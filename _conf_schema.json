@@ -1,6 +1,6 @@
 {
   "enabled": {
-    "description": "是否启用什亭之枢",
+    "description": "是否启用插件",
     "type": "bool",
     "default": true
   },
@@ -14,83 +14,104 @@
         "default": true
       },
       "extract_provider_id": {
-        "description": "记忆提炼所用模型（建议选便宜的轻量模型，留空则关闭自动提炼）",
+        "description": "记忆提炼模型（建议轻量，留空则关闭自动提炼）",
         "type": "string",
         "default": "",
         "_special": "select_provider"
       },
       "extract_batch_size": {
-        "description": "累积多少条未提炼消息后触发一次提炼",
+        "description": "触发提炼所需的未提炼消息数（条）",
         "type": "int",
         "default": 40
       },
       "extract_max_items": {
-        "description": "单次提炼最多产出几条长期记忆",
+        "description": "单次提炼产出的长期记忆上限（条）",
         "type": "int",
         "default": 5
       },
       "extract_min_strength": {
-        "description": "低于该强度的提炼结果直接丢弃",
+        "description": "提炼结果的最低强度，低于此值丢弃（强度值）",
         "type": "float",
         "default": 1.0
       },
       "short_term_max_messages": {
-        "description": "每个会话各保留多少条原始消息（按会话分组淘汰，避免话痨群挤掉其它会话）",
+        "description": "每个会话保留的原始消息上限，按会话分组淘汰（条）",
         "type": "int",
         "default": 400
       },
       "backfill_astrbot_history": {
-        "description": "从 AstrBot 已有对话记录回填插件不在场期间的对话",
+        "description": "回填插件不在场期间的 AstrBot 历史对话",
         "type": "bool",
         "default": true
       },
       "backfill_max_messages": {
-        "description": "每个会话最多回填多少条历史（回填内容不参与长期记忆提炼）",
+        "description": "每个会话回填的历史上限，回填内容不参与提炼（条）",
         "type": "int",
         "default": 200
       },
+      "vision_enabled": {
+        "description": "图片转文字：把图片转述成文字写入账本（AstrBot 仅提供「[图片]」占位）",
+        "type": "bool",
+        "default": true
+      },
+      "vision_provider_id": {
+        "description": "图片转述模型（须支持图片输入，留空则用 AstrBot 全局的图片转述模型）",
+        "type": "string",
+        "default": "",
+        "_special": "select_provider"
+      },
+      "vision_prompt": {
+        "description": "图片转述提示词（留空则用内置提示词）",
+        "type": "text",
+        "default": ""
+      },
+      "vision_max_images": {
+        "description": "单条消息转述的图片上限，每张图一次模型调用（张）",
+        "type": "int",
+        "default": 2
+      },
       "short_term_context_per_chat": {
-        "description": "跨会话语境：每个会话取最近几条（按会话配额，避免话痨群挤掉其它会话）",
+        "description": "跨会话语境中每个会话取的消息上限（条）",
         "type": "int",
         "default": 6
       },
       "short_term_context_chats": {
-        "description": "跨会话语境：最多纳入几个会话",
+        "description": "跨会话语境纳入的会话上限（个）",
         "type": "int",
         "default": 6
       },
       "short_term_context_tokens": {
-        "description": "近期原始消息的 token 预算",
+        "description": "近期原始消息块的 token 预算（token）",
         "type": "int",
         "default": 2000
       },
       "merge_gated_into_contexts": {
-        "description": "把同步进记忆但 AstrBot 看不到的对话回合插回上下文（她主动发出的消息、被拦下的消息）",
+        "description": "把主脑看不到的对话回合插回上下文（主动发出的、被拦下的）",
         "type": "bool",
         "default": true
       },
       "strip_invalid_images": {
-        "description": "请求前摘除读不到的图片引用（坏图会让整条请求被上游拒绝并导致切换到备用模型）",
+        "description": "请求前摘除读不到的图片引用，避免整条请求被上游拒绝并切换备用模型",
         "type": "bool",
         "default": true
       },
       "recall_top_k": {
-        "description": "与当前消息相关的记忆条数上限",
+        "description": "与当前消息相关的记忆上限（条）",
         "type": "int",
         "default": 5
       },
       "recall_user_top_k": {
-        "description": "与发送者相关的记忆条数上限",
+        "description": "与发送者相关的记忆上限（条）",
         "type": "int",
         "default": 3
       },
       "recall_min_score": {
-        "description": "低于该相关度的记忆不注入（调高更克制，调低更健谈）",
+        "description": "记忆注入的最低相关度，低于此值不注入（0~1）",
         "type": "float",
         "default": 0.18
       },
       "recall_token_budget": {
-        "description": "记忆注入块的 token 预算",
+        "description": "记忆注入块的 token 预算（token）",
         "type": "int",
         "default": 900
       },
@@ -105,42 +126,42 @@
         "default": 30.0
       },
       "forget_threshold": {
-        "description": "强度跌破该值的长期记忆会被遗忘",
+        "description": "长期记忆的遗忘阈值，强度跌破即遗忘（强度值）",
         "type": "float",
         "default": 0.6
       },
       "promote_min_recall": {
-        "description": "晋升永久记忆所需的最少召回次数",
+        "description": "晋升永久记忆所需的最少召回次数（次）",
         "type": "int",
         "default": 8
       },
       "promote_min_strength": {
-        "description": "晋升永久记忆所需的强度",
+        "description": "晋升永久记忆所需的最低强度（强度值）",
         "type": "float",
         "default": 12.0
       },
       "promote_min_cross_chat": {
-        "description": "晋升永久记忆所需的跨会话出现次数",
+        "description": "晋升永久记忆所需的最少跨会话出现次数（次）",
         "type": "int",
         "default": 2
       },
       "merge_max_strength": {
-        "description": "只合并强度不高于该值的长期记忆",
+        "description": "可参与合并的记忆强度上限（强度值）",
         "type": "float",
         "default": 3.5
       },
       "merge_min_age_days": {
-        "description": "只合并创建时间早于该天数的长期记忆",
+        "description": "可参与合并的记忆最短创建时长（天）",
         "type": "float",
         "default": 14.0
       },
       "merge_min_cluster": {
-        "description": "聚类规模达到该值才交给模型合并",
+        "description": "触发模型合并所需的最小聚类规模（条）",
         "type": "int",
         "default": 3
       },
       "merge_similarity": {
-        "description": "聚类时的标签/关键词相似度阈值",
+        "description": "聚类时的标签 / 关键词相似度阈值（0~1）",
         "type": "float",
         "default": 0.34
       }
@@ -156,23 +177,23 @@
         "default": true
       },
       "provider_id": {
-        "description": "决策所用模型（建议用最便宜的轻量模型；留空则复用记忆提炼模型，都留空则走规则兜底）",
+        "description": "决策模型（建议轻量，留空则复用记忆提炼模型，都留空则只走规则）",
         "type": "string",
         "default": "",
         "_special": "select_provider"
       },
       "always_reply_private": {
-        "description": "私聊直接回复（不调用决策模型，省 token）",
+        "description": "私聊消息直接回复，不经决策模型",
         "type": "bool",
         "default": true
       },
       "always_reply_when_mentioned": {
-        "description": "被 @ 或叫到名字时直接回复（不调用决策模型）",
+        "description": "被 @ 或叫到名字时直接回复，不经决策模型",
         "type": "bool",
         "default": true
       },
       "allow_upstream_commands": {
-        "description": "让路给 AstrBot 指令与 skill（必须保持开启，否则 /命令 会失效）",
+        "description": "让路给 AstrBot 指令与 skill，关闭会导致 /命令 失效",
         "type": "bool",
         "default": true
       },
@@ -183,37 +204,37 @@
         "default": []
       },
       "disable_builtin_send_tool": {
-        "description": "从每次请求的工具列表里摘除 AstrBot 内置的 send_message_to_user（它参数写错时会静默发到当前会话，造成错发）",
+        "description": "摘除 AstrBot 内置的 send_message_to_user（参数写错时会发到当前会话）",
         "type": "bool",
         "default": true
       },
       "context_messages": {
-        "description": "决策时给她看的近期消息条数（每个会话各取这么多）",
+        "description": "判定时每个会话取给她看的近期消息上限（条）",
         "type": "int",
         "default": 6
       },
       "patrol_enabled": {
-        "description": "群聊巡检：不逐条判定，而是把一小段时间的消息攒起来判一次",
+        "description": "群聊巡检：把一小段时间的消息攒起来整体判定一次，不逐条判定",
         "type": "bool",
         "default": true
       },
       "patrol_window_seconds": {
-        "description": "巡检窗口：群里安静这么多秒后，对这段时间的对话判一次",
+        "description": "巡检窗口：会话安静多久后判定一次（秒）",
         "type": "float",
         "default": 5.0
       },
       "patrol_max_wait_seconds": {
-        "description": "巡检封顶：群里一直有人说话时，最多等这么久就必须判一次",
+        "description": "巡检封顶：一直有人说话时的最长等待（秒）",
         "type": "float",
         "default": 20.0
       },
       "patrol_cooldown_seconds": {
-        "description": "判定为不回后，该会话在这么多秒内不再调用决策模型",
+        "description": "判为不回后该会话的冷却时长（秒）",
         "type": "float",
         "default": 60.0
       },
       "patrol_noise_filter": {
-        "description": "窗口内只有图片/表情、复读、同一人连刷短句时，直接判不回（不花模型调用，也不进冷却）",
+        "description": "噪声预过滤：整段只有图片 / 表情、复读或同一人连刷短句时不调用决策模型",
         "type": "bool",
         "default": true
       }
@@ -224,7 +245,7 @@
     "type": "object",
     "items": {
       "timeout_minutes": {
-        "description": "会话安静多久后收回她的主动发言资格",
+        "description": "会话安静多久后收回主动发言资格（分钟）",
         "type": "float",
         "default": 30.0
       },
@@ -240,27 +261,27 @@
     "type": "object",
     "items": {
       "enabled": {
-        "description": "是否允许 LLM 主动发送消息",
+        "description": "是否允许主动发送消息",
         "type": "bool",
         "default": true
       },
       "silence_origin_after_say": {
-        "description": "她前往别的会话后，不再回原会话收尾汇报（她的话说在那边，不说在这边）",
+        "description": "去别的会话发言后不再回原会话收尾汇报",
         "type": "bool",
         "default": true
       },
       "allowed_targets": {
-        "description": "允许主动发送的目标白名单（格式：private:QQ号 或 group:群号），留空表示不限制",
+        "description": "主动发送的目标白名单，格式 private:QQ号 或 group:群号，留空表示不限制",
         "type": "list",
         "default": []
       },
       "rate_limit_per_minute": {
-        "description": "每分钟最大主动消息数",
+        "description": "主动消息速率上限（条/分钟）",
         "type": "int",
         "default": 3
       },
       "rate_limit_per_hour": {
-        "description": "每小时最大主动消息数",
+        "description": "主动消息速率上限（条/小时）",
         "type": "int",
         "default": 20
       }

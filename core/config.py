@@ -63,6 +63,14 @@ class MemoryConfig:
     backfill_astrbot_history: bool = True
     backfill_max_messages: int = 200      # 每个会话最多回填多少条
 
+    # ── 图片转文字 ────────────────────────────────────────
+    # AstrBot 只把图片转成「[图片]」占位，账本里得自己补一句描述，
+    # 否则她「看不到」群里发的图，记忆页面也只显示一个占位。
+    vision_enabled: bool = True
+    vision_provider_id: str = ""          # 留空则用 AstrBot 设置的「图片转述模型」
+    vision_prompt: str = ""               # 留空则用内置的中文提示词
+    vision_max_images: int = 2            # 单条消息最多转述几张图
+
     # ── 召回 ──────────────────────────────────────────────
     recall_top_k: int = 5                 # 消息相关记忆条数
     recall_user_top_k: int = 3            # 用户相关记忆条数
@@ -108,6 +116,10 @@ class MemoryConfig:
                 _get(cfg, "memory.backfill_astrbot_history", True)
             ),
             backfill_max_messages=_get_int(cfg, "memory.backfill_max_messages", 200),
+            vision_enabled=bool(_get(cfg, "memory.vision_enabled", True)),
+            vision_provider_id=str(_get(cfg, "memory.vision_provider_id", "") or ""),
+            vision_prompt=str(_get(cfg, "memory.vision_prompt", "") or ""),
+            vision_max_images=_get_int(cfg, "memory.vision_max_images", 2),
             recall_top_k=_get_int(cfg, "memory.recall_top_k", 5),
             recall_user_top_k=_get_int(cfg, "memory.recall_user_top_k", 3),
             recall_min_score=_get_float(cfg, "memory.recall_min_score", 0.18),

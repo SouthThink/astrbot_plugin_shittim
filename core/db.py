@@ -12,7 +12,7 @@ import sqlite3
 import threading
 from pathlib import Path
 
-SCHEMA_VERSION = 5
+SCHEMA_VERSION = 6
 
 # 增量列迁移：用于给已存在的库补列，避免升级插件时丢数据
 _COLUMN_MIGRATIONS = (
@@ -22,6 +22,9 @@ _COLUMN_MIGRATIONS = (
     # source 取值 live / backfill。回填的历史又旧又多，塞进 req.contexts 会撑爆
     # 窗口，所以合并回上下文时只处理 live 那批，回填的交由带 token 预算的块兜底。
     ("short_term_messages", "source", "TEXT NOT NULL DEFAULT 'live'"),
+    # 图片消息转述出来的文字。AstrBot 只会把图片转成「[图片]」占位，
+    # 所以账本里得自己补一句描述，否则她永远「看不到」那张图。
+    ("short_term_messages", "image_caption", "TEXT NOT NULL DEFAULT ''"),
 )
 
 _DDL = """
@@ -45,11 +48,19 @@ CREATE TABLE IF NOT EXISTS short_term_messages (
     created_at  REAL    NOT NULL,
     extracted   INTEGER NOT NULL DEFAULT 0,
     gated       INTEGER NOT NULL DEFAULT 0,
-    source      TEXT    NOT NULL DEFAULT 'live'
+    source      TEXT    NOT NULL DEFAULT 'live',
+    image_caption TEXT  NOT NULL DEFAULT ''
 );
 CREATE INDEX IF NOT EXISTS idx_stm_created ON short_term_messages (created_at);
 CREATE INDEX IF NOT EXISTS idx_stm_chat    ON short_term_messages (chat_id, created_at);
 CREATE INDEX IF NOT EXISTS idx_stm_pending ON short_term_messages (extracted, id);
+
+-- 图片转述缓存：同一个引用只问一次视觉模型，省下重复调用的钱和时间
+CREATE TABLE IF NOT EXISTS image_captions (
+    ref_hash   TEXT PRIMARY KEY,
+    caption    TEXT NOT NULL,
+    created_at REAL NOT NULL
+);
 
 -- 长期 / 永久记忆
 CREATE TABLE IF NOT EXISTS memories (

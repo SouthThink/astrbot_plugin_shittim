@@ -86,6 +86,10 @@ def _paging(limit: int, offset: int) -> tuple[int, int]:
 
 
 def _short_term_item(row) -> dict:
+    try:
+        caption = str(row["image_caption"] or "")
+    except (KeyError, IndexError, TypeError):
+        caption = ""
     return {
         "id": int(row["id"]),
         "chat_id": str(row["chat_id"] or ""),
@@ -95,6 +99,8 @@ def _short_term_item(row) -> dict:
         "sender_name": str(row["sender_name"] or ""),
         "role": str(row["role"] or "user"),
         "content": str(row["content"] or ""),
+        # 图片转述出来的文字：页面据此把「[图片]」补成看得见的内容
+        "image_caption": caption,
         "created_at": float(row["created_at"] or 0.0),
         "gated": bool(row["gated"]),
         "source": str(row["source"] or "live"),

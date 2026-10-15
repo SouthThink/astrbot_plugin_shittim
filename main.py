@@ -83,6 +83,7 @@ from .core.short_term import (
     format_message_line,
 )
 from .core.time_utils import format_age
+from .core.vision import ImageCaptioner
 from .web_api import register_all_routes
 
 # 决断层在事件链上的优先级：必须早于 AstrBot 的默认 LLM 阶段。
@@ -161,6 +162,8 @@ class ShittimPlugin(Star):
         self.db = MemoryDB(data_dir)
         self.short_term = ShortTermLedger(self.db, self.memory_config)
         self.memory_store = MemoryStore(self.db, self.memory_config)
+        # 图片转文字：AstrBot 只给「[图片]」占位，账本里的描述得自己补
+        self.captioner = ImageCaptioner(self.db, self.memory_config, self.context)
         self.extractor = MemoryExtractor(self.context, self.memory_config)
         self.maintainer = MemoryMaintainer(
             self.memory_store,
@@ -259,6 +262,8 @@ class ShittimPlugin(Star):
             if message_id:
                 # 供决断层在拦下这条消息时回填标记
                 set_extra(event, EXTRA_MESSAGE_ID, message_id)
+                # 图里是什么，得自己问一次视觉模型：AstrBot 只给「[图片]」占位
+                self._schedule_image_caption(event, message_id)
             self.memory_store.upsert_user(
                 platform_of(event) or "unknown",
                 sender_id,
@@ -808,6 +813,34 @@ class ShittimPlugin(Star):
     #  官方历史回填
     # ══════════════════════════════════════════════════════════
 
+    def _schedule_image_caption(self, event: AstrMessageEvent, message_id: int) -> None:
+        """把图片转述丢到后台。
+
+        不能在这里等视觉模型：记账是事件链的第一环，卡住它会把后面所有插件
+        的处理一起拖慢。引用必须**当场**取出来——图片的临时文件、链接都可能
+        在我们睡一觉之后失效。
+        """
+        if not self.memory_config.vision_enabled or not message_id:
+            return
+        refs = ImageCaptioner.collect_refs(
+            event, self.memory_config.vision_max_images
+        )
+        if not refs:
+            return
+        self._spawn(self._caption_message(message_id, refs))
+
+    async def _caption_message(self, message_id: int, refs: list[str]) -> None:
+        """转述回来就回填账本，她与记忆页面便都能看到图里是什么了。"""
+        try:
+            caption = await self.captioner.describe(refs)
+        except Exception as error:
+            logger.error("[什亭之枢] 图片转述异常: %s", error)
+            return
+        if not caption:
+            return
+        self.short_term.set_image_caption(message_id, caption)
+        logger.debug("[什亭之枢] 图片转述完成 | %s", caption[:60])
+
     def _schedule_backfill(self, chat_id: str, chat_label: str, chat_kind: str) -> None:
         """每个会话在本次进程里只尝试回填一次。"""
         if not self.memory_config.backfill_astrbot_history:
@@ -982,6 +1015,7 @@ class ShittimPlugin(Star):
         self.extractor.update_config(self.memory_config)
         self.maintainer.update_config(self.memory_config)
         self.decider.update_config(self.decision_config, self.memory_config)
+        self.captioner.update_config(self.memory_config)
         self.patrol.update_config(self.decision_config)
         self.focus.update_config(self.focus_config)
         self._allowed_targets = self._load_allowed_targets()

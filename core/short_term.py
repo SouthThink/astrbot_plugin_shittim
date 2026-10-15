@@ -39,12 +39,23 @@ def build_chat_label(chat_kind: str, name: str, chat_id: str) -> str:
     return "·".join(parts)
 
 
+def _caption_of(row) -> str:
+    """取这一行的图片转述；老库的行没有该列，取不到就当没有。"""
+    try:
+        return str(row["image_caption"] or "").strip()
+    except (KeyError, IndexError, TypeError):
+        return ""
+
+
 def format_message_line(row: sqlite3.Row) -> str:
     """把一条短期消息格式化成带来源与时间标记的一行。
 
     时间标签是刻意加的：没有它，模型只能看到消息的先后顺序，无法区分
     「刚刚」和「一个多小时前」，会把很久以前的事当成刚发生的。
     用相对时间而不是绝对时间——判断新旧不需要任何锚点。
+
+    图片描述同理：AstrBot 给图片的只有「[图片]」这个占位，不补一句描述，
+    她就等于没看见那张图。
     """
     role = str(row["role"] or "user")
     sender_id = str(row["sender_id"] or "")
@@ -57,6 +68,9 @@ def format_message_line(row: sqlite3.Row) -> str:
         name = str(row["sender_name"] or "").strip() or sender_id
         speaker = name or "某人"
     content = str(row["content"] or "").replace("\n", " ").strip()
+    caption = _caption_of(row)
+    if caption:
+        content = f"{content}（图片内容：{caption}）" if content else f"[图片]（图片内容：{caption}）"
 
     time_tag = ""
     try:
@@ -125,6 +139,19 @@ class ShortTermLedger:
     def mark_extracted(self, ids: list[int]) -> None:
         """标记这批消息已提炼进长期层。"""
         self._mark_flag("extracted", ids)
+
+    def set_image_caption(self, message_id: int, caption: str) -> None:
+        """给一条已入库的消息补上图片描述。
+
+        图片转述是后台异步做的：记账必须快，不能为了等视觉模型把事件处理
+        卡住。等描述回来再回填这一行。
+        """
+        if not message_id or not caption:
+            return
+        self._db.execute(
+            "UPDATE short_term_messages SET image_caption = ? WHERE id = ?",
+            (caption, int(message_id)),
+        )
 
     def mark_gated(self, ids: list[int]) -> None:
         """标记这批消息不在 AstrBot 的历史里（被拦下或插件主动发出）。"""

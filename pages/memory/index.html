@@ -123,6 +123,16 @@
       .who { color: var(--text); font-weight: 600; }
       .who.self { color: var(--accent); }
       .body { white-space: pre-wrap; word-break: break-word; }
+      .caption {
+        margin-top: 6px;
+        padding: 6px 10px;
+        border-radius: 8px;
+        background: var(--accent-soft);
+        color: var(--accent);
+        font-size: 12px;
+        white-space: pre-wrap;
+        word-break: break-word;
+      }
       .tags { color: var(--muted); font-size: 12px; margin-top: 6px; }
       .quote {
         margin-top: 6px;
@@ -349,6 +359,12 @@
           body.className = "body";
           body.textContent = item.content;
           box.append(meta, body);
+          if (item.image_caption) {
+            const caption = document.createElement("div");
+            caption.className = "caption";
+            caption.textContent = `图片内容：${item.image_caption}`;
+            box.appendChild(caption);
+          }
           el.list.appendChild(box);
         });
       }
