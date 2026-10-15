@@ -1,6 +1,25 @@
 name: astrbot_plugin_shittim # 插件唯一识别名，以 astrbot_plugin_ 前缀开头
-display_name: 什亭之枢 # 用于展示的名字，可以是方便人类阅读的名字（需要版本 >= v4.5.0，低版本不会报错，请放心填写）
-desc: AstrBot 插件示例。 # 插件简短描述
-version: v1.0.0 # 插件版本号。格式：v1.1.1 或者 v1.1
-author: Soulter # 作者
-repo:  # 插件的仓库地址
+display_name: 什亭之枢
+desc: |
+  什亭之枢（Shittim）是一个让 AstrBot 智能体拥有全局状态、
+  跨会话上下文与主动行动能力的插件。
+
+  它让智能体不再局限于单一会话，而是能够在所有私聊与群聊中
+  共享同一人格与记忆，自主决定向谁、在哪个会话说，以及说什么。
+
+  主要特性：
+  - 跨会话上下文池：所有会话共享同一人格记忆
+  - 主动消息发送：LLM 可自主调用工具向任意私聊/群聊发送消息
+  - 全局状态机：清醒/休息状态跨所有会话共享（后续版本）
+  - 作息调度与起床批处理（后续版本）
+version: v1.0.0 # 插件版本号
+author: SouthThink # 作者
+repo: https://github.com/SouthThink/astrbot_plugin_shittim # 插件的仓库地址
+astrbot_version: ">=4.17.0"
+support_platforms:
+  - aiocqhttp
+tags:
+  - agent
+  - memory
+  - proactive
+  - qq
