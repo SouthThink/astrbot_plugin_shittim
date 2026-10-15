@@ -1,13 +1,14 @@
-"""决断层：在 AstrBot 官方 LLM 被触发之前，决定这条消息要不要回。
+"""决断层：在 AstrBot 官方 LLM 被触发之前，决定要不要回。
 
-这是「思考与发送分离」里的思考层门闩：
-- 判定不回 → 调用方 `stop_event()`，官方 LLM 完全不触发
-- 判定回   → 调用方置位 `is_at_or_wake_command` 放行主脑生成
+分两层，边界很清晰：
 
-「规则优先、模型兜底」是刻意的成本设计：能用规则确定的（上游指令、私聊、
-被点名）不花模型 token，只有群聊里的普通消息才交给轻量模型判断。
+- **规则层** `rule_decide()`：同步、零 token。上游指令、空文本、私聊、被点名
+  都在这里当场定夺，返回 None 表示「这条得再看看」。
+- **模型层** `judge_window()`：给一段窗口内的对话做判断。调用方是巡检器
+  （`patrol.PatrolManager`），它负责攒够一段时间再叫这一层，而不是每来一句
+  就调一次模型。
 
-所有异常路径一律判定「不回」：宁可她安静，也不要不受控地开口。
+两个层的失败都收敛为「不回」：宁可她安静，也不要不受控地开口。
 """
 
 from __future__ import annotations
@@ -22,7 +23,6 @@ except ImportError:  # pragma: no cover
 from dataclasses import dataclass
 
 from .event_utils import (
-    describe_chat,
     get_message_text,
     is_private_chat,
     is_upstream_command_event,
@@ -36,7 +36,7 @@ SOURCE_FALLBACK = "fallback"
 # 决策模型输出里 should_reply 的各种真值写法
 _TRUE_WORDS = {"true", "1", "yes", "y", "是", "真", "需要", "回复"}
 
-_DECIDE_PROMPT = """你是「{alias}」的思考层。请判断下面这条新消息，是否需要你亲自开口回复。
+_WINDOW_PROMPT = """你是「{alias}」的思考层。下面是你刚在「{chat_label}」听到的一小段对话。
 
 【你最近看到的事】
 {recent}
@@ -44,22 +44,24 @@ _DECIDE_PROMPT = """你是「{alias}」的思考层。请判断下面这条新�
 【你记得的事】
 {memory}
 
-【需要判断的新消息】
-来源：{chat_label}
+【这段对话】（按发生顺序）
 {content}
 
 【判断标准】
-需要回复：
+需要你开口：
 - 有人直接叫你、在问你、或在等你回应
 - 话题与你的记忆、身份或职责有关
-- 群里聊到了你能补充的信息
-不需要回复：
+- 你有能补充的信息
+
+不需要开口：
 - 别人之间的对话，你插进去很突兀
 - 与你无关的闲聊、复读、表情、刷屏
+- 这轮问答已经闭环，或他们明显没在等谁
 - 你没有什么可说的
 
-宁可不回，也不要硬凑话，沉默是完全允许的。
-如果你刚刚已经回应过同一个人、同一话题，不要重复回应。
+宁可不开口，也不要硬凑话，沉默是完全允许的。
+如果这段话里没有人在等你，就不要回。
+如果你刚刚已经回应过同一话题，不要重复回应。
 
 【输出】
 只输出 JSON，不要解释，不要代码块围栏：
@@ -103,23 +105,15 @@ class DecisionEngine:
         self._config = decision_config
         self._memory_config = memory_config
 
-    # ── 对外入口 ──────────────────────────────────────────
-
-    async def decide(self, event) -> Decision:
-        """判定这条消息要不要回。任何异常都收敛为「不回」。"""
-        try:
-            ruled = self._rule_decide(event)
-            if ruled is not None:
-                return ruled
-            return await self._model_decide(event)
-        except Exception as error:
-            logger.error("[什亭之枢] 决断层判定异常，按不回复处理: %s", error)
-            return Decision(False, "决断层异常", SOURCE_FALLBACK)
-
     # ── 规则层 ────────────────────────────────────────────
 
-    def _rule_decide(self, event) -> Decision | None:
-        """能靠规则定的直接定，返回 None 表示需要交给模型。"""
+    def rule_decide(self, event) -> Decision | None:
+        """能靠规则定的直接定；返回 None 表示「交给巡检窗口再看」。
+
+        规则层是同步的、不花 token 的：上游指令、空文本、私聊、被点名都在
+        这里当场定夺。剩下的群聊普通消息才是巡检的活——攒一小段再判一次，
+        而不是每来一句就问一次模型。
+        """
         chat_id = getattr(event, "unified_msg_origin", "") or ""
         text = get_message_text(event)
 
@@ -146,7 +140,15 @@ class DecisionEngine:
 
     # ── 模型层 ────────────────────────────────────────────
 
-    async def _model_decide(self, event) -> Decision:
+    async def judge_window(
+        self, chat_id: str, chat_label: str, lines: list[str]
+    ) -> Decision:
+        """判定「这段时间的对话」要不要接一句。
+
+        与逐条判定的区别在判据本身：她听到的是一整段，而不是被切成一条条、
+        彼此脱节的碎片。所以模型能看出「这轮问答已经闭环了」或「他们在等
+        别人回」，而不是对着一句「应该可以」独自猜上下文。
+        """
         provider = self._resolve_provider()
         if provider is None:
             # 未配置决策模型时的兜底：群聊里的普通消息不介入
@@ -154,18 +156,21 @@ class DecisionEngine:
                 False, "未配置决策模型，按规则不介入群聊普通消息", SOURCE_FALLBACK
             )
 
-        chat_id = getattr(event, "unified_msg_origin", "") or ""
-        _, chat_label = describe_chat(event)
-        text = get_message_text(event)
-        prompt = _DECIDE_PROMPT.format(
+        body = "\n".join(line for line in lines if line).strip()
+        if not body:
+            return Decision(False, "没有可判断的内容", SOURCE_FALLBACK)
+
+        prompt = _WINDOW_PROMPT.format(
             alias=self._alias_label(),
             recent=self._short_term.build_recent_block(
-                limit=self._config.context_messages
+                per_chat=self._config.context_messages,
+                max_chats=3,
+                exclude_chat_id=chat_id,
             )
             or "（暂无近期消息）",
-            memory=self._format_memories(text),
-            chat_label=chat_label,
-            content=text,
+            memory=self._format_memories(body),
+            chat_label=chat_label or "群聊",
+            content=body,
         )
 
         try:

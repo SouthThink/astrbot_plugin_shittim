@@ -7,6 +7,8 @@
 
 from __future__ import annotations
 
+import re
+
 try:
     from astrbot.api import logger
 except ImportError:  # pragma: no cover
@@ -27,6 +29,8 @@ _FALLBACK_COMMAND_PREFIXES = ("/",)
 
 # 事件属性上的临时标记键
 EXTRA_MESSAGE_ID = "shittim_message_id"
+# 她本轮用 say 去了别的会话（值为目标 umo）。据此抑制原会话的收尾发言。
+EXTRA_LEFT_TO = "shittim_left_to"
 
 
 def call_str(event, method_name: str, default: str = "") -> str:
@@ -46,6 +50,60 @@ def get_message_text(event) -> str:
         return (event.get_message_outline() or "").strip()
     except Exception:
         return ""
+
+
+# 无文本消息的占位说明。用组件类名匹配，取不到就整体降级为空串。
+_COMPONENT_LABELS = {
+    "Image": "[图片]",
+    "Face": "[表情]",
+    "Poke": "[戳一戳]",
+    "Video": "[视频]",
+    "File": "[文件]",
+    "Record": "[语音]",
+    "Forward": "[转发消息]",
+    "Json": "[卡片消息]",
+    "Music": "[音乐]",
+}
+
+
+def describe_non_text(event) -> str:
+    """为图片/表情这类无文本消息生成占位描述。
+
+    这类消息不该触发回复，但完全不入账会让她的对话流出现空白——
+    她会看到「刚才有人发了什么，但我不知道是什么」。占位描述既保留了
+    「发生过什么」这个事实，又不会让决断层误以为有内容可回应。
+    """
+    try:
+        components = event.get_messages() or []
+    except Exception:
+        return ""
+    labels: list[str] = []
+    for component in components:
+        label = _COMPONENT_LABELS.get(type(component).__name__)
+        if label and label not in labels:
+            labels.append(label)
+    return "".join(labels)
+
+
+# AstrBot 把非文本消息转成占位标签（`_outline_chain`：图片→[图片]、表情→[表情:id]），
+# 所以这些文本看着非空，其实什么也没说。
+_PLACEHOLDER_RE = re.compile(
+    r"\[(?:图片|表情[^\]]*|At[^\]]*|引用消息[^\]]*|转发消息|戳一戳|视频|文件|"
+    r"语音|卡片消息|音乐|Image[^\]]*)\]"
+)
+# 表情符号与零宽连接符：只发表情同样没有可回应的内容
+_EMOJI_RE = re.compile(r"[\U0001F000-\U0001FAFF\u2600-\u27BF\uFE0F\u200D\s]+")
+
+
+def is_placeholder_only(text: str) -> bool:
+    """整条消息是否只有占位标签、表情和空白，没有一句真正的话。
+
+    存在的意义：`get_message_outline()` 对图片返回「[图片]」，非空，
+    所以「没有可回应的文本内容」这类判断不能只看是否为空串。
+    """
+    cleaned = _PLACEHOLDER_RE.sub("", text or "")
+    cleaned = _EMOJI_RE.sub("", cleaned)
+    return not cleaned.strip()
 
 
 def is_private_chat(chat_id: str) -> bool:
@@ -140,15 +198,3 @@ def get_extra(event, key: str, default=None):
     except Exception:
         return default
     return default if value is None else value
-
-
-def format_age(seconds: float) -> str:
-    """把「距今多少秒」说成人话。"""
-    seconds = max(float(seconds), 0.0)
-    if seconds < 60:
-        return "刚刚"
-    if seconds < 3600:
-        return f"{int(seconds // 60)}分钟前"
-    if seconds < 86400:
-        return f"{int(seconds // 3600)}小时前"
-    return f"{int(seconds // 86400)}天前"

@@ -34,22 +34,38 @@ _BLOCK_HEADER = """{open}
 _BLOCK_FOOTER = _BLOCK_CLOSE
 
 
-_RECENT_HEADER = """<recent_conversations>
-以下是你在其他会话里的近期对话片段，方括号内标注来源。它只用于让你知道别处发生了什么。
+_RECENT_HEADER = """<your_recent_experience>
+这是你最近亲身经历的事，方括号内是你当时所在的会话。
+这些不是别人的对话，而是你自己听到和说过的话——你一直是同一个人，
+只是同时在几个地方活动。
 
-使用规则：
-1. 这些不是当前会话的内容，不要在里边找「该回复谁」，回复对象只看当前这条消息。
-2. 只有与当前话题相关时才可以参考，不要提及、不要复述、不要说「你刚才在那个群说」。
-3. 不要在错误的会话里使用这里的称呼和语境。
+- 你现在正在当前会话里说话，不要在这些片段里找「该回复谁」
+- 不要用旁观者的口吻谈论它们，不要说「我查了一下」「那边的记录显示」这类话
+- 只有在与当前话题自然相关时，才像人一样自然地带出来
+- 不要逐条复述，也不要说明这些信息的来源
 """
-
 
 def build_recent_context_block(body: str) -> str:
     """把跨会话近期原始消息包成注入块。"""
     body = (body or "").strip()
     if not body:
         return ""
-    return f"{_RECENT_HEADER}{body}\n</recent_conversations>"
+    return f"{_RECENT_HEADER}{body}\n</your_recent_experience>"
+
+
+def build_injected_entry(block: str) -> dict:
+    """构造一条注入条目。
+
+    单独暴露构造、而不是直接追加到 req.contexts，是因为注入顺序就是模型的
+    读取顺序：我们需要把背景块**放在原生历史之前**，而不是一律追加到末尾。
+    """
+    return {
+        "role": "user",
+        "content": block,
+        "_no_save": True,
+        # 供排障：注入时刻，便于对照日志确认是否命中
+        "_shittim_injected_at": time.time(),
+    }
 
 
 def build_block(
@@ -83,28 +99,6 @@ def build_block(
 
     block = "\n".join([_BLOCK_HEADER, *lines, _BLOCK_FOOTER])
     return block, used_ids
-
-
-def inject_into_request(req, block: str) -> bool:
-    """把注入块作为独立消息追加到 req.contexts。
-
-    刻意不碰 system_prompt：那条通道会放大记忆权重，是造成过拟合的主因。
-    """
-    if not block:
-        return False
-    contexts = getattr(req, "contexts", None)
-    if not isinstance(contexts, list):
-        return False
-    contexts.append(
-        {
-            "role": "user",
-            "content": block,
-            "_no_save": True,
-            # 供排障：注入时刻，便于对照日志确认是否命中
-            "_shittim_injected_at": time.time(),
-        }
-    )
-    return True
 
 
 def format_for_log(memories: list[RecalledMemory]) -> str:

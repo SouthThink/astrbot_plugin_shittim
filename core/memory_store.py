@@ -329,6 +329,30 @@ class MemoryStore:
         rows = self._db.query("SELECT tier, COUNT(*) AS n FROM memories GROUP BY tier")
         return {str(r["tier"]): int(r["n"]) for r in rows}
 
+    def list_page(
+        self, tier: str, limit: int, offset: int
+    ) -> tuple[list[Memory], int]:
+        """分页读某一层记忆（按强度倒序），返回 (本页记忆, 该层总数)。
+
+        供记忆页面展示：她脑子里最强的那几条记忆，应该排在能看见的最前面。
+        """
+        limit = max(int(limit), 1)
+        offset = max(int(offset), 0)
+        total_row = self._db.query_one(
+            "SELECT COUNT(*) AS n FROM memories WHERE tier = ?", (tier,)
+        )
+        rows = self._db.query(
+            """
+            SELECT * FROM memories
+             WHERE tier = ?
+             ORDER BY strength DESC, id DESC
+             LIMIT ? OFFSET ?
+            """,
+            (tier, limit, offset),
+        )
+        total = int(total_row["n"]) if total_row else 0
+        return [Memory.from_row(row) for row in rows], total
+
     # ── 召回 ──────────────────────────────────────────────
 
     def recall(

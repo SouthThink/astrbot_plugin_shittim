@@ -12,13 +12,16 @@ import sqlite3
 import threading
 from pathlib import Path
 
-SCHEMA_VERSION = 3
+SCHEMA_VERSION = 5
 
 # 增量列迁移：用于给已存在的库补列，避免升级插件时丢数据
 _COLUMN_MIGRATIONS = (
     # gated=1 表示这条消息不在 AstrBot 的历史里：要么被决断层拦下，
     # 要么是插件主动发出的。跨会话上下文档据此把主脑看不到的内容补进去。
     ("short_term_messages", "gated", "INTEGER NOT NULL DEFAULT 0"),
+    # source 取值 live / backfill。回填的历史又旧又多，塞进 req.contexts 会撑爆
+    # 窗口，所以合并回上下文时只处理 live 那批，回填的交由带 token 预算的块兜底。
+    ("short_term_messages", "source", "TEXT NOT NULL DEFAULT 'live'"),
 )
 
 _DDL = """
@@ -41,7 +44,8 @@ CREATE TABLE IF NOT EXISTS short_term_messages (
     content     TEXT    NOT NULL,
     created_at  REAL    NOT NULL,
     extracted   INTEGER NOT NULL DEFAULT 0,
-    gated       INTEGER NOT NULL DEFAULT 0
+    gated       INTEGER NOT NULL DEFAULT 0,
+    source      TEXT    NOT NULL DEFAULT 'live'
 );
 CREATE INDEX IF NOT EXISTS idx_stm_created ON short_term_messages (created_at);
 CREATE INDEX IF NOT EXISTS idx_stm_chat    ON short_term_messages (chat_id, created_at);
@@ -93,13 +97,38 @@ CREATE TABLE IF NOT EXISTS user_ledger (
 
 -- 会话焦点：她当前在关注哪些会话（只约束主动发言，不约束被动接话）
 CREATE TABLE IF NOT EXISTS session_focus (
-    chat_id    TEXT PRIMARY KEY,
-    chat_label TEXT NOT NULL DEFAULT '',
-    focused_at REAL NOT NULL,
-    left       INTEGER NOT NULL DEFAULT 0
+    chat_id      TEXT PRIMARY KEY,
+    chat_label   TEXT NOT NULL DEFAULT '',
+    focused_at   REAL NOT NULL,
+    left         INTEGER NOT NULL DEFAULT 0
 );
 CREATE INDEX IF NOT EXISTS idx_focus_recent ON session_focus (left, focused_at);
 """
+
+
+class _NullCursor:
+    """连接已关闭时的空游标。
+
+    插件卸载（terminate）会关闭连接，但此时可能仍有 handler 停留在 await 里
+    （例如等决策模型返回）。它们恢复后会继续读写，于是撞上「Cannot operate on
+    a closed database」。与其在每个调用点判空，不如在这里给出一个无副作用的
+    替身，让这些迟到的写入静默失效。
+    """
+
+    lastrowid = 0
+    rowcount = 0
+
+    def fetchall(self) -> list:
+        return []
+
+    def fetchone(self):
+        return None
+
+    def fetchmany(self, size: int = 1) -> list:
+        return []
+
+    def __iter__(self):
+        return iter(())
 
 
 class MemoryDB:
@@ -109,6 +138,7 @@ class MemoryDB:
         self.path = Path(data_dir) / "shittim_memory.db"
         self.path.parent.mkdir(parents=True, exist_ok=True)
         self._lock = threading.RLock()
+        self._closed = False
         self._conn = sqlite3.connect(str(self.path), check_same_thread=False)
         self._conn.row_factory = sqlite3.Row
         with self._lock:
@@ -142,29 +172,44 @@ class MemoryDB:
         """对外暴露的锁，供需要「多次操作保持原子」的调用方使用。"""
         return self._lock
 
-    def execute(self, sql: str, params: tuple = ()) -> sqlite3.Cursor:
+    @property
+    def closed(self) -> bool:
+        """连接是否已关闭。调用方可据此避免把「丢弃」报告成「成功」。"""
+        return self._closed
+
+    def execute(self, sql: str, params: tuple = ()) -> sqlite3.Cursor | _NullCursor:
+        if self._closed:
+            return _NullCursor()
         with self._lock:
             cursor = self._conn.execute(sql, params)
             self._conn.commit()
             return cursor
 
     def executemany(self, sql: str, rows: list[tuple]) -> None:
-        if not rows:
+        if not rows or self._closed:
             return
         with self._lock:
             self._conn.executemany(sql, rows)
             self._conn.commit()
 
     def query(self, sql: str, params: tuple = ()) -> list[sqlite3.Row]:
+        if self._closed:
+            return []
         with self._lock:
             return self._conn.execute(sql, params).fetchall()
 
     def query_one(self, sql: str, params: tuple = ()) -> sqlite3.Row | None:
+        if self._closed:
+            return None
         with self._lock:
             return self._conn.execute(sql, params).fetchone()
 
     def close(self) -> None:
+        """关闭连接。幂等；关闭后所有读写静默失效而不是抛异常。"""
         with self._lock:
+            if self._closed:
+                return
+            self._closed = True
             try:
                 self._conn.close()
             except Exception:

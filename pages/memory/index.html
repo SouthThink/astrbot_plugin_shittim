@@ -1,0 +1,497 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>记忆</title>
+    <!-- 主动引入宿主桥：AstrBot 会给这行补上访问令牌，并且因为已存在就不再往
+         文档末尾重复注入——注入在末尾的话，会晚于本页的内联脚本执行。 -->
+    <script src="/api/plugin/page/bridge-sdk.js"></script>
+    <style>
+      :root {
+        --bg: #f6f7f9;
+        --card: #ffffff;
+        --text: #1f2329;
+        --muted: #8a9099;
+        --line: #e5e6eb;
+        --accent: #4d7cfe;
+        --accent-soft: rgba(77, 124, 254, 0.12);
+        --warn: #d9822b;
+        --warn-soft: rgba(217, 130, 43, 0.14);
+        --ok: #2f9e6f;
+        --ok-soft: rgba(47, 158, 111, 0.14);
+      }
+      @media (prefers-color-scheme: dark) {
+        :root {
+          --bg: #1a1d21;
+          --card: #232629;
+          --text: #e6e8ea;
+          --muted: #8b9199;
+          --line: #33373c;
+          --accent: #6b91ff;
+          --accent-soft: rgba(107, 145, 255, 0.18);
+          --warn: #e0a05a;
+          --warn-soft: rgba(224, 160, 90, 0.18);
+          --ok: #4cc38a;
+          --ok-soft: rgba(76, 195, 138, 0.18);
+        }
+      }
+      * { box-sizing: border-box; }
+      body {
+        margin: 0;
+        padding: 20px;
+        background: var(--bg);
+        color: var(--text);
+        font: 14px/1.6 -apple-system, "Segoe UI", "Microsoft YaHei", sans-serif;
+      }
+      .head {
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        gap: 12px;
+        margin-bottom: 16px;
+      }
+      .head h1 { font-size: 18px; margin: 0; font-weight: 600; }
+      button {
+        font: inherit;
+        color: var(--text);
+        background: var(--card);
+        border: 1px solid var(--line);
+        border-radius: 8px;
+        padding: 6px 14px;
+        cursor: pointer;
+      }
+      button:hover:not(:disabled) { border-color: var(--accent); color: var(--accent); }
+      button:disabled { opacity: 0.45; cursor: default; }
+      .stats {
+        display: grid;
+        grid-template-columns: repeat(auto-fit, minmax(120px, 1fr));
+        gap: 10px;
+        margin-bottom: 16px;
+      }
+      .stat {
+        background: var(--card);
+        border: 1px solid var(--line);
+        border-radius: 10px;
+        padding: 12px 14px;
+      }
+      .stat .num { font-size: 20px; font-weight: 600; }
+      .stat .cap { color: var(--muted); font-size: 12px; }
+      .tabs {
+        display: flex;
+        gap: 6px;
+        margin-bottom: 12px;
+        flex-wrap: wrap;
+      }
+      .tabs button.active {
+        color: var(--accent);
+        border-color: var(--accent);
+        background: var(--accent-soft);
+      }
+      .filters {
+        display: flex;
+        gap: 8px;
+        align-items: center;
+        margin-bottom: 12px;
+        flex-wrap: wrap;
+      }
+      select {
+        font: inherit;
+        color: var(--text);
+        background: var(--card);
+        border: 1px solid var(--line);
+        border-radius: 8px;
+        padding: 6px 10px;
+        max-width: 320px;
+      }
+      .item {
+        background: var(--card);
+        border: 1px solid var(--line);
+        border-radius: 10px;
+        padding: 12px 14px;
+        margin-bottom: 8px;
+      }
+      .meta {
+        display: flex;
+        flex-wrap: wrap;
+        gap: 8px;
+        align-items: center;
+        color: var(--muted);
+        font-size: 12px;
+        margin-bottom: 6px;
+      }
+      .who { color: var(--text); font-weight: 600; }
+      .who.self { color: var(--accent); }
+      .body { white-space: pre-wrap; word-break: break-word; }
+      .tags { color: var(--muted); font-size: 12px; margin-top: 6px; }
+      .quote {
+        margin-top: 6px;
+        padding-left: 10px;
+        border-left: 2px solid var(--line);
+        color: var(--muted);
+        font-size: 12px;
+        white-space: pre-wrap;
+      }
+      .badge {
+        padding: 1px 8px;
+        border-radius: 999px;
+        background: var(--accent-soft);
+        color: var(--accent);
+      }
+      .badge.warn { background: var(--warn-soft); color: var(--warn); }
+      .badge.ok { background: var(--ok-soft); color: var(--ok); }
+      .pager {
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        gap: 12px;
+        margin-top: 16px;
+        color: var(--muted);
+      }
+      .empty, .status {
+        text-align: center;
+        color: var(--muted);
+        padding: 24px 0;
+      }
+      .status.error { color: var(--warn); }
+      .hidden { display: none; }
+    </style>
+  </head>
+  <body>
+    <div class="head">
+      <h1>什亭之枢 · 记忆</h1>
+      <button id="refresh">刷新</button>
+    </div>
+
+    <div class="stats" id="stats"></div>
+
+    <div class="tabs" id="tabs">
+      <button data-tab="short" class="active">短期账本</button>
+      <button data-tab="long">长期记忆</button>
+      <button data-tab="permanent">永久记忆</button>
+    </div>
+
+    <div class="filters" id="filters">
+      <select id="chat-filter"><option value="">全部会话</option></select>
+    </div>
+
+    <main id="list"></main>
+
+    <div class="pager hidden" id="pager">
+      <button id="prev">上一页</button>
+      <span id="pageinfo"></span>
+      <button id="next">下一页</button>
+    </div>
+
+    <div class="status" id="status">载入中…</div>
+
+    <script>
+      const PLUGIN = "astrbot_plugin_shittim";
+      const PAGE_LIMIT = 50;
+
+      const state = { tab: "short", chatId: "", offset: 0, total: 0 };
+
+      const el = {
+        stats: document.getElementById("stats"),
+        tabs: document.getElementById("tabs"),
+        filters: document.getElementById("filters"),
+        chatFilter: document.getElementById("chat-filter"),
+        list: document.getElementById("list"),
+        pager: document.getElementById("pager"),
+        pageInfo: document.getElementById("pageinfo"),
+        prev: document.getElementById("prev"),
+        next: document.getElementById("next"),
+        status: document.getElementById("status"),
+        refresh: document.getElementById("refresh"),
+      };
+
+      // 宿主桥由 AstrBot 注入。这里不缓存引用，并在需要时等它出现：桥的注入
+      // 位置不由本页决定，缓存早了就会一路走下面的回退分支。
+      function getBridge() {
+        return (typeof window !== "undefined" && window.AstrBotPluginPage) || null;
+      }
+
+      async function waitForBridge(timeoutMs = 1000) {
+        const deadline = Date.now() + timeoutMs;
+        for (;;) {
+          const bridge = getBridge();
+          if (bridge) return bridge;
+          if (Date.now() >= deadline) return null;
+          await new Promise((resolve) => setTimeout(resolve, 30));
+        }
+      }
+
+      async function apiGet(path, params) {
+        const bridge = await waitForBridge();
+        if (bridge) {
+          // 插件页是 sandbox 的 opaque origin，自己发请求必被 401 挡下，
+          // 只能交给宿主代发（它带着 dashboard 的鉴权）。
+          await bridge.ready();
+          return await bridge.apiGet(path, params || {});
+        }
+        // 直接打开这个 HTML 独立调试时才会走到这里，正常在插件页里走不到
+        const url = new URL(`/api/plug/${PLUGIN}/${path}`, location.origin);
+        Object.entries(params || {}).forEach(([key, value]) => {
+          if (value !== undefined && value !== null && value !== "") {
+            url.searchParams.set(key, String(value));
+          }
+        });
+        const resp = await fetch(url.toString(), { credentials: "include" });
+        const body = await resp.json();
+        if (body && body.status === "error") throw new Error(body.message || "请求失败");
+        return body && "data" in body ? body.data : body;
+      }
+
+      function fmtTime(ts) {
+        if (!ts) return "—";
+        const d = new Date(ts * 1000);
+        const pad = (n) => String(n).padStart(2, "0");
+        return `${pad(d.getMonth() + 1)}-${pad(d.getDate())} ${pad(d.getHours())}:${pad(d.getMinutes())}`;
+      }
+
+      function fmtAge(ts) {
+        if (!ts) return "";
+        const sec = Math.max(Date.now() / 1000 - ts, 0);
+        if (sec < 60) return "刚刚";
+        if (sec < 3600) return `${Math.floor(sec / 60)}分钟前`;
+        if (sec < 86400) return `${Math.floor(sec / 3600)}小时前`;
+        return `${Math.floor(sec / 86400)}天前`;
+      }
+
+      function tag(text, cls) {
+        const span = document.createElement("span");
+        span.className = "badge" + (cls ? " " + cls : "");
+        span.textContent = text;
+        return span;
+      }
+
+      function line(text, cls) {
+        const span = document.createElement("span");
+        if (cls) span.className = cls;
+        span.textContent = text;
+        return span;
+      }
+
+      function setStatus(text, isError) {
+        el.status.textContent = text || "";
+        el.status.className = "status" + (isError ? " error" : "");
+        el.status.classList.toggle("hidden", !text);
+      }
+
+      function renderStats(data) {
+        el.stats.replaceChildren();
+        const cards = [
+          ["短期消息", data.short_term],
+          ["活跃会话", data.chats],
+          ["长期记忆", data.long],
+          ["永久记忆", data.permanent],
+          ["关注中会话", data.focused],
+        ];
+        cards.forEach(([cap, num]) => {
+          const box = document.createElement("div");
+          box.className = "stat";
+          const n = document.createElement("div");
+          n.className = "num";
+          n.textContent = String(num ?? 0);
+          const c = document.createElement("div");
+          c.className = "cap";
+          c.textContent = cap;
+          box.append(n, c);
+          el.stats.appendChild(box);
+        });
+      }
+
+      function renderChats(chats) {
+        const current = el.chatFilter.value;
+        el.chatFilter.replaceChildren();
+        const all = document.createElement("option");
+        all.value = "";
+        all.textContent = "全部会话";
+        el.chatFilter.appendChild(all);
+        chats.forEach((chat) => {
+          const option = document.createElement("option");
+          option.value = chat.chat_id;
+          option.textContent = `${chat.chat_label || chat.chat_id}（${chat.message_count}）`;
+          el.chatFilter.appendChild(option);
+        });
+        el.chatFilter.value = current;
+      }
+
+      function renderShortTerm(items) {
+        el.list.replaceChildren();
+        if (!items.length) {
+          el.list.appendChild(emptyNode("这片记忆还是空的"));
+          return;
+        }
+        items.forEach((item) => {
+          const box = document.createElement("div");
+          box.className = "item";
+          const meta = document.createElement("div");
+          meta.className = "meta";
+          meta.appendChild(line(item.chat_label || item.chat_id));
+          meta.appendChild(
+            line(
+              item.role === "assistant" ? "爱丽丝" : item.sender_name || item.sender_id || "某人",
+              "who" + (item.role === "assistant" ? " self" : "")
+            )
+          );
+          meta.appendChild(line(`${fmtTime(item.created_at)} · ${fmtAge(item.created_at)}`));
+          if (item.gated) {
+            meta.appendChild(tag("主脑看不到", "warn"));
+          }
+          if (item.source === "backfill") {
+            meta.appendChild(tag("回填"));
+          }
+          if (item.extracted) {
+            meta.appendChild(tag("已提炼", "ok"));
+          }
+          const body = document.createElement("div");
+          body.className = "body";
+          body.textContent = item.content;
+          box.append(meta, body);
+          el.list.appendChild(box);
+        });
+      }
+
+      function renderMemories(items) {
+        el.list.replaceChildren();
+        if (!items.length) {
+          el.list.appendChild(emptyNode("这层还没有记忆"));
+          return;
+        }
+        items.forEach((item) => {
+          const box = document.createElement("div");
+          box.className = "item";
+          const meta = document.createElement("div");
+          meta.className = "meta";
+          meta.appendChild(tag(item.tier === "permanent" ? "永久" : "长期"));
+          meta.appendChild(line(`强度 ${item.strength}`));
+          meta.appendChild(line(`${fmtTime(item.created_at)} · ${fmtAge(item.created_at)}`));
+          meta.appendChild(tag(`召回 ${item.recall_count} 次`));
+          if (item.cross_chat_count > 1) {
+            meta.appendChild(tag(`跨 ${item.cross_chat_count} 个会话`));
+          }
+          if (item.manual) {
+            meta.appendChild(tag("手动记住", "ok"));
+          }
+          if (item.chat_label) {
+            meta.appendChild(line(`来自 ${item.chat_label}`));
+          }
+          const body = document.createElement("div");
+          body.className = "body";
+          body.textContent = item.content;
+          box.append(meta, body);
+
+          const words = [...(item.tags || []), ...(item.keywords || [])];
+          if (words.length) {
+            const tags = document.createElement("div");
+            tags.className = "tags";
+            tags.textContent = words.map((word) => `#${word}`).join(" ");
+            box.appendChild(tags);
+          }
+          if (item.source_quote) {
+            const quote = document.createElement("div");
+            quote.className = "quote";
+            quote.textContent = `原话：${item.source_quote}`;
+            box.appendChild(quote);
+          }
+          el.list.appendChild(box);
+        });
+      }
+
+      function emptyNode(text) {
+        const div = document.createElement("div");
+        div.className = "empty";
+        div.textContent = text;
+        return div;
+      }
+
+      function renderPager() {
+        const pages = Math.max(Math.ceil(state.total / PAGE_LIMIT), 1);
+        const page = Math.floor(state.offset / PAGE_LIMIT) + 1;
+        el.pageInfo.textContent = `第 ${page} / ${pages} 页 · 共 ${state.total} 条`;
+        el.prev.disabled = state.offset <= 0;
+        el.next.disabled = state.offset + PAGE_LIMIT >= state.total;
+        el.pager.classList.toggle("hidden", state.total <= PAGE_LIMIT);
+      }
+
+      async function loadOverview() {
+        renderStats(await apiGet("overview"));
+      }
+
+      async function loadChats() {
+        renderChats(await apiGet("chats"));
+      }
+
+      async function loadList() {
+        const data =
+          state.tab === "short"
+            ? await apiGet("short_term", {
+                chat_id: state.chatId,
+                limit: PAGE_LIMIT,
+                offset: state.offset,
+              })
+            : await apiGet("memories", {
+                tier: state.tab,
+                limit: PAGE_LIMIT,
+                offset: state.offset,
+              });
+        state.total = data.total || 0;
+        if (state.tab === "short") {
+          renderShortTerm(data.items || []);
+        } else {
+          renderMemories(data.items || []);
+        }
+        renderPager();
+      }
+
+      async function reload() {
+        setStatus("载入中…");
+        el.refresh.disabled = true;
+        try {
+          await Promise.all([loadOverview(), loadChats()]);
+          await loadList();
+          setStatus("");
+        } catch (error) {
+          console.error("[记忆页面]", error);
+          setStatus(`载入失败：${error.message || error}`, true);
+        } finally {
+          el.refresh.disabled = false;
+        }
+      }
+
+      el.refresh.addEventListener("click", reload);
+
+      el.tabs.addEventListener("click", (event) => {
+        const button = event.target.closest("button[data-tab]");
+        if (!button) return;
+        state.tab = button.dataset.tab;
+        state.offset = 0;
+        [...el.tabs.querySelectorAll("button")].forEach((item) =>
+          item.classList.toggle("active", item === button)
+        );
+        // 会话筛选只对短期账本有意义
+        el.filters.classList.toggle("hidden", state.tab !== "short");
+        reload();
+      });
+
+      el.chatFilter.addEventListener("change", () => {
+        state.chatId = el.chatFilter.value;
+        state.offset = 0;
+        reload();
+      });
+
+      el.prev.addEventListener("click", () => {
+        state.offset = Math.max(state.offset - PAGE_LIMIT, 0);
+        loadList().catch((error) => setStatus(`载入失败：${error.message}`, true));
+      });
+
+      el.next.addEventListener("click", () => {
+        state.offset += PAGE_LIMIT;
+        loadList().catch((error) => setStatus(`载入失败：${error.message}`, true));
+      });
+
+      reload();
+    </script>
+  </body>
+</html>

@@ -49,15 +49,30 @@
         "type": "int",
         "default": 200
       },
-      "short_term_context_messages": {
-        "description": "每次请求附带的近期原始消息条数",
+      "short_term_context_per_chat": {
+        "description": "跨会话语境：每个会话取最近几条（按会话配额，避免话痨群挤掉其它会话）",
         "type": "int",
-        "default": 20
+        "default": 6
+      },
+      "short_term_context_chats": {
+        "description": "跨会话语境：最多纳入几个会话",
+        "type": "int",
+        "default": 6
       },
       "short_term_context_tokens": {
         "description": "近期原始消息的 token 预算",
         "type": "int",
         "default": 2000
+      },
+      "merge_gated_into_contexts": {
+        "description": "把同步进记忆但 AstrBot 看不到的对话回合插回上下文（她主动发出的消息、被拦下的消息）",
+        "type": "bool",
+        "default": true
+      },
+      "strip_invalid_images": {
+        "description": "请求前摘除读不到的图片引用（坏图会让整条请求被上游拒绝并导致切换到备用模型）",
+        "type": "bool",
+        "default": true
       },
       "recall_top_k": {
         "description": "与当前消息相关的记忆条数上限",
@@ -167,10 +182,40 @@
         "items": { "type": "string" },
         "default": []
       },
+      "disable_builtin_send_tool": {
+        "description": "从每次请求的工具列表里摘除 AstrBot 内置的 send_message_to_user（它参数写错时会静默发到当前会话，造成错发）",
+        "type": "bool",
+        "default": true
+      },
       "context_messages": {
-        "description": "决策时给她看的近期消息条数",
+        "description": "决策时给她看的近期消息条数（每个会话各取这么多）",
         "type": "int",
-        "default": 12
+        "default": 6
+      },
+      "patrol_enabled": {
+        "description": "群聊巡检：不逐条判定，而是把一小段时间的消息攒起来判一次",
+        "type": "bool",
+        "default": true
+      },
+      "patrol_window_seconds": {
+        "description": "巡检窗口：群里安静这么多秒后，对这段时间的对话判一次",
+        "type": "float",
+        "default": 5.0
+      },
+      "patrol_max_wait_seconds": {
+        "description": "巡检封顶：群里一直有人说话时，最多等这么久就必须判一次",
+        "type": "float",
+        "default": 20.0
+      },
+      "patrol_cooldown_seconds": {
+        "description": "判定为不回后，该会话在这么多秒内不再调用决策模型",
+        "type": "float",
+        "default": 60.0
+      },
+      "patrol_noise_filter": {
+        "description": "窗口内只有图片/表情、复读、同一人连刷短句时，直接判不回（不花模型调用，也不进冷却）",
+        "type": "bool",
+        "default": true
       }
     }
   },
@@ -196,6 +241,11 @@
     "items": {
       "enabled": {
         "description": "是否允许 LLM 主动发送消息",
+        "type": "bool",
+        "default": true
+      },
+      "silence_origin_after_say": {
+        "description": "她前往别的会话后，不再回原会话收尾汇报（她的话说在那边，不说在这边）",
         "type": "bool",
         "default": true
       },

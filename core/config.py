@@ -48,8 +48,17 @@ class MemoryConfig:
 
     # ── 短期层 ────────────────────────────────────────────
     short_term_max_messages: int = 400    # 每个会话各保留多少条（按会话分组淘汰）
-    short_term_context_messages: int = 20 # 每个请求带上的近期原始消息条数
-    short_term_context_tokens: int = 2000 # 近期原始消息的 token 预算
+    # 跨会话语境：按会话配额取，而不是全局取最近 N 条——
+    # 否则一个话痨群能把其它所有会话挤出她的经历之外
+    short_term_context_per_chat: int = 6  # 每个会话取最近几条
+    short_term_context_chats: int = 6     # 最多纳入几个会话
+    short_term_context_tokens: int = 2000 # 这块的 token 预算
+    # 把「账本里有、AstrBot 没有」的真实对话回合插回 req.contexts
+    # （她主动发出的消息、被拦下的消息），而不是当背景备注附加
+    merge_gated_into_contexts: bool = True
+    # 请求发出前摘掉读不到的图片引用：一张坏图会让整条请求被上游 400 拒绝，
+    # 而 AstrBot 会因此把这轮切给备用模型（人格与工具全变）
+    strip_invalid_images: bool = True
     # 从 AstrBot 官方历史回填插件不在场期间的对话
     backfill_astrbot_history: bool = True
     backfill_max_messages: int = 200      # 每个会话最多回填多少条
@@ -82,11 +91,18 @@ class MemoryConfig:
             extract_max_items=_get_int(cfg, "memory.extract_max_items", 5),
             extract_min_strength=_get_float(cfg, "memory.extract_min_strength", 1.0),
             short_term_max_messages=_get_int(cfg, "memory.short_term_max_messages", 400),
-            short_term_context_messages=_get_int(
-                cfg, "memory.short_term_context_messages", 20
+            short_term_context_per_chat=_get_int(
+                cfg, "memory.short_term_context_per_chat", 6
             ),
+            short_term_context_chats=_get_int(cfg, "memory.short_term_context_chats", 6),
             short_term_context_tokens=_get_int(
                 cfg, "memory.short_term_context_tokens", 2000
+            ),
+            merge_gated_into_contexts=bool(
+                _get(cfg, "memory.merge_gated_into_contexts", True)
+            ),
+            strip_invalid_images=bool(
+                _get(cfg, "memory.strip_invalid_images", True)
             ),
             backfill_astrbot_history=bool(
                 _get(cfg, "memory.backfill_astrbot_history", True)
@@ -127,8 +143,20 @@ class DecisionConfig:
     allow_upstream_commands: bool = True
     # 她的名字 / 唤醒词，命中即视为被叫到
     aliases: tuple[str, ...] = ()
-    # 决策时给她看的近期消息条数
-    context_messages: int = 12
+    # 决策时给她看的近期消息条数（每个会话各取这么多）
+    context_messages: int = 6
+    # ── 群聊巡检 ──────────────────────────────────────────
+    # 不逐条判定，而是把一小段时间的消息攒起来判一次：既是省 token，
+    # 更是因为单条判定会让模型看不到「这轮对话已经闭环了」。
+    patrol_enabled: bool = True
+    patrol_window_seconds: float = 5.0     # 群里安静这么久就判一次
+    patrol_max_wait_seconds: float = 20.0  # 一直有人说话时的封顶，否则永远不判
+    patrol_cooldown_seconds: float = 60.0  # 判「不回」后，该会话多久不再开窗
+    patrol_noise_filter: bool = True       # 整段只有图片/复读/连刷时不花模型调用
+    # 移除 AstrBot 内置的 send_message_to_user。
+    # 该工具在参数写错时会静默把消息发到当前会话（实测已造成一次错发），
+    # 而且绕过会话解析与焦点校验。既然由我们的 say 接管跨会话发言，就该关掉它。
+    disable_builtin_send_tool: bool = True
 
     @classmethod
     def from_dict(cls, cfg: dict | None) -> "DecisionConfig":
@@ -153,7 +181,23 @@ class DecisionConfig:
                 _get(cfg, "decision.allow_upstream_commands", True)
             ),
             aliases=aliases,
-            context_messages=_get_int(cfg, "decision.context_messages", 12),
+            context_messages=_get_int(cfg, "decision.context_messages", 6),
+            patrol_enabled=bool(_get(cfg, "decision.patrol_enabled", True)),
+            patrol_window_seconds=_get_float(
+                cfg, "decision.patrol_window_seconds", 5.0
+            ),
+            patrol_max_wait_seconds=_get_float(
+                cfg, "decision.patrol_max_wait_seconds", 20.0
+            ),
+            patrol_cooldown_seconds=_get_float(
+                cfg, "decision.patrol_cooldown_seconds", 60.0
+            ),
+            patrol_noise_filter=bool(
+                _get(cfg, "decision.patrol_noise_filter", True)
+            ),
+            disable_builtin_send_tool=bool(
+                _get(cfg, "decision.disable_builtin_send_tool", True)
+            ),
         )
 
 

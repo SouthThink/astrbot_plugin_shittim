@@ -3,9 +3,14 @@
 ## 四条链路
 
 **拦放链路（接管官方 LLM）**
-  所有消息 → 记入短期账本 + 刷新该会话焦点 → 决断层判定
-    ├─ 不回 → stop_event()，AstrBot 官方 LLM 完全不触发
-    └─ 要回 → 置位 is_at_or_wake_command，放行主脑生成回复
+  所有消息 → 记入短期账本 + 刷新该会话焦点 → 决断层规则层
+    ├─ 上游指令 / 私聊 / 被点名 / 无文本 → 当场定夺
+    └─ 群聊里的普通消息 → 巡检窗口：攒一小段对话再判一次
+         ├─ 不回 → stop_event()，官方 LLM 完全不触发，该会话安静一阵
+         └─ 要回 → 置位 is_at_or_wake_command，放行主脑生成回复
+
+  不逐条判定是有原因的：单条消息看不出「这轮问答已经闭环」，而一次慢调用
+  的判定若迟到几十秒，她会拿着过期判断去干预已经在聊别的话题的群。
 
 **焦点链路（她在哪）**
   她可以同时在多个会话里"在场"，像一个人同时开着几个聊天窗口。
@@ -29,7 +34,7 @@ import time
 from collections import deque
 
 from astrbot.api import logger
-from astrbot.api.event import AstrMessageEvent, filter
+from astrbot.api.event import AstrMessageEvent, MessageChain, filter
 from astrbot.api.message_components import Plain
 from astrbot.api.star import Context, Star, register
 from astrbot.core.star.star_tools import StarTools
@@ -38,11 +43,12 @@ from .core.config import DecisionConfig, FocusConfig, MemoryConfig
 from .core.db import MemoryDB
 from .core.decision import DecisionEngine
 from .core.event_utils import (
+    EXTRA_LEFT_TO,
     EXTRA_MESSAGE_ID,
     call_str,
     describe_chat,
+    describe_non_text,
     extract_reply_text,
-    format_age,
     get_extra,
     is_private_chat,
     platform_of,
@@ -50,20 +56,34 @@ from .core.event_utils import (
 )
 from .core.extractor import MemoryExtractor
 from .core.focus import FocusManager
-from .core.history import ConversationHistoryReader, align_records
+from .core.history import (
+    ConversationHistoryReader,
+    align_records,
+    merge_missing_into_contexts,
+    strip_invalid_image_urls,
+    strip_invalid_images,
+)
 from .core.injector import (
     build_block,
+    build_injected_entry,
     build_recent_context_block,
     format_for_log,
-    inject_into_request,
 )
 from .core.maintenance import MemoryMaintainer
 from .core.memory_store import MemoryStore
+from .core.patrol import (
+    KILL as PATROL_KILL,
+    PROCESS as PATROL_PROCESS,
+    PatrolManager,
+)
 from .core.short_term import (
     HISTORY_SENDER_ID,
+    SOURCE_BACKFILL,
     ShortTermLedger,
     format_message_line,
 )
+from .core.time_utils import format_age
+from .web_api import register_all_routes
 
 # 决断层在事件链上的优先级：必须早于 AstrBot 的默认 LLM 阶段。
 # 记账用 100、判定用 90，保证判定时当前消息已在账本里。
@@ -74,9 +94,17 @@ from .core.short_term import (
 # 即可让出优先级，只要仍高于默认 LLM 阶段就依然能拦住官方 LLM。
 _PRIORITY_RECORD = 100
 _PRIORITY_GATE = 90
-# 上下文注入与发送后收口
+# 工具清理与上下文注入
+_PRIORITY_TOOLS = 60
 _PRIORITY_INJECT = 50
+# 结果装饰：放在最后，让其它插件先跑完，我们最后决定要不要发
+_PRIORITY_DECORATE = -100
+# 发送后收口
 _PRIORITY_AFTER_SENT = 100
+
+# AstrBot 内置的「给用户发消息」工具。它参数写错时会静默发到当前会话，
+# 由我们逐请求摘除，跨会话发言统一走 say。
+_BUILTIN_SEND_TOOL = "send_message_to_user"
 
 # 休息状态机落地前的临时兜底：距上次维护超过该时长就在回复后补跑一次
 _MAINTENANCE_FALLBACK_SECONDS = 24 * 3600
@@ -93,6 +121,20 @@ def _plugin_version() -> str:
     except (OSError, ValueError):
         pass
     return "0.0.0"
+
+
+def _build_plain_chain(text: str) -> MessageChain:
+    """构造一条纯文本消息链。
+
+    两种写法都试：`Context.send_message` 要求第二个参数是 MessageChain
+    （内部会取 `.chain`），传组件列表会报「'list' object has no attribute
+    'chain'」。但不同 AstrBot 版本对 MessageChain 的构造方式不一致，
+    所以退一步再试列表构造。
+    """
+    try:
+        return MessageChain().message(text)
+    except Exception:
+        return MessageChain([Plain(text)])
 
 
 @register(
@@ -134,6 +176,10 @@ class ShittimPlugin(Star):
             self.memory_store,
         )
         self.focus = FocusManager(self.db, self.focus_config)
+        # 群聊巡检：把「每条消息问一次模型」改成「攒一小段再判一次」
+        self.patrol = PatrolManager(
+            self.decision_config, self.short_term, self.decider
+        )
         self.history_reader = ConversationHistoryReader(self.context)
 
         # ── 运行时状态 ────────────────────────────────────────
@@ -145,8 +191,13 @@ class ShittimPlugin(Star):
         self._allowed_targets = self._load_allowed_targets()
         # 已尝试过从官方历史回填的会话（每进程每个会话只试一次）
         self._backfilled: set[str] = set()
+        # 摘除内置工具失败只告警一次，避免每条请求刷屏
+        self._tool_removal_warned = False
+        self._tool_removal_logged = False
 
         tiers = self.memory_store.count_by_tier()
+        # 记忆页面（pages/memory/）的只读接口
+        register_all_routes(self)
         logger.info(
             "[什亭之枢] 初始化完成 | 接管=%s 决策模型=%s | 记忆=%s 提炼模型=%s | "
             "短期%d条 长期%d条 永久%d条 | 关注中%d个会话",
@@ -180,6 +231,10 @@ class ShittimPlugin(Star):
             if sender_id and sender_id == call_str(event, "get_self_id"):
                 return  # 自己的消息由 after_message_sent 记录，避免重复入账
             content = event.get_message_outline() or ""
+            if not content.strip():
+                # 图片/表情这类无文本消息：用占位描述入账，让她的经历不留空白。
+                # 决断层那边拿到的仍是空文本，所以照样不会触发回复。
+                content = describe_non_text(event)
             if not content.strip():
                 return
             chat_kind, chat_label = describe_chat(event)
@@ -222,38 +277,140 @@ class ShittimPlugin(Star):
     async def gate_official_llm(self, event: AstrMessageEvent):
         """在 AstrBot 官方 LLM 被触发之前做拦放判定。
 
+        **规则层**能定的（上游指令、私聊、被点名、空文本）当场定夺；剩下的
+        群聊普通消息交给**巡检器**：把这条事件扣押进窗口，等这段对话说完再
+        判一次要不要接话——而不是每来一句就问一次模型。
+
         要回 → 置位 is_at_or_wake_command 强行唤醒主脑，让它生成回复；
         不回 → stop_event()，官方 LLM 完全不触发。
         """
         if not self._gate_active():
             return
+
         try:
-            decision = await self.decider.decide(event)
+            ruled = self.decider.rule_decide(event)
         except Exception as error:
             # 决断层自己出问题不该让机器人陪葬：放行，交给原生链路
             logger.error("[什亭之枢] 决断层异常，已放行: %s", error)
             return
 
+        if ruled is not None:
+            self._apply_decision(event, ruled)
+            return
+
+        await self._gate_by_patrol(event)
+
+    async def _gate_by_patrol(self, event: AstrMessageEvent) -> None:
+        """群聊里的普通消息：扣押进窗口，攒一段再判。"""
+        chat_id = event.unified_msg_origin or ""
+
+        if not self.decision_config.patrol_enabled:
+            # 巡检关闭：退回逐条判定，用账本里最新这条当判据
+            chat_label, lines = self._latest_window(chat_id)
+            decision = await self.decider.judge_window(chat_id, chat_label, lines)
+            if self._is_terminating:
+                return
+            self._apply_decision(event, decision)
+            return
+
+        future = await self.patrol.hold(chat_id, event)
+        if future is None:
+            # 冷却中：安静地拦下，连窗口都不开
+            if not self._is_terminating:
+                self._block(event)
+            return
+
+        verdict = await future
+        # 等窗口的这几秒里插件可能已被重载或卸载，此时不该再动这个事件：
+        # 新实例的巡检会重新判定，我们插手只会两边打架。
+        if self._is_terminating:
+            logger.debug("[什亭之枢] 插件已卸载，放弃本次巡检结果")
+            return
+        if verdict == PATROL_PROCESS:
+            self._release(event)
+            logger.info("[什亭之枢] 放行主脑 [patrol] 窗口判定：开口")
+        else:
+            self._block(event)
+            logger.info("[什亭之枢] 拦截官方 LLM [patrol] 窗口判定：沉默")
+
+    def _apply_decision(self, event: AstrMessageEvent, decision) -> None:
+        """按判定结果放行或拦下这条事件。"""
         if decision.passthrough:
             logger.debug("[什亭之枢] 原样让路 [%s] %s", decision.source, decision.reason)
             return
-
         if decision.should_reply:
-            try:
-                # 群聊里 AstrBot 可能判定未唤醒而不调用主脑，这里强行唤醒
-                event.is_at_or_wake_command = True
-            except Exception:
-                pass
+            self._release(event)
             logger.info("[什亭之枢] 放行主脑 [%s] %s", decision.source, decision.reason)
             return
+        self._block(event)
+        logger.info("[什亭之枢] 拦截官方 LLM [%s] %s", decision.source, decision.reason)
 
+    def _release(self, event: AstrMessageEvent) -> None:
+        """放行主脑。
+
+        群聊里 AstrBot 可能判定未唤醒而不调用主脑，这里强行唤醒。
+        """
+        try:
+            event.is_at_or_wake_command = True
+        except Exception:
+            pass
+
+    def _block(self, event: AstrMessageEvent) -> None:
+        """拦下这条事件：官方 LLM 完全不触发。"""
         event.stop_event()
         self._mark_gated(event)
-        logger.info("[什亭之枢] 拦截官方 LLM [%s] %s", decision.source, decision.reason)
+
+    def _latest_window(self, chat_id: str) -> tuple[str, list[str]]:
+        """逐条判定模式下的判据：该会话账本里最新的一条。"""
+        rows = self.short_term.recent_of_chat(chat_id, 1)
+        if not rows:
+            return "", []
+        return str(rows[-1]["chat_label"] or ""), [format_message_line(rows[-1])]
 
     # ══════════════════════════════════════════════════════════
     #  事件：召回并注入记忆
     # ══════════════════════════════════════════════════════════
+
+    @filter.on_llm_request(priority=_PRIORITY_TOOLS)
+    async def hide_builtin_send_tool(self, event: AstrMessageEvent, req):
+        """把 AstrBot 内置的 send_message_to_user 从本次请求的可用工具里摘掉。
+
+        为什么必须在这一层：全局的 `provider_manager.llm_tools.remove_func()` 对
+        这个内置工具无效——调用不报错，日志显示「已移除」，但模型照样能调用
+        （实测过）。它显然不在插件工具注册表里。逐请求摘除才是可靠的拦截点。
+
+        为什么必须摘掉：该工具参数写错时**不报错，而是静默把消息发到当前会话**。
+        已经造成两次错发——本该发给别人的话发给了正在对话的人。它还绕过我们的
+        会话解析（平台前缀修正）与焦点校验。
+        """
+        if not self.decision_config.disable_builtin_send_tool:
+            return
+        try:
+            func_tool = getattr(req, "func_tool", None)
+            if func_tool is None:
+                # 本次请求压根没有任何工具，无从摘除，也不算异常
+                return
+            remover = getattr(func_tool, "remove_tool", None)
+            if not callable(remover):
+                if not self._tool_removal_warned:
+                    self._tool_removal_warned = True
+                    logger.warning(
+                        "[什亭之枢] 当前 AstrBot 版本不支持 req.func_tool.remove_tool，"
+                        "无法摘除内置 send_message_to_user；请留意模型误用它导致错发"
+                    )
+                return
+            remover(_BUILTIN_SEND_TOOL)
+            if not self._tool_removal_logged:
+                # 只报一次，既给排障一个明确信号，又不刷屏
+                self._tool_removal_logged = True
+                logger.info(
+                    "[什亭之枢] 已从请求工具列表中摘除内置 %s，跨会话发言统一走 say",
+                    _BUILTIN_SEND_TOOL,
+                )
+        except Exception as error:
+            if not self._tool_removal_warned:
+                self._tool_removal_warned = True
+                logger.warning("[什亭之枢] 摘除内置发送工具失败: %s", error)
 
     @filter.on_llm_request(priority=_PRIORITY_INJECT)
     async def inject_memory_context(self, event: AstrMessageEvent, req):
@@ -266,13 +423,26 @@ class ShittimPlugin(Star):
             return
         try:
             chat_id = event.unified_msg_origin or ""
+            contexts = getattr(req, "contexts", None)
+            if not isinstance(contexts, list):
+                self._strip_broken_images(req)
+                return
 
-            # 1) 跨会话近期原始上下文：让她知道「别处发生了什么」
-            recent_text = self.short_term.build_recent_block(exclude_chat_id=chat_id)
-            if recent_text:
-                inject_into_request(req, build_recent_context_block(recent_text))
+            # 注入顺序 = 模型的读取顺序。背景块一律**插在原生历史之前**，
+            # 而不是追加到末尾：
+            #   长期记忆 → 别处的经历 → 原生历史（含合并回来的真实回合） → 当前消息
+            # 她读到的顺序与真实经历一致：先想起「我是谁、我知道什么」，再回忆
+            # 「我刚才在别处经历了什么」，最后才是眼前这段对话。背景块若贴在
+            # 末尾，权重会压过对方刚说的话，让她像在自说自话。
 
-            # 2) 长期记忆双通道召回：消息相关 + 发送者相关
+            # 1) 先把「账本里有、AstrBot 没有」的实时回合插回**原生** contexts。
+            #    必须在插入背景块之前做：否则我们注入的块会被当成原生条目参与
+            #    对齐，缺口位置就会算错。
+            self._merge_missing_messages(event, req, chat_id)
+
+            prefix: list[dict] = []
+
+            # 2) 长期记忆双通道召回：消息相关 + 发送者相关。最前面，作为底子。
             recalled = self.memory_store.recall(
                 query_text=self._build_query_text(chat_id),
                 user_id=call_str(event, "get_sender_id") or None,
@@ -280,19 +450,64 @@ class ShittimPlugin(Star):
             block, used_ids = build_block(
                 recalled, self.memory_config.recall_token_budget
             )
-            if block and inject_into_request(req, block):
+            if block:
+                prefix.append(build_injected_entry(block))
                 self.memory_store.mark_recalled(used_ids)
                 logger.debug(
                     "[什亭之枢] 召回 %d 条记忆: %s",
                     len(used_ids),
                     format_for_log(recalled),
                 )
+
+            # 3) 别处的经历：只放语境，不复述当前会话（它已在原生历史里）
+            recent_text = self.short_term.build_recent_block(exclude_chat_id=chat_id)
+            if recent_text:
+                prefix.append(
+                    build_injected_entry(build_recent_context_block(recent_text))
+                )
+
+            if prefix:
+                req.contexts = prefix + req.contexts
+
+            # 4) 最后一道保险：摘掉读不到的图片引用。坏图会让整条请求被上游
+            #    400 拒绝，而 AstrBot 随后会把这轮切给备用模型——人格和工具全变。
+            self._strip_broken_images(req)
         except Exception as error:
             logger.error("[什亭之枢] 记忆注入失败: %s", error)
 
     # ══════════════════════════════════════════════════════════
     #  事件：发送后收口
     # ══════════════════════════════════════════════════════════
+
+    @filter.on_decorating_result(priority=_PRIORITY_DECORATE)
+    async def drop_origin_reply_after_leaving(self, event: AstrMessageEvent):
+        """她本轮已前往别的会话时，丢掉原会话的收尾发言。
+
+        没有这一步，她就会「走过去说了一句，再跑回来汇报一句」——像隔空喊话
+        加复命，而不是一个真的走过去说话的人。她应该说在那边，不是说在这边。
+
+        注意这不影响她在调用 say **之前**说的话：那部分在工具调用时就已发出，
+        所以「好，我这就去」这类过渡语照常送达，被丢掉的只是走之后的收尾汇报。
+
+        放在极低优先级，让其它插件的结果装饰先跑完，我们最后再决定要不要发。
+        """
+        if not self._proactive_config().get("silence_origin_after_say", True):
+            return
+        if not get_extra(event, EXTRA_LEFT_TO):
+            return
+        try:
+            result = event.get_result() if hasattr(event, "get_result") else None
+            if result is None:
+                return
+            chain = getattr(result, "chain", None)
+            if chain:
+                result.chain = []
+                logger.info(
+                    "[什亭之枢] 她已前往 %s，原会话本轮发言已省略",
+                    get_extra(event, EXTRA_LEFT_TO, ""),
+                )
+        except Exception as error:
+            logger.error("[什亭之枢] 抑制原会话发言失败: %s", error)
 
     @filter.after_message_sent(priority=_PRIORITY_AFTER_SENT)
     async def after_message_sent(self, event: AstrMessageEvent):
@@ -433,7 +648,7 @@ class ShittimPlugin(Star):
             return "错误：主动发言过于频繁，请稍后再试"
 
         try:
-            sent = await self.context.send_message(umo, [Plain(message)])
+            sent = await self.context.send_message(umo, _build_plain_chain(message))
         except Exception as error:
             logger.error("[什亭之枢] 发言失败 | %s | %s", umo, error)
             return f"发送失败：{error}"
@@ -451,6 +666,9 @@ class ShittimPlugin(Star):
         # 她「去」了那里：刷新焦点，之后那边有人说话她会正常参与
         label = self.short_term.label_for_chat(umo)
         self.focus.touch(umo, label)
+        # 标记「她本轮已经离开原会话」：收尾时据此不再回原会话汇报
+        if umo != (event.unified_msg_origin or ""):
+            set_extra(event, EXTRA_LEFT_TO, umo)
         # 写回短期账本。主动说出的话不在 AstrBot 的历史里，标 gated 让
         # 上下文档知道「这条主脑看不到」，避免她忘记自己说过。
         self.short_term.add(
@@ -642,6 +860,8 @@ class ShittimPlugin(Star):
                     # 主脑就再也看不到，必须由我们兜底注入。
                     # 落在实时消息之间的，AstrBot 自己会保留，不必重复注入。
                     "gated": is_older_than_known,
+                    # 回填的历史不参与「合并回 contexts」——又旧又多，会撑爆窗口
+                    "source": SOURCE_BACKFILL,
                 }
                 for record, timestamp, is_older_than_known in placed
             ]
@@ -762,6 +982,7 @@ class ShittimPlugin(Star):
         self.extractor.update_config(self.memory_config)
         self.maintainer.update_config(self.memory_config)
         self.decider.update_config(self.decision_config, self.memory_config)
+        self.patrol.update_config(self.decision_config)
         self.focus.update_config(self.focus_config)
         self._allowed_targets = self._load_allowed_targets()
         logger.info(
@@ -779,6 +1000,8 @@ class ShittimPlugin(Star):
         if pending:
             await asyncio.gather(*pending, return_exceptions=True)
         self._background_tasks.clear()
+        # 扣押中的窗口事件一律按拦下收场，否则它们会一直挂在等待里
+        await self.patrol.cleanup()
         self.db.close()
         logger.info("[什亭之枢] 已卸载，记忆库已关闭")
 
@@ -809,10 +1032,74 @@ class ShittimPlugin(Star):
 
     def _build_query_text(self, chat_id: str) -> str:
         """召回查询词 = 当前会话最近的几条消息。"""
-        rows = self.short_term.recent(self.memory_config.short_term_context_messages)
-        same_chat = [str(row["content"]) for row in rows if str(row["chat_id"]) == chat_id]
-        chosen = same_chat if same_chat else [str(row["content"]) for row in rows[-4:]]
-        return "\n".join(chosen[-8:])
+        rows = self.short_term.recent_of_chat(
+            chat_id, self.memory_config.short_term_context_per_chat * 2
+        )
+        return "\n".join(
+            str(row["content"]) for row in rows[-8:] if str(row["content"] or "").strip()
+        )
+
+    def _strip_broken_images(self, req) -> None:
+        """请求发出前摘掉读不到的图片引用。
+
+        上游只接受 base64 / http(s) 的图片 URL。本地图片由 AstrBot 在 provider
+        层转 base64，一旦转换失败（文件被清理、路径失效、内容为空）它会**原样
+        透传**，严格的上游直接 400 —— 而 AstrBot 随后会把这轮切给备用模型，
+        语气突变、工具调用多半失效。一张坏图的代价不该是整个回合。
+        """
+        if not self.memory_config.strip_invalid_images:
+            return
+        dropped: list[str] = []
+        try:
+            contexts = getattr(req, "contexts", None)
+            if isinstance(contexts, list):
+                cleaned, gone = strip_invalid_images(contexts)
+                if gone:
+                    req.contexts = cleaned
+                    dropped.extend(gone)
+            urls = getattr(req, "image_urls", None)
+            if isinstance(urls, list):
+                cleaned_urls, gone_urls = strip_invalid_image_urls(urls)
+                if gone_urls:
+                    req.image_urls = cleaned_urls
+                    dropped.extend(gone_urls)
+        except Exception as error:
+            logger.error("[什亭之枢] 清理失效图片引用失败: %s", error)
+            return
+        if dropped:
+            logger.warning(
+                "[什亭之枢] 已摘除 %d 个读不到的图片引用，避免整条请求被上游拒绝: %s",
+                len(dropped),
+                " | ".join(ref[:120] for ref in dropped[:3]),
+            )
+
+    def _merge_missing_messages(self, event, req, chat_id: str) -> None:
+        """把账本里有、AstrBot 的 contexts 里没有的消息插回正确的时间位置。
+
+        典型的两类：被决断层拦下的消息，以及她主动去别处说的那些话
+        （由 `context.send_message` 发出，完全绕过 AstrBot 管线）。
+        合并之后，她读到的是「我说过的话」这个真实回合，而不是一份背景备注。
+        """
+        if not self.memory_config.merge_gated_into_contexts:
+            return
+        contexts = getattr(req, "contexts", None)
+        if not isinstance(contexts, list):
+            return
+        try:
+            merged = merge_missing_into_contexts(
+                contexts,
+                self.short_term.all_of_chat(chat_id),
+                str(getattr(req, "prompt", "") or ""),
+            )
+        except Exception as error:
+            logger.error("[什亭之枢] 合并缺失对话回合失败: %s", error)
+            return
+        if len(merged) != len(contexts):
+            req.contexts = merged
+            logger.debug(
+                "[什亭之枢] 已把 %d 条主脑看不到的对话回合补进上下文",
+                len(merged) - len(contexts),
+            )
 
     def _resolve_target(
         self, event: AstrMessageEvent, target_type: str, target_id: str
