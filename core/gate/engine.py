@@ -3,7 +3,8 @@
 分两层，边界很清晰：
 
 - **规则层** `rule_decide()`：同步、零 token。上游指令、空文本、私聊、被点名
-  都在这里当场定夺，返回 None 表示「这条得再看看」。
+  都在这里当场定夺，返回 None 表示「这条得再看看」。私聊定的是「要回」，
+  但要回不等于立刻回——它带上 `debounce` 标记，由上层攒够静默时长再唤醒主脑。
 - **模型层** `judge_window()`：给一段窗口内的对话做判断。调用方是巡检器
   （`patrol.PatrolManager`），它负责攒够一段时间再叫这一层，而不是每来一句
   就调一次模型。
@@ -22,12 +23,12 @@ except ImportError:  # pragma: no cover
 
 from dataclasses import dataclass
 
-from .event_utils import (
+from ..common.event_utils import (
     get_message_text,
     is_private_chat,
     is_upstream_command_event,
 )
-from .extractor import parse_model_json
+from ..common.model_json import parse_model_json
 
 SOURCE_RULE = "rule"
 SOURCE_MODEL = "model"
@@ -82,6 +83,8 @@ class Decision:
     reason: str
     source: str  # rule | model | fallback
     passthrough: bool = False
+    # 要回，但别立刻回：交给上层攒一小段（私聊防抖），别在对方打字打一半时插嘴
+    debounce: bool = False
 
 
 class DecisionEngine:
@@ -125,7 +128,9 @@ class DecisionEngine:
             return Decision(False, "没有可回应的文本内容", SOURCE_RULE)
 
         if is_private_chat(chat_id) and self._config.always_reply_private:
-            return Decision(True, "私聊", SOURCE_RULE)
+            # 私聊一定要回，但不立刻回：对方常把一句话拆成几条发，
+            # 等她安静下来再一次性回应，免得抢在中间打断。
+            return Decision(True, "私聊", SOURCE_RULE, debounce=True)
 
         if self._is_mentioned(event, text) and self._config.always_reply_when_mentioned:
             return Decision(True, "被点名", SOURCE_RULE)

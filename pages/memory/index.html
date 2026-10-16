@@ -292,6 +292,7 @@
         el.stats.replaceChildren();
         const cards = [
           ["短期消息", data.short_term],
+          ["短期摘要", data.summaries],
           ["活跃会话", data.chats],
           ["长期记忆", data.long],
           ["永久记忆", data.permanent],
@@ -327,10 +328,27 @@
         el.chatFilter.value = current;
       }
 
-      function renderShortTerm(items) {
+      // 摘要块排在最前：时间线里它们也代表「更早的那一段」，顺序必须一致
+      function renderShortTerm(items, summaries) {
         el.list.replaceChildren();
+        (summaries || []).forEach((item) => {
+          const box = document.createElement("div");
+          box.className = "item";
+          const meta = document.createElement("div");
+          meta.className = "meta";
+          meta.appendChild(tag("更早的一段概括", "ok"));
+          meta.appendChild(line(`${item.covered_count} 条压成 1 条`));
+          meta.appendChild(line(`覆盖到 ${fmtTime(item.covered_at)}`));
+          const body = document.createElement("div");
+          body.className = "body";
+          body.textContent = item.content;
+          box.append(meta, body);
+          el.list.appendChild(box);
+        });
         if (!items.length) {
-          el.list.appendChild(emptyNode("这片记忆还是空的"));
+          if (!(summaries || []).length) {
+            el.list.appendChild(emptyNode("这片记忆还是空的"));
+          }
           return;
         }
         items.forEach((item) => {
@@ -349,11 +367,11 @@
           if (item.gated) {
             meta.appendChild(tag("主脑看不到", "warn"));
           }
-          if (item.source === "backfill") {
-            meta.appendChild(tag("回填"));
+          if (item.source === "sleep") {
+            meta.appendChild(tag("睡觉时收到"));
           }
-          if (item.extracted) {
-            meta.appendChild(tag("已提炼", "ok"));
+          if (item.staged) {
+            meta.appendChild(tag("醒来才入账", "warn"));
           }
           const body = document.createElement("div");
           body.className = "body";
@@ -381,7 +399,15 @@
           const meta = document.createElement("div");
           meta.className = "meta";
           meta.appendChild(tag(item.tier === "permanent" ? "永久" : "长期"));
-          meta.appendChild(line(`强度 ${item.strength}`));
+          if (item.tier === "permanent") {
+            meta.appendChild(line("确信的事，不参与榜序"));
+          } else {
+            meta.appendChild(line(`第 ${item.rank} / ${item.rank_total} 位`));
+            meta.appendChild(tag(item.level_label, item.level === 0 ? "ok" : "warn"));
+            if (item.promoted_at) {
+              meta.appendChild(line(`最近想起 ${fmtAge(item.promoted_at)}`));
+            }
+          }
           meta.appendChild(line(`${fmtTime(item.created_at)} · ${fmtAge(item.created_at)}`));
           meta.appendChild(tag(`召回 ${item.recall_count} 次`));
           if (item.cross_chat_count > 1) {
@@ -440,24 +466,29 @@
       }
 
       async function loadList() {
-        const data =
-          state.tab === "short"
-            ? await apiGet("short_term", {
-                chat_id: state.chatId,
-                limit: PAGE_LIMIT,
-                offset: state.offset,
-              })
-            : await apiGet("memories", {
-                tier: state.tab,
-                limit: PAGE_LIMIT,
-                offset: state.offset,
-              });
-        state.total = data.total || 0;
         if (state.tab === "short") {
-          renderShortTerm(data.items || []);
-        } else {
-          renderMemories(data.items || []);
+          // 摘要与消息一起取：页面展示的必须是时间线里真实存在的那批条目
+          const [data, sums] = await Promise.all([
+            apiGet("short_term", {
+              chat_id: state.chatId,
+              limit: PAGE_LIMIT,
+              offset: state.offset,
+            }),
+            // 摘要跨会话，按会话筛选时就没有对应关系了，只在「全部会话」下展示
+            state.chatId ? Promise.resolve({ items: [] }) : apiGet("summaries", { limit: PAGE_LIMIT }),
+          ]);
+          state.total = data.total || 0;
+          renderShortTerm(data.items || [], sums.items || []);
+          renderPager();
+          return;
         }
+        const data = await apiGet("memories", {
+          tier: state.tab,
+          limit: PAGE_LIMIT,
+          offset: state.offset,
+        });
+        state.total = data.total || 0;
+        renderMemories(data.items || []);
         renderPager();
       }
 

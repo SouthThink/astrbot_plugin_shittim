@@ -12,6 +12,7 @@
 
 from __future__ import annotations
 
+import json
 from typing import Any
 
 try:
@@ -90,6 +91,10 @@ def _short_term_item(row) -> dict:
         caption = str(row["image_caption"] or "")
     except (KeyError, IndexError, TypeError):
         caption = ""
+    try:
+        staged = bool(row["staged"])
+    except (KeyError, IndexError, TypeError):
+        staged = False
     return {
         "id": int(row["id"]),
         "chat_id": str(row["chat_id"] or ""),
@@ -104,8 +109,27 @@ def _short_term_item(row) -> dict:
         "created_at": float(row["created_at"] or 0.0),
         "gated": bool(row["gated"]),
         "source": str(row["source"] or "live"),
-        "extracted": bool(row["extracted"]),
+        "staged": staged,
     }
+
+
+def _summary_item(row) -> dict:
+    try:
+        covered_items = json.loads(str(row["covered_items"] or "[]"))
+    except (TypeError, ValueError):
+        covered_items = []
+    return {
+        "id": int(row["id"]),
+        "content": str(row["content"] or ""),
+        "created_at": float(row["created_at"] or 0.0),
+        "covered_at": float(row["covered_at"] or 0.0),
+        "covered_count": int(row["covered_count"] or 0),
+        "covered_items": [int(i) for i in covered_items if str(i).lstrip("-").isdigit()],
+    }
+
+
+# 等级编号 → 页面文案。等级由名次推导（见 store.curation_level），不落库。
+_LEVEL_LABELS = {0: "完整", 1: "精简", 2: "关键词"}
 
 
 def _memory_item(memory) -> dict:
@@ -118,9 +142,13 @@ def _memory_item(memory) -> dict:
         "keywords": memory.keywords,
         "chat_label": memory.chat_label or "",
         "user_name": memory.user_name or "",
-        "strength": round(float(memory.strength), 2),
+        # 位置榜：名次即她的记忆排序，等级由名次推导
+        "rank": memory.rank,
+        "rank_total": memory.rank_total,
+        "level": memory.level,
+        "level_label": _LEVEL_LABELS.get(memory.level, "完整"),
+        "promoted_at": memory.promoted_at,
         "recall_count": memory.recall_count,
-        "useful_count": memory.useful_count,
         "cross_chat_count": memory.cross_chat_count,
         "manual": bool(memory.manual),
         "created_at": memory.created_at,
@@ -146,6 +174,7 @@ class MemoryPageAPI:
         return _ok(
             {
                 "short_term": short_term.count(),
+                "summaries": len(short_term.list_summaries(500)),
                 "chats": len(chats),
                 "long": tiers.get("long", 0),
                 "permanent": tiers.get("permanent", 0),
@@ -185,8 +214,18 @@ class MemoryPageAPI:
             }
         )
 
+    async def summaries(self) -> Any:
+        """短期层里「压过的那些段落」：它们与时间线里的摘要块同源。
+
+        摘要不进消息分页（它没有 sender / 时间线以外的属性），单独给一个
+        视图，页面就能把「原始消息 + 摘要」拼回她真正读到的那条脉络。
+        """
+        limit, _ = _paging(_query_int("limit", _DEFAULT_LIMIT), 0)
+        rows = self._plugin.short_term.list_summaries(limit)
+        return _ok({"items": [_summary_item(row) for row in rows]})
+
     async def memories(self) -> Any:
-        """长期 / 永久记忆分页，按强度倒序。"""
+        """长期 / 永久记忆分页，按位置榜倒序（她记得最牢的排最前）。"""
         tier = (_query_raw("tier") or "long").strip()
         if tier not in _VALID_TIERS:
             return _err("tier 只能是 long 或 permanent")
@@ -217,6 +256,7 @@ def register_all_routes(plugin) -> None:
         ("overview", api.overview, "记忆总览"),
         ("chats", api.chats, "会话列表"),
         ("short_term", api.short_term, "短期账本"),
+        ("summaries", api.summaries, "短期摘要"),
         ("memories", api.memories, "长期与永久记忆"),
     )
     for path, handler, description in routes:

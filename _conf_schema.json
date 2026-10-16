@@ -14,40 +14,25 @@
         "default": true
       },
       "extract_provider_id": {
-        "description": "记忆提炼模型（建议轻量，留空则关闭自动提炼）",
+        "description": "记忆压缩模型（建议轻量，留空则关闭自动压缩）",
         "type": "string",
         "default": "",
         "_special": "select_provider"
       },
-      "extract_batch_size": {
-        "description": "触发提炼所需的未提炼消息数（条）",
-        "type": "int",
-        "default": 40
-      },
       "extract_max_items": {
-        "description": "单次提炼产出的长期记忆上限（条）",
+        "description": "单次压缩顺带产出的长期记忆上限（条）",
         "type": "int",
-        "default": 5
+        "default": 12
       },
-      "extract_min_strength": {
-        "description": "提炼结果的最低强度，低于此值丢弃（强度值）",
-        "type": "float",
-        "default": 1.0
-      },
-      "short_term_max_messages": {
-        "description": "每个会话保留的原始消息上限，按会话分组淘汰（条）",
-        "type": "int",
-        "default": 400
-      },
-      "backfill_astrbot_history": {
-        "description": "回填插件不在场期间的 AstrBot 历史对话",
+      "extract_include_events": {
+        "description": "压缩时纳入「当天发生的事及其结论」，而不只是稳定事实（关掉更精简，但可能隔天就记不起昨天聊过什么）",
         "type": "bool",
         "default": true
       },
-      "backfill_max_messages": {
-        "description": "每个会话回填的历史上限，回填内容不参与提炼（条）",
-        "type": "int",
-        "default": 200
+      "extract_min_strength": {
+        "description": "压缩结果的最低强度，低于此值丢弃（强度值）",
+        "type": "float",
+        "default": 1.0
       },
       "vision_enabled": {
         "description": "图片转文字：把图片转述成文字写入账本（AstrBot 仅提供「[图片]」占位）",
@@ -71,7 +56,7 @@
         "default": 2
       },
       "short_term_context_per_chat": {
-        "description": "跨会话语境中每个会话取的消息上限（条）",
+        "description": "跨会话语境（仅供决断层与巡检参考）中每个会话取的消息上限（条）",
         "type": "int",
         "default": 6
       },
@@ -81,74 +66,84 @@
         "default": 6
       },
       "short_term_context_tokens": {
-        "description": "近期原始消息块的 token 预算（token）",
+        "description": "跨会话语境的 token 预算（token）",
         "type": "int",
         "default": 2000
       },
-      "merge_gated_into_contexts": {
-        "description": "把主脑看不到的对话回合插回上下文（主动发出的、被拦下的）",
-        "type": "bool",
-        "default": true
+      "condense_threshold": {
+        "description": "短期条目（消息 + 摘要）超过此数就压一轮最旧的（条）",
+        "type": "int",
+        "default": 300
+      },
+      "condense_batch": {
+        "description": "每次压缩取最旧多少条（条）",
+        "type": "int",
+        "default": 100
+      },
+      "timeline_max_messages": {
+        "description": "全局时间线单次最多取多少条条目（条）",
+        "type": "int",
+        "default": 400
+      },
+      "timeline_token_budget": {
+        "description": "全局时间线的 token 上限：主脑唯一的上下文，按模型窗口给足；超出从最旧的开始丢",
+        "type": "int",
+        "default": 8000
       },
       "strip_invalid_images": {
         "description": "请求前摘除读不到的图片引用，避免整条请求被上游拒绝并切换备用模型",
         "type": "bool",
         "default": true
       },
+      "auto_top": {
+        "description": "榜前多少条长期记忆给完整正文（条）",
+        "type": "int",
+        "default": 10
+      },
+      "auto_index": {
+        "description": "榜前正文之后多少条只给关键词索引，提示她「还忘了什么」（条）",
+        "type": "int",
+        "default": 30
+      },
       "recall_top_k": {
-        "description": "与当前消息相关的记忆上限（条）",
+        "description": "recall 工具一次想起的、与话题相关的记忆上限（条）",
         "type": "int",
         "default": 5
       },
       "recall_user_top_k": {
-        "description": "与发送者相关的记忆上限（条）",
+        "description": "recall 工具一次想起的、与发送者相关的记忆上限（条）",
         "type": "int",
         "default": 3
       },
       "recall_min_score": {
-        "description": "记忆注入的最低相关度，低于此值不注入（0~1）",
+        "description": "记忆检索的最低相关度，低于此值不返回（0~1）",
         "type": "float",
         "default": 0.18
       },
       "recall_token_budget": {
-        "description": "记忆注入块的 token 预算（token）",
+        "description": "记忆块（永久 + 榜前正文 + 关键词索引）共用的 token 预算（token）",
         "type": "int",
-        "default": 900
+        "default": 1600
       },
       "maintenance_enabled": {
-        "description": "是否启用记忆维护（衰减 / 遗忘 / 合并 / 晋升）",
+        "description": "是否启用记忆维护（降级 / 遗忘 / 晋升 / 合并）",
         "type": "bool",
         "default": true
       },
       "decay_half_life_days": {
-        "description": "长期记忆强度的半衰期（天）",
+        "description": "记忆检索打分里的时间近因半衰期（天）",
         "type": "float",
         "default": 30.0
-      },
-      "forget_threshold": {
-        "description": "长期记忆的遗忘阈值，强度跌破即遗忘（强度值）",
-        "type": "float",
-        "default": 0.6
       },
       "promote_min_recall": {
         "description": "晋升永久记忆所需的最少召回次数（次）",
         "type": "int",
         "default": 8
       },
-      "promote_min_strength": {
-        "description": "晋升永久记忆所需的最低强度（强度值）",
-        "type": "float",
-        "default": 12.0
-      },
       "promote_min_cross_chat": {
         "description": "晋升永久记忆所需的最少跨会话出现次数（次）",
         "type": "int",
         "default": 2
-      },
-      "merge_max_strength": {
-        "description": "可参与合并的记忆强度上限（强度值）",
-        "type": "float",
-        "default": 3.5
       },
       "merge_min_age_days": {
         "description": "可参与合并的记忆最短创建时长（天）",
@@ -164,6 +159,16 @@
         "description": "聚类时的标签 / 关键词相似度阈值（0~1）",
         "type": "float",
         "default": 0.34
+      },
+      "forget_min_curations": {
+        "description": "长期记忆至少经历过这么多轮降级才有资格被遗忘（次）",
+        "type": "int",
+        "default": 6
+      },
+      "forget_stale_days": {
+        "description": "长期记忆连续多少天未被召回归入遗忘候选（天）",
+        "type": "int",
+        "default": 7
       }
     }
   },
@@ -177,7 +182,7 @@
         "default": true
       },
       "provider_id": {
-        "description": "决策模型（建议轻量，留空则复用记忆提炼模型，都留空则只走规则）",
+        "description": "决策模型（建议轻量，留空则复用记忆压缩模型，都留空则只走规则）",
         "type": "string",
         "default": "",
         "_special": "select_provider"
@@ -186,6 +191,11 @@
         "description": "私聊消息直接回复，不经决策模型",
         "type": "bool",
         "default": true
+      },
+      "private_debounce_seconds": {
+        "description": "私聊防抖：发出后静默这么久没有下一条消息才回复（秒），设为 0 立即回复",
+        "type": "float",
+        "default": 10.0
       },
       "always_reply_when_mentioned": {
         "description": "被 @ 或叫到名字时直接回复，不经决策模型",
@@ -253,6 +263,92 @@
         "description": "主动发言前必须持有该会话的焦点",
         "type": "bool",
         "default": true
+      }
+    }
+  },
+  "schedule": {
+    "description": "全局作息状态机（睡眠期间不进模型，并可被 @/私聊叫醒）",
+    "type": "object",
+    "items": {
+      "enabled": {
+        "description": "启用作息状态机（关闭则退回 7×24 在线）",
+        "type": "bool",
+        "default": true
+      },
+      "sleep_at": {
+        "description": "基础入睡时刻 HH:MM（本地时间）",
+        "type": "string",
+        "default": "23:30"
+      },
+      "wake_at": {
+        "description": "基础起床时刻 HH:MM（本地时间）",
+        "type": "string",
+        "default": "07:00"
+      },
+      "wake_latest": {
+        "description": "起床时间上限 HH:MM，推迟入睡不得越过",
+        "type": "string",
+        "default": "12:00"
+      },
+      "wake_notice_lead_minutes": {
+        "description": "起床前多久转为浅睡（这段时间可被叫醒，分钟）",
+        "type": "int",
+        "default": 120
+      },
+      "light_until_deep_minutes": {
+        "description": "浅睡满多久转入深睡（分钟）",
+        "type": "int",
+        "default": 120
+      },
+      "wake_signal_window_minutes": {
+        "description": "叫醒信号的有效窗口（分钟）",
+        "type": "int",
+        "default": 5
+      },
+      "wake_signal_threshold": {
+        "description": "窗口内同一会话累计多少次 @/私聊即叫醒（次）",
+        "type": "int",
+        "default": 3
+      },
+      "wake_grace_minutes": {
+        "description": "被叫醒后的清醒宽限时长，超时无信号即回到浅睡（分钟）",
+        "type": "int",
+        "default": 10
+      },
+      "curation_enabled": {
+        "description": "深睡期是否执行记忆整理（短期收口 / 降级 / 遗忘 / 晋升 / 合并 / 清空账本）",
+        "type": "bool",
+        "default": true
+      },
+      "curation_min_interval_hours": {
+        "description": "距上次整理满这么多小时才整理，即「每晚一次」（小时）",
+        "type": "int",
+        "default": 24
+      },
+      "curation_force_after_hours": {
+        "description": "距上次整理超过这么多小时则强制整理一次，但不清空账本（小时）",
+        "type": "int",
+        "default": 48
+      },
+      "collapse_max_rounds": {
+        "description": "单次整理内短期收口（树状压缩）的安全轮数上限；触顶仍剩多条则跳过清空（轮）",
+        "type": "int",
+        "default": 20
+      },
+      "curate_max_per_run": {
+        "description": "单轮整理最多重写多少条长期记忆的正文（条）",
+        "type": "int",
+        "default": 20
+      },
+      "daily_reset_enabled": {
+        "description": "整理后把当天账本移入归档（从上下文与常规查询中排除，数据仍保留）",
+        "type": "bool",
+        "default": true
+      },
+      "archive_retention_days": {
+        "description": "归档消息保留天数，到期物理删除（天）",
+        "type": "int",
+        "default": 90
       }
     }
   },

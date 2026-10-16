@@ -33,6 +33,14 @@
 
 AstrBot 一条消息一个事件，`stop_event()` 只能决定这一条的命运。所以窗口里
 只有最后一条能被放行——这正是「只放行最后边界事件」的含义。
+
+## 私聊防抖（silent 窗口）
+
+私聊不走模型判定（规则层直接定「要回」），但同样不该立刻回：对方常常把一句
+话拆成好几条发，她抢在第二条前面回就成了打断。所以私聊也开窗，只是**静默
+模式**——等最后一条消息之后安静满 `private_debounce_seconds` 秒就放行，
+不问模型、不进冷却、不计入「上次判定时刻」。计时基准跟着最新那条走，
+对方一直说就一直等，不设封顶。
 """
 
 from __future__ import annotations
@@ -44,8 +52,8 @@ from typing import Any
 
 from astrbot.api import logger
 
-from .event_utils import is_placeholder_only
-from .short_term import format_message_line
+from ..common.event_utils import is_placeholder_only
+from ..memory.ledger import format_message_line
 
 PROCESS = "PROCESS"
 KILL = "KILL"
@@ -79,6 +87,8 @@ class PatrolRecord:
     # 否则群里一直有人说话就能无限推迟判定。
     opened_at: float
     timer: asyncio.Task | None = None
+    # 静默窗口（私聊防抖）：到点直接放行，不问模型、不进冷却。
+    silent: bool = False
 
 
 def noise_reason(rows: list) -> str:
@@ -133,8 +143,15 @@ class PatrolManager:
 
     # ── 对外入口 ──────────────────────────────────────────
 
-    async def hold(self, chat_id: str, event: Any) -> asyncio.Future | None:
+    async def hold(
+        self, chat_id: str, event: Any, *, silent: bool = False
+    ) -> asyncio.Future | None:
         """把这条消息扣押进窗口。
+
+        Args:
+            silent: 私聊防抖模式。窗口到期后不再问模型，直接放行最后一条事件，
+                因此既不进冷却也不占用判定。计时基准是**最后一条消息**而不是
+                首次开窗时刻——对方一直说，她就一直等。
 
         Returns:
             Future: 调用方 await，结果为 PROCESS（放行）或 KILL（拦下）。
@@ -145,7 +162,7 @@ class PatrolManager:
 
         now = time.time()
         async with self._lock:
-            if self._cooldown_until.get(chat_id, 0.0) > now:
+            if not silent and self._cooldown_until.get(chat_id, 0.0) > now:
                 logger.debug("[什亭之枢] 巡检冷却中，拦下 | %s", chat_id)
                 return None
 
@@ -153,9 +170,12 @@ class PatrolManager:
             if existing is not None:
                 # 旧事件 KILL，只留最后一条持有窗口
                 self._kill(existing, "被更新的消息取代")
-                opened_at = existing.opened_at
-            else:
+            if silent:
                 opened_at = now
+                delay = self._silent_delay()
+            else:
+                opened_at = existing.opened_at if existing is not None else now
+                delay = self._window_delay(opened_at, now)
 
             future: asyncio.Future = asyncio.get_running_loop().create_future()
             record = PatrolRecord(
@@ -163,13 +183,15 @@ class PatrolManager:
                 event=event,
                 future=future,
                 version=self._next_version(),
-                delay=self._window_delay(opened_at, now),
+                delay=delay,
                 opened_at=opened_at,
+                silent=silent,
             )
             record.timer = asyncio.create_task(self._timer(record))
             self._records[chat_id] = record
             logger.debug(
-                "[什亭之枢] 巡检窗口 %s | %s | 等待%.1fs",
+                "[什亭之枢] %s %s | %s | 等待%.1fs",
+                "私聊防抖" if silent else "巡检窗口",
                 "续窗" if existing is not None else "开窗",
                 chat_id,
                 record.delay,
@@ -210,6 +232,14 @@ class PatrolManager:
             return 0.01
         return max(0.01, min(window, remaining))
 
+    def _silent_delay(self) -> float:
+        """私聊防抖的静默时长。不设封顶：对方一直说，她就一直等。"""
+        try:
+            seconds = float(self._config.private_debounce_seconds)
+        except (TypeError, ValueError):
+            seconds = 0.0
+        return max(seconds, 0.01)
+
     def _kill(self, record: PatrolRecord, reason: str) -> None:
         """把一条窗口记录作废（取消定时、结束等待）。"""
         if record.timer and not record.timer.done():
@@ -218,8 +248,28 @@ class PatrolManager:
             record.future.set_result(KILL)
         logger.debug("[什亭之枢] 巡检窗口作废 | %s | %s", record.chat_id, reason)
 
+    async def _silent_timer(self, record: PatrolRecord) -> None:
+        """私聊防抖：静默满时长就直接放行最后一条，不问模型、不进冷却。"""
+        try:
+            await asyncio.sleep(record.delay)
+            async with self._lock:
+                current = self._records.get(record.chat_id)
+                if current is None or current.version != record.version:
+                    # 已被更新的消息取代，或已被清理
+                    return
+                self._records.pop(record.chat_id, None)
+            self._finish(record, PROCESS)
+        except asyncio.CancelledError:
+            return
+        except Exception as error:
+            logger.error("[什亭之枢] 私聊防抖异常，按放行处理: %s", error, exc_info=True)
+            self._finish(record, PROCESS)
+
     async def _timer(self, record: PatrolRecord) -> None:
         """窗口计时；到点后占用会话做一次判定。"""
+        if record.silent:
+            await self._silent_timer(record)
+            return
         try:
             for attempt in range(_MAX_TIMER_RETRY + 1):
                 delay = record.delay if attempt == 0 else _RETRY_DELAY

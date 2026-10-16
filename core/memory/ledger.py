@@ -8,12 +8,14 @@
 
 from __future__ import annotations
 
+import json
 import sqlite3
 import time
 
-from .db import MemoryDB
-from .time_utils import format_age
-from .tokenizer import estimate_tokens
+from ..common.db import MemoryDB
+from ..common.event_utils import build_chat_label
+from ..common.time_utils import format_age
+from ..common.tokenizer import estimate_tokens
 
 _ROLE_LABEL_ASSISTANT = "你"
 
@@ -21,22 +23,22 @@ _ROLE_LABEL_ASSISTANT = "你"
 # 不含发送者，所以回填进群聊的 user 消息无法还原是谁说的。
 HISTORY_SENDER_ID = "astrbot_history"
 
-# 消息来源：实时记录 vs 从官方历史回填
+# 消息来源：实时记录 / 睡眠期间收到
 SOURCE_LIVE = "live"
-SOURCE_BACKFILL = "backfill"
+# 睡眠期间收到的消息：不参与整理（起床后 staged 置 0 才纳入）。
+SOURCE_SLEEP = "sleep"
+
+# 「这条还在短期记忆里活着」——即她此刻应该记得的。
+# **所有面向「她现在记得什么」的查询都必须带上它**：少一个条件，
+# 已经归档或被压进摘要的行就会重新出现在上下文、判定与页面里，而且不报错。
+# 短期记忆只有一条出路：被压缩成摘要（`condensed_at`）或随深夜整理清空
+# （`archived_at`）。两者之外的行才是她当下真正的经历。
+_LIVE_SQL = "archived_at = 0 AND condensed_at = 0"
 
 
-def build_chat_label(chat_kind: str, name: str, chat_id: str) -> str:
-    """构造人类可读的会话来源标签，如「群聊·测试群·10001」。"""
-    kind_label = "私聊" if chat_kind == "private" else "群聊"
-    parts = [kind_label]
-    if name and name.strip():
-        parts.append(name.strip())
-    # chat_id 形如 aiocqhttp:GroupMessage:10001，只取最后一段做辨识
-    tail = (chat_id or "").rsplit(":", 1)[-1].strip()
-    if tail and tail not in parts:
-        parts.append(tail)
-    return "·".join(parts)
+def _entry_sort_key(entry: dict) -> tuple:
+    """时间线条目的排序键：按时间，同一时刻让摘要排在前（它代表更早的那一段）。"""
+    return (float(entry.get("at") or 0.0), 0 if entry.get("kind") == "summary" else 1)
 
 
 def _caption_of(row) -> str:
@@ -45,6 +47,33 @@ def _caption_of(row) -> str:
         return str(row["image_caption"] or "").strip()
     except (KeyError, IndexError, TypeError):
         return ""
+
+
+def _source_of(row) -> str:
+    """取这一行的来源；老库的行没有该列，取不到按实时消息算。"""
+    try:
+        return str(row["source"] or "")
+    except (KeyError, IndexError, TypeError):
+        return ""
+
+
+def format_speech(row) -> str:
+    """这一行**说出来的话本身**，不含「谁、在哪儿、多久前」这些前缀。
+
+    时间线要把她说过的话还原成干净的 assistant 回合——上一条消息里已经写着
+    会话与发言人了，再在正文里重复一遍「你」就成了自言自语。
+    """
+    content = str(row["content"] or "").replace("\n", " ").strip()
+    caption = _caption_of(row)
+    if caption:
+        content = (
+            f"{content}（图片内容：{caption}）" if content else f"[图片]（图片内容：{caption}）"
+        )
+    if _source_of(row) == SOURCE_SLEEP:
+        # 睡眠期收到的消息：如实标注。她起床后读到这些行时，得知道
+        # 「这条不是刚发生的，是我睡着的时候来的」，否则会把昨晚的话当成现在的。
+        content = f"{content}（睡觉时收到）"
+    return content
 
 
 def format_message_line(row: sqlite3.Row) -> str:
@@ -67,10 +96,7 @@ def format_message_line(row: sqlite3.Row) -> str:
     else:
         name = str(row["sender_name"] or "").strip() or sender_id
         speaker = name or "某人"
-    content = str(row["content"] or "").replace("\n", " ").strip()
-    caption = _caption_of(row)
-    if caption:
-        content = f"{content}（图片内容：{caption}）" if content else f"[图片]（图片内容：{caption}）"
+    content = format_speech(row)
 
     time_tag = ""
     try:
@@ -104,12 +130,15 @@ class ShortTermLedger:
         created_at: float | None = None,
         gated: bool = False,
         source: str = SOURCE_LIVE,
+        staged: bool = False,
     ) -> int:
         """记入一条短期消息，返回自增 id。内容为空的记录直接丢弃。
 
         gated=True 表示这条消息不在 AstrBot 的历史里（被决断层拦下，
-        或由插件主动发出），跨会话上下文档需要把它补进去。
-        source 区分「实时记录」与「回填的历史」，合并回上下文时只处理前者。
+        或由插件主动发出）——现在只用于页面与排障，上下文由全局时间线整体
+        重建，不再读它。
+        source 区分「实时记录」与「睡眠期间收到」。
+        staged=True 表示这条消息还在睡眠期暂存区（不参与整理），起床时统一放行。
         """
         text = (content or "").strip()
         if not text:
@@ -118,8 +147,8 @@ class ShortTermLedger:
             """
             INSERT INTO short_term_messages
                 (chat_id, chat_label, chat_kind, sender_id, sender_name,
-                 role, content, created_at, extracted, gated, source)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, 0, ?, ?)
+                 role, content, created_at, gated, source, staged)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 chat_id or "",
@@ -132,13 +161,88 @@ class ShortTermLedger:
                 float(created_at if created_at is not None else time.time()),
                 1 if gated else 0,
                 source or SOURCE_LIVE,
+                1 if staged else 0,
             ),
         )
         return int(cursor.lastrowid or 0)
 
-    def mark_extracted(self, ids: list[int]) -> None:
-        """标记这批消息已提炼进长期层。"""
-        self._mark_flag("extracted", ids)
+    def release_staged(self) -> int:
+        """起床收口：把睡眠期暂存的消息放行，纳入正常流程。
+
+        只翻 `staged` 标记，**不动 `source`**——"这条是睡觉时收到的"是永久事实，
+        上下文里还要靠它显示「（睡觉时收到）」。
+        """
+        cursor = self._db.execute(
+            "UPDATE short_term_messages SET staged = 0 WHERE staged = 1"
+        )
+        return int(cursor.rowcount or 0)
+
+    def staged_chat_ids(self) -> list[str]:
+        """睡眠期间有消息的会话列表。
+
+        起床时据此刷新焦点，让她有资格回去回应那些会话。**必须在
+        `release_staged()` 之前调用**，否则查不到。
+        """
+        rows = self._db.query(
+            """
+            SELECT DISTINCT chat_id FROM short_term_messages
+             WHERE staged = 1 AND chat_id <> ''
+            """
+        )
+        return [str(row["chat_id"]) for row in rows]
+
+    def sleep_digest(
+        self, since: float, max_chats: int = 10
+    ) -> tuple[int, list[tuple[str, int, str]]]:
+        """本轮睡眠期间的消息摘要：`(总条数, [(会话标签, 条数, 最后一条)])`。
+
+        起床提示靠它回答「我睡着的时候谁找过我」。用聚合而不是把几百条原文
+        都拖出来：一夜积压可能很多，而她只需要知道有哪些会话、各说了多少、
+        最后一句是什么。
+
+        会话按最近发言时间倒序，最多 `max_chats` 个；`since` 传本轮入睡时刻
+        （见 `schedule.last_sleep_start()`），否则会混进前几晚的消息。
+        """
+        if since <= 0:
+            return 0, []
+        total_row = self._db.query_one(
+            f"""
+            SELECT COUNT(*) AS n FROM short_term_messages
+             WHERE source = ? AND created_at >= ? AND {_LIVE_SQL}
+            """,
+            (SOURCE_SLEEP, float(since)),
+        )
+        total = int(total_row["n"] or 0) if total_row is not None else 0
+        if not total:
+            return 0, []
+
+        rows = self._db.query(
+            f"""
+            SELECT chat_id, chat_label, COUNT(*) AS cnt, MAX(id) AS last_id
+              FROM short_term_messages
+             WHERE source = ? AND chat_id <> '' AND created_at >= ?
+               AND {_LIVE_SQL}
+             GROUP BY chat_id
+             ORDER BY MAX(created_at) DESC, last_id DESC
+             LIMIT ?
+            """,
+            (SOURCE_SLEEP, float(since), max(int(max_chats), 1)),
+        )
+        digest: list[tuple[str, int, str]] = []
+        for row in rows:
+            last = self._db.query_one(
+                "SELECT * FROM short_term_messages WHERE id = ?",
+                (int(row["last_id"]),),
+            )
+            line = format_message_line(last) if last is not None else ""
+            digest.append(
+                (
+                    str(row["chat_label"] or "") or str(row["chat_id"] or ""),
+                    int(row["cnt"] or 0),
+                    line,
+                )
+            )
+        return total, digest
 
     def set_image_caption(self, message_id: int, caption: str) -> None:
         """给一条已入库的消息补上图片描述。
@@ -157,47 +261,6 @@ class ShortTermLedger:
         """标记这批消息不在 AstrBot 的历史里（被拦下或插件主动发出）。"""
         self._mark_flag("gated", ids)
 
-    def add_batch(self, rows: list[dict], extracted: bool = False) -> int:
-        """批量写入。
-
-        extracted=True 表示这批消息不参与长期记忆提炼。回填 AstrBot 历史时
-        用它：回填可能一次几百条，若计入提炼会突然产生大量模型调用。
-
-        库已关闭时返回 0：写入被丢弃了就该如实回报，不能把丢弃说成成功。
-        """
-        if self._db.closed:
-            return 0
-        payload = []
-        for row in rows:
-            text = str(row.get("content") or "").strip()
-            if not text:
-                continue
-            payload.append(
-                (
-                    row.get("chat_id") or "",
-                    row.get("chat_label") or "",
-                    row.get("chat_kind") or "group",
-                    str(row.get("sender_id") or ""),
-                    row.get("sender_name") or "",
-                    row.get("role") or "user",
-                    text,
-                    float(row.get("created_at") or time.time()),
-                    1 if extracted else 0,
-                    1 if row.get("gated") else 0,
-                    row.get("source") or SOURCE_LIVE,
-                )
-            )
-        self._db.executemany(
-            """
-            INSERT INTO short_term_messages
-                (chat_id, chat_label, chat_kind, sender_id, sender_name,
-                 role, content, created_at, extracted, gated, source)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-            """,
-            payload,
-        )
-        return len(payload)
-
     def _mark_flag(self, column: str, ids: list[int]) -> None:
         if not ids:
             return
@@ -209,24 +272,6 @@ class ShortTermLedger:
 
     # ── 读取 ──────────────────────────────────────────────
 
-    def pending(self, limit: int) -> list[sqlite3.Row]:
-        """取最早的、尚未提炼的消息（按时间正序，保证提炼顺序正确）。"""
-        return self._db.query(
-            """
-            SELECT * FROM short_term_messages
-            WHERE extracted = 0
-            ORDER BY id ASC
-            LIMIT ?
-            """,
-            (int(limit),),
-        )
-
-    def pending_count(self) -> int:
-        row = self._db.query_one(
-            "SELECT COUNT(*) AS n FROM short_term_messages WHERE extracted = 0"
-        )
-        return int(row["n"]) if row else 0
-
     def recent(self, limit: int) -> list[sqlite3.Row]:
         """取最近 N 条消息（返回按时间正序）。
 
@@ -234,8 +279,9 @@ class ShortTermLedger:
         按 id 排会把它们错误地当成最新消息。
         """
         rows = self._db.query(
-            """
+            f"""
             SELECT * FROM short_term_messages
+             WHERE {_LIVE_SQL}
              ORDER BY created_at DESC, id DESC
              LIMIT ?
             """,
@@ -244,29 +290,200 @@ class ShortTermLedger:
         return list(reversed(rows))
 
     def count(self) -> int:
-        row = self._db.query_one("SELECT COUNT(*) AS n FROM short_term_messages")
-        return int(row["n"]) if row else 0
-
-    def count_of_chat(self, chat_id: str) -> int:
         row = self._db.query_one(
-            "SELECT COUNT(*) AS n FROM short_term_messages WHERE chat_id = ?", (chat_id,)
+            f"SELECT COUNT(*) AS n FROM short_term_messages WHERE {_LIVE_SQL}"
         )
         return int(row["n"]) if row else 0
 
-    def all_of_chat(self, chat_id: str) -> list[sqlite3.Row]:
-        """取某会话账本的全部记录，按时间正序。
+    # ── 条目（消息 + 摘要）─────────────────────────────────
+    #
+    # 短期记忆的「条目」有两种：原始的对话消息，以及被压掉的那一段的替身
+    # （摘要）。两者一起构成时间线，也一起参与下一次压缩的取材——旧摘要
+    # 只是个占一个名额的普通条目，这正是「二次合并不作特殊处理」的落点。
 
-        两个用途：回填时做锚点对齐（需要 role/content/created_at），
-        以及合并回上下文时判断哪些消息 AstrBot 看不到（需要 gated/source）。
+    def timeline_entries(self, limit: int) -> list[dict]:
+        """时间线的条目：取**最新**的 limit 个，按时间正序返回。
+
+        过滤条件决定了它天然「只保留最近」：
+
+        - `_LIVE_SQL`：归档与被压掉的行都不在。归档发生在深睡整理里，
+          醒来时时间线从那一刻重新累积；被压掉的那段由摘要代表。
+        - `staged = 0`：睡眠期暂存的消息不进时间线——她那时没在听。被叫醒或
+          起床时 `release_staged()` 会翻掉这个标记，它们才作为「睡觉时收到的」
+          出现在时间线开头。
         """
-        return self._db.query(
-            """
-            SELECT * FROM short_term_messages
-             WHERE chat_id = ?
-             ORDER BY created_at ASC, id ASC
-            """,
-            (chat_id,),
+        if limit <= 0:
+            return []
+        entries = self._entry_rows(order="DESC", limit=int(limit))
+        entries.sort(key=_entry_sort_key)
+        return entries[-int(limit) :]
+
+    def oldest_entries(self, limit: int) -> list[dict]:
+        """取**最旧**的 limit 个条目，按时间正序（短期压缩的取材范围）。"""
+        if limit <= 0:
+            return []
+        entries = self._entry_rows(order="ASC", limit=int(limit))
+        entries.sort(key=_entry_sort_key)
+        return entries[: int(limit)]
+
+    def live_entries(self) -> list[dict]:
+        """短期层当前**全部**条目（消息 + 摘要），按时间正序。
+
+        与 `timeline_entries` 的区别是**不分页**：深夜收口要把它们一条不剩地
+        压掉，任何上限都会让超出的部分在清空时静默消失。
+        """
+        entries = self._entry_rows(order="ASC")
+        entries.sort(key=_entry_sort_key)
+        return entries
+
+    def live_entry_count(self) -> int:
+        """短期记忆里活着的条目总数（消息 + 摘要），压缩阈值的判据。"""
+        messages = self._db.query_one(
+            f"SELECT COUNT(*) AS n FROM short_term_messages "
+            f"WHERE {_LIVE_SQL} AND staged = 0"
         )
+        summaries = self._db.query_one(
+            "SELECT COUNT(*) AS n FROM short_term_summaries WHERE condensed_at = 0"
+        )
+        return int(messages["n"] or 0 if messages else 0) + int(
+            summaries["n"] or 0 if summaries else 0
+        )
+
+    def _entry_rows(self, *, order: str, limit: int | None = None) -> list[dict]:
+        """消息与摘要各取一份再合并；给了 limit 时整体最新/最旧的 limit 个
+        一定落在其中。"""
+        tail = " LIMIT ?" if limit is not None else ""
+        params: tuple = (int(limit),) if limit is not None else ()
+        messages = self._db.query(
+            f"""
+            SELECT * FROM short_term_messages
+             WHERE {_LIVE_SQL} AND staged = 0
+             ORDER BY created_at {order}, id {order}{tail}
+            """,
+            params,
+        )
+        summaries = self._db.query(
+            f"""
+            SELECT * FROM short_term_summaries
+             WHERE condensed_at = 0
+             ORDER BY covered_at {order}, id {order}{tail}
+            """,
+            params,
+        )
+        entries = [
+            {"kind": "message", "at": float(row["created_at"] or 0.0), "row": row}
+            for row in messages
+        ]
+        entries.extend(
+            {"kind": "summary", "at": float(row["covered_at"] or 0.0), "row": row}
+            for row in summaries
+        )
+        entries.sort(key=_entry_sort_key)
+        return entries
+
+    def condense_records(self, entries: list[dict]) -> str:
+        """把待压缩的条目渲染成给模型的对话记录。"""
+        lines: list[str] = []
+        for entry in entries:
+            if entry.get("kind") == "summary":
+                # 旧摘要在压缩时以「上一层的概括」身份出现：模型据此再概括一层
+                content = str(entry["row"]["content"] or "").strip()
+                lines.append(f"【更早的一段概括】{content}")
+                continue
+            lines.append(format_message_line(entry["row"]))
+        return "\n".join(line for line in lines if line)
+
+    def condense_context(self, entries: list[dict]) -> dict:
+        """待压缩区段的归属信息，供写入长期记忆时带上来源。"""
+        name_to_id: dict[str, str] = {}
+        chat_ids: set[str] = set()
+        chat_label = ""
+        for entry in entries:
+            if entry.get("kind") != "message":
+                continue
+            row = entry["row"]
+            name = str(row["sender_name"] or "").strip()
+            if name:
+                name_to_id.setdefault(name, str(row["sender_id"] or ""))
+            chat_ids.add(str(row["chat_id"] or ""))
+            chat_label = str(row["chat_label"] or "") or chat_label
+        single = chat_ids.pop() if len(chat_ids) == 1 else ""
+        return {
+            "chat_id": single or None,
+            "chat_label": chat_label if single else None,
+            "name_to_id": name_to_id,
+        }
+
+    def apply_condensation(
+        self, *, summary: str, entries: list[dict], covered_count: int
+    ) -> bool:
+        """落盘一次压缩：写摘要 + 把被覆盖的条目移出短期记忆。
+
+        多步写入必须原子：中途可见半成品会让那些条目既不在原始列表、
+        也不在摘要里——静默丢一段对话。
+
+        被覆盖的**消息**同时标 `condensed_at`：它们的内容已在本次调用里
+        一并处理过（压缩即提炼），既不再进上下文，也不会被搜出来。
+        """
+        text = (summary or "").strip()
+        if not text or not entries:
+            return False
+        now = time.time()
+        covered_at = max(float(entry.get("at") or 0.0) for entry in entries)
+        inner_ids = [
+            int(entry["row"]["id"]) for entry in entries if entry.get("kind") == "summary"
+        ]
+        message_ids = [
+            int(entry["row"]["id"]) for entry in entries if entry.get("kind") == "message"
+        ]
+        with self._db.lock:
+            cursor = self._db.execute(
+                """
+                INSERT INTO short_term_summaries
+                    (content, created_at, covered_at, covered_count, covered_items)
+                VALUES (?, ?, ?, ?, ?)
+                """,
+                (
+                    text,
+                    now,
+                    covered_at,
+                    max(int(covered_count), len(entries)),
+                    json.dumps(inner_ids, ensure_ascii=False),
+                ),
+            )
+            if message_ids:
+                placeholders = ",".join("?" for _ in message_ids)
+                self._db.execute(
+                    f"""
+                    UPDATE short_term_messages
+                       SET condensed_at = ?
+                     WHERE id IN ({placeholders})
+                    """,
+                    (now, *message_ids),
+                )
+            if inner_ids:
+                placeholders = ",".join("?" for _ in inner_ids)
+                self._db.execute(
+                    f"""
+                    UPDATE short_term_summaries SET condensed_at = ?
+                     WHERE id IN ({placeholders})
+                    """,
+                    (now, *inner_ids),
+                )
+        return bool(cursor.lastrowid)
+
+    def list_summaries(self, limit: int = 200) -> list[sqlite3.Row]:
+        """当前活着的摘要，按时间正序（页面展示用）。"""
+        rows = self._db.query(
+            """
+            SELECT * FROM short_term_summaries
+             WHERE condensed_at = 0
+             ORDER BY covered_at DESC, id DESC
+             LIMIT ?
+            """,
+            (int(limit),),
+        )
+        return list(reversed(rows))
 
     def build_recent_block(
         self,
@@ -275,18 +492,17 @@ class ShortTermLedger:
         token_budget: int | None = None,
         exclude_chat_id: str | None = None,
     ) -> str:
-        """把她的近期经历拼成带来源标记的上下文块，受 token 预算约束。
+        """把「别处最近发生了什么」拼成带来源标记的一段，受 token 预算约束。
+
+        只给**决断层**用（判断某个群该不该接话时，得知道她同时在别处经历
+        什么）。主脑的上下文是整条全局时间线，不走这里。
 
         按**会话配额**取，而不是全局取最近 N 条：全局取会让一个话痨群把其它
         会话全部挤出窗口，她就「忘了」自己在别处经历过什么。每个会话保证有
         代表，跨会话的人格连续性才立得住。
 
-        exclude_chat_id 用于排除当前会话：当前会话里**能到达主脑**的历史已由
-        AstrBot 原样放进 req.contexts。而实时记录、主脑却看不到的消息
-        （被决断层拦下的、她主动代发的）由 merge_missing_into_contexts 直接
-        合并回 contexts，所以这里**不再重复纳入**。唯一需要在这里兜底的是
-        回填的旧消息：它们又旧又多，不适合塞进 contexts，只能走带 token
-        预算的块。
+        exclude_chat_id 排除正在判定的那个会话：它这一段的内容由 `messages_since`
+        单独喂给判定，重复一遍只会让模型以为看到了两次。
         """
         per_chat = (
             self._config.short_term_context_per_chat if per_chat is None else per_chat
@@ -318,12 +534,17 @@ class ShortTermLedger:
     def _context_rows(
         self, per_chat: int, max_chats: int, exclude_chat_id: str | None
     ) -> list[sqlite3.Row]:
-        """取最近活跃的若干会话，各取最近 per_chat 条，按时间正序返回。"""
-        # 多取一个会话，防止当前会话占掉名额后实际只有 max_chats-1 个
+        """取最近活跃的若干会话，各取最近 per_chat 条，按时间正序返回。
+
+        正在判定的会话整个排除：它这一段的内容由 `messages_since` 单独喂给
+        判定，这里再放一份只会让模型以为同一句话出现了两次。
+        """
+        # 多取一个会话，防止被排除的会话占掉名额后实际只有 max_chats-1 个
         chat_rows = self._db.query(
-            """
+            f"""
             SELECT chat_id
               FROM short_term_messages
+             WHERE {_LIVE_SQL}
              GROUP BY chat_id
              ORDER BY MAX(created_at) DESC
              LIMIT ?
@@ -344,23 +565,21 @@ class ShortTermLedger:
                        ) AS _rank
                   FROM short_term_messages
                  WHERE chat_id IN ({placeholders})
+                   AND {_LIVE_SQL}
             )
              WHERE _rank <= ?
-               AND (
-                     chat_id != ?
-                     OR (gated = 1 AND source = ?)
-                   )
+               AND chat_id != ?
              ORDER BY created_at ASC, id ASC
             """,
-            (*chat_ids, int(per_chat), exclude_chat_id or "", SOURCE_BACKFILL),
+            (*chat_ids, int(per_chat), exclude_chat_id or ""),
         )
 
     def recent_of_chat(self, chat_id: str, limit: int) -> list[sqlite3.Row]:
         """取某个会话最近的对话（按时间正序）。"""
         rows = self._db.query(
-            """
+            f"""
             SELECT * FROM short_term_messages
-             WHERE chat_id = ?
+             WHERE chat_id = ? AND {_LIVE_SQL}
              ORDER BY created_at DESC, id DESC
              LIMIT ?
             """,
@@ -377,9 +596,9 @@ class ShortTermLedger:
         一整段对话，而不是被切成一条条、彼此脱节的碎片。
         """
         rows = self._db.query(
-            """
+            f"""
             SELECT * FROM short_term_messages
-             WHERE chat_id = ? AND created_at >= ?
+             WHERE chat_id = ? AND created_at >= ? AND {_LIVE_SQL}
              ORDER BY created_at DESC, id DESC
              LIMIT ?
             """,
@@ -392,19 +611,21 @@ class ShortTermLedger:
     ) -> tuple[list[sqlite3.Row], int]:
         """分页读短期账本（可按会话过滤），返回 (本页消息, 总数)。
 
-        按时间倒序——记忆页面要的是「最近发生了什么」，最新的排在最前面。
+        走 `_LIVE_SQL`：页面与上下文**同源**——已归档、已被压进摘要的行
+        不应该只在这里冒出来。她读到的和页面上看到的必须是同一批条目。
         """
         limit = max(int(limit), 1)
         offset = max(int(offset), 0)
         if chat_id:
             total_row = self._db.query_one(
-                "SELECT COUNT(*) AS n FROM short_term_messages WHERE chat_id = ?",
+                f"SELECT COUNT(*) AS n FROM short_term_messages "
+                f"WHERE chat_id = ? AND {_LIVE_SQL}",
                 (chat_id,),
             )
             rows = self._db.query(
-                """
+                f"""
                 SELECT * FROM short_term_messages
-                 WHERE chat_id = ?
+                 WHERE chat_id = ? AND {_LIVE_SQL}
                  ORDER BY created_at DESC, id DESC
                  LIMIT ? OFFSET ?
                 """,
@@ -412,11 +633,12 @@ class ShortTermLedger:
             )
         else:
             total_row = self._db.query_one(
-                "SELECT COUNT(*) AS n FROM short_term_messages"
+                f"SELECT COUNT(*) AS n FROM short_term_messages WHERE {_LIVE_SQL}"
             )
             rows = self._db.query(
-                """
+                f"""
                 SELECT * FROM short_term_messages
+                 WHERE {_LIVE_SQL}
                  ORDER BY created_at DESC, id DESC
                  LIMIT ? OFFSET ?
                 """,
@@ -428,13 +650,14 @@ class ShortTermLedger:
     def list_known_chats(self, limit: int = 20) -> list[sqlite3.Row]:
         """列出活跃过的会话，供她决定往哪里发消息。"""
         return self._db.query(
-            """
+            f"""
             SELECT chat_id,
                    chat_label,
                    chat_kind,
                    COUNT(*)      AS message_count,
                    MAX(created_at) AS last_at
               FROM short_term_messages
+             WHERE {_LIVE_SQL}
              GROUP BY chat_id
              ORDER BY last_at DESC
              LIMIT ?
@@ -493,34 +716,81 @@ class ShortTermLedger:
     def update_config(self, config) -> None:
         self._config = config
 
-    # ── 淘汰 ──────────────────────────────────────────────
+    def retire_summary(self, summary_id: int) -> None:
+        """把一条摘要移出短期层（内容已被提升为长期记忆）。"""
+        if not summary_id:
+            return
+        self._db.execute(
+            "UPDATE short_term_summaries SET condensed_at = ? WHERE id = ?",
+            (time.time(), int(summary_id)),
+        )
 
-    def prune(self, max_per_chat: int | None = None) -> int:
-        """淘汰每个会话中最早的消息，只保留最近 N 条。
+    # ── 归档 ──────────────────────────────────────────────
 
-        刻意按会话分组而不是全局按时间排序：全局淘汰会让一个话痨群把其它
-        会话的历史全部挤掉，跨会话记忆就废了。
+    def clear_short_term(self, now: float) -> tuple[int, int]:
+        """清空短期层，返回 (归档消息数, 收起摘要数)。
+
+        这是深夜收口的最后一步：当天摘要已经写进长期层，短期层就不该再留下
+        任何东西——「整理完短期记忆为空」是这套设计的验收点。
+
+        **不是物理删除**：原始消息标 `archived_at`、摘要标 `condensed_at`，
+        数据都留着供 `search_history` 回查（保留期见 `purge_expired`）。
+
+        只动 `staged = 0` 的消息：睡眠期暂存要等起床后走正常流程，不能被顺手归档。
         """
-        max_per_chat = (
-            self._config.short_term_max_messages if max_per_chat is None else max_per_chat
-        )
-        if max_per_chat <= 0:
+        with self._db.lock:
+            messages = self._db.execute(
+                """
+                UPDATE short_term_messages SET archived_at = ?
+                 WHERE staged = 0 AND archived_at = 0
+                """,
+                (float(now),),
+            )
+            summaries = self._db.execute(
+                """
+                UPDATE short_term_summaries SET condensed_at = ?
+                 WHERE condensed_at = 0
+                """,
+                (float(now),),
+            )
+        return int(messages.rowcount or 0), int(summaries.rowcount or 0)
+
+    def purge_expired(self, retention_days: int) -> int:
+        """物理删除超过保留期的旧内容，返回删除的消息条数。
+
+        两类都会过期，都是「已经离开上下文、只等回查窗口结束」的：
+
+        - **归档**的原始消息（每天整理时移出上下文的那批）
+        - **被压进摘要**的原始消息（压缩时移出上下文的那批）
+
+        没有这一步库里会无限增长：分会话淘汰（`prune`）退役后，这里是唯一
+        的清理路径。被吸收掉的旧摘要（`condensed_at > 0`）一并清掉。
+        """
+        days = max(int(retention_days), 0)
+        if days <= 0:
             return 0
-        cursor = self._db.execute(
-            """
-            DELETE FROM short_term_messages
-             WHERE id IN (
-                 SELECT id FROM (
-                     SELECT id,
-                            ROW_NUMBER() OVER (
-                                PARTITION BY chat_id
-                                ORDER BY created_at DESC, id DESC
-                            ) AS rn
-                       FROM short_term_messages
-                 )
-                  WHERE rn > ?
-             )
-            """,
-            (int(max_per_chat),),
-        )
+        cutoff = time.time() - days * 86400
+        with self._db.lock:
+            cursor = self._db.execute(
+                """
+                DELETE FROM short_term_messages
+                 WHERE (archived_at > 0 AND archived_at < ?)
+                    OR (condensed_at > 0 AND condensed_at < ?)
+                """,
+                (cutoff, cutoff),
+            )
+            self._db.execute(
+                """
+                DELETE FROM short_term_summaries
+                 WHERE condensed_at > 0 AND condensed_at < ?
+                """,
+                (cutoff,),
+            )
         return int(cursor.rowcount or 0)
+
+    # ── 淘汰 ──────────────────────────────────────────────
+    #
+    # 分会话淘汰（保留每会话最近 N 条）已随位置榜一起退役：它会把摘要挤掉，
+    # 而且与「条目总数超阈值才压缩」是两套互相打架的规则。
+    # 现在短期层的体量由「压缩 + 保留期清理」共同约束，见 condense/apply_condensation
+    # 与 purge_expired。

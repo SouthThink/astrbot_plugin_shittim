@@ -25,7 +25,7 @@ from __future__ import annotations
 
 import time
 
-from .db import MemoryDB
+from ..common.db import MemoryDB
 
 DEFAULT_TIMEOUT_MINUTES = 30.0
 # 焦点记录超过该天数就清理，避免表无限增长

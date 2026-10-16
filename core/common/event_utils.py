@@ -127,10 +127,21 @@ def platform_of(event) -> str:
     return call_str(event, "get_platform_name")
 
 
+def build_chat_label(chat_kind: str, name: str, chat_id: str) -> str:
+    """构造人类可读的会话来源标签，如「群聊·测试群·10001」。"""
+    kind_label = "私聊" if chat_kind == "private" else "群聊"
+    parts = [kind_label]
+    if name and name.strip():
+        parts.append(name.strip())
+    # chat_id 形如 aiocqhttp:GroupMessage:10001，只取最后一段做辨识
+    tail = (chat_id or "").rsplit(":", 1)[-1].strip()
+    if tail and tail not in parts:
+        parts.append(tail)
+    return "·".join(parts)
+
+
 def describe_chat(event) -> tuple[str, str]:
     """返回 (chat_kind, chat_label)，标签用于分清消息来自哪里。"""
-    from .short_term import build_chat_label
-
     chat_id = getattr(event, "unified_msg_origin", "") or ""
     if is_private_chat(chat_id):
         return "private", build_chat_label(
