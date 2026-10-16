@@ -68,12 +68,12 @@ core/
 
 **短期记忆只有一个出口：压缩。** 逐批提炼已退役——同一批原文既提炼又压缩等于处理两遍。压缩一次调用同时产出「1 条摘要 + N 条长期记忆」，两者是同源**兄弟**，不是父子。
 
-- **白天**：`condense_short_term()`，条目总数（消息 + 摘要）超 `condense_threshold` 才把最旧 `condense_batch` 条压一轮。它的职责是「别让上下文太长」，不是清空。
-- **深夜**：`collapse_short_term()` 树状收口（每轮分块各压一条，100:1 收缩），最后唯一那条就是**当天摘要**（`_DAY_SUMMARY_CHARS = 400`），由 `_promote_day_summary()` 作为一条长期记忆写进榜最前。收口是短期→长期**唯一**通道，也是「睡前所有消息都被处理过一遍」的落点。
+- **白天**：`condense_short_term()`，条目总数（消息 + 摘要）超 `condense_threshold` 才把最旧 `condense_batch` 条压一轮。它的职责是「别让上下文太长」，不是清空。触发点是**记账与发送这两条路径**（`main.py: _schedule_condense_if_due()`，30 秒节流 + 防重入），判据是**条数**而不是时间，所以它**不在** `run_maintenance()` 的小时节拍里——那条管线要调模型做降级与合并，按小时跑；把压缩混进去会让它被节拍卡住。
+- **深夜**：`collapse_short_term()` 树状收口（每轮分块各压一条，100:1 收缩），最后唯一那条就是**当天摘要**（`_DAY_SUMMARY_CHARS = 400`），由 `_promote_day_summary()` 作为一条长期记忆写进榜最前。收口是短期→长期**唯一**通道，也是「睡前所有消息都被处理过一遍」的落点。**只有深睡期（`full_reset=True`）才收口**：收口会把当天整条时间线压掉，清醒期做这件事和清空一样是当场失忆。
 
 **位置榜取代权重**：长期记忆只按 `promoted_at DESC, id DESC` 排（每晚整理产出、每次召回都刷新为当下）。等级（完整 / 精简 / 关键词）由**名次**推导（榜前 60% / 85% 分档），不落库。沉到**榜尾 5%** 且降级够多次、够久没被召回，才被遗忘。`tier='permanent'` 不在榜上，不降级不遗忘，注入时全量排在最前。
 
-**深睡整理**：`main._run_curation()` 顺序固定——维护（降级 → 遗忘 → 晋升 → 合并）→ 短期收口 → 提升当天摘要 → `clear_short_term()` 清空 → `purge_expired()`。**收口排在维护之后**，当天摘要最后写入（同刻并列靠 id 兜底），于是确定性地落在榜首。
+**深睡整理**：触发条件是 `main.py: _maybe_curate()` 里的两个判据——**`phase == DEEP` 且距 `last_curation_at` 满 `curation_min_interval_hours`**（判据与阶段转换无关，每个 60 秒 tick 都看一次，所以真正的触发点是 DEEP 窗口内第一个「满 24h」的刻度）。守卫只推迟不丢失：正在整理、正在压缩、记忆停用、**她处于清醒宽限（刚被叫醒、正在回话）**都跳过，下一 tick 再来。`full_reset=True` 的流程顺序固定——维护（降级 → 遗忘 → 晋升 → 合并）→ 短期收口 → 提升当天摘要 → `clear_short_term()` 清空 → `purge_expired()`。**收口排在维护之后**，当天摘要最后写入（同刻并列靠 id 兜底），于是确定性地落在榜首。`full_reset=False` 的兜底（不在深睡且超过 `curation_force_after_hours`）**只做维护**，不收口也不清空。**关掉作息（`schedule.enabled=False`）则 tick 不跑，永远不会整理。**
 
 **清空不等于删除**：`archived_at > 0`（原始消息）与 `condensed_at > 0`（已被压进摘要的消息、被吸收的旧摘要）都只是从常规查询与上下文里排除，数据保留 `archive_retention_days`（默认 90 天）供回查。
 
@@ -115,8 +115,9 @@ core/
 - **新增 LLM 工具** → `main.py` 里 `@filter.llm_tool(name=...)`，docstring 就是给模型看的说明书，要写清「什么时候该用」。
 - **新增页面** → `pages/<名字>/index.html` + `web_api.py` 注册路由 + `.astrbot-plugin/i18n/zh-CN.json` 里配 `views.<名字>.title`。
 - **调整压缩质量与形态** → `core/memory/extractor.py` 的 `_CONDENSE_PROMPT` / `_EXTRACT_RULES`；阈值与批大小是 `memory.condense_threshold` / `condense_batch`，顺带产出上限 `extract_max_items`，开关是 `memory.extract_include_events`，摘要长度常量在 `maintenance.py` 顶部。
+- **调整压缩的触发时机** → `main.py: _schedule_condense_if_due()`（调用点在 `record_incoming_message` 与 `after_message_sent`，节流常量 `_CONDENSE_CHECK_SECONDS`）；动手的门槛在 `maintenance.condense_short_term()` 里。
 - **调整位置榜分档或遗忘** → `core/memory/store.py` 顶部的 `DEGRADE_BRIEF_RATIO` / `DEGRADE_KEYWORD_RATIO` / `_FORGET_TAIL_RATIO` 与 `curation_level()` / `is_tail()`；`core/memory/maintenance.py` 的 `_demote()`（含 `_DEMOTE_INTERVAL_HOURS`、`_BRIEF_MAX_CHARS`、`_MERGE_SAFE_RATIO`）与 `_forget()`。遗忘门槛是 `memory.forget_min_curations` / `forget_stale_days`。
-- **调整每日整理节拍** → `schedule` 配置组的 `curation_*` + `main.py` 的 `_maybe_curate()` / `_run_curation()`。
+- **调整每日整理节拍** → `schedule` 配置组的 `curation_*` + `main.py: _maybe_curate()`（守卫：`_curating` / `_condensing` / 清醒宽限，只推迟不丢失）与 `_run_curation()`；深睡窗口的边界由 `wake_notice_lead_minutes` / `light_until_deep_minutes` 决定。
 - **调整清空或保留期** → `core/memory/ledger.py` 的 `clear_short_term()` / `purge_expired()` 与 `main.py` 的 `_run_curation()`；开关是 `schedule.daily_reset_enabled` / `archive_retention_days`。
 - **调整图片转述** → `core/memory/vision.py`（取图、转 data URL、缓存、模型能力检查）。
 - **调整主动发言风控** → `proactive` 配置组 + `main.py` 的 `_check_say_gate()` / `_check_rate_limit()`。
@@ -139,7 +140,7 @@ core/
 
 **`_LIVE_SQL` 漏加 = 「她已经忘了」静默失效**。`archived_at = 0 AND condensed_at = 0` 是「这条还在短期记忆里活着」的**唯一**表达。少一个条件，已经清空或已被压进摘要的行就会重新出现在上下文、巡检、压缩与页面里，而且不报任何错。所以账本查询统一走 `ShortTermLedger` 的封装方法（或显式拼 `_LIVE_SQL`），**禁止业务层直写 SQL**；新增查询时先问一句「这条她现在还该记得吗」。
 
-**没收口完就不许清空短期层**。清空会把消息移出常规路径，没压过的内容一旦被清就永远进不了长期记忆。因此 `_run_curation(full_reset=...)` 里：兜底整理、`collapse.failed`、未配置提炼模型、`daily_reset_enabled=False` 四种情况一律跳过清空并告警。
+**没收口完就不许清空短期层**。清空会把消息移出常规路径，没压过的内容一旦被清就永远进不了长期记忆。因此 `_run_curation(full_reset=True)` 里：`collapse.failed`、未配置压缩模型、`daily_reset_enabled=False` 三种情况一律跳过清空并告警。**兜底整理（`full_reset=False`）连收口都不做**——收口会把当天整条时间线压掉，清醒期做它等于当场失忆，它只跑维护、长度交给白天的按条数压缩兜。
 
 **摘要不豁免清空**。「整理完短期层为空」是这套设计的验收点：当天摘要已先提升为长期记忆，其余摘要与原始消息一起收口。不要给摘要开例外，否则「刚起床时短期记忆是空的」不成立。
 

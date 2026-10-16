@@ -141,6 +141,10 @@ _BUILTIN_SEND_TOOL = "send_message_to_user"
 # 休息状态机落地前的临时兜底：距上次维护超过该时长就在回复后补跑一次
 _MAINTENANCE_FALLBACK_SECONDS = 24 * 3600
 
+# 短期压缩的检查节流：判据是「条目总数」，而计数要走一次带索引的查询。
+# 记账是热路径，所以两次检查之间至少隔这么久；压缩本身不赶这几十秒。
+_CONDENSE_CHECK_SECONDS = 30.0
+
 # 作息检查节拍。60 秒足够捕捉入睡/起床跨越，且这个 tick 只做纯算术，
 # 真正耗时的整理由 P3 的深睡调度单独触发。
 _SLEEP_TICK_SECONDS = 60.0
@@ -242,6 +246,9 @@ class ShittimPlugin(Star):
         self._sleep_tick_started = False
         # 整理是重活（多次模型调用 + 重写历史），同一时刻只允许一次
         self._curating = False
+        # 短期压缩也要调模型，同样防重入；与 _curating 互斥，避免两边同时动账本
+        self._condensing = False
+        self._last_condense_check = 0.0
 
         tiers = self.memory_store.count_by_tier()
         # 记忆页面（pages/memory/）的只读接口
@@ -401,6 +408,8 @@ class ShittimPlugin(Star):
                 sender_id,
                 sender_name,
             )
+            # 账本刚变长，顺手看一眼要不要压一轮（节流在函数里，热路径只多一次比较）
+            self._schedule_condense_if_due()
         except Exception as error:
             logger.error("[什亭之枢] 记录消息失败: %s", error)
 
@@ -564,9 +573,22 @@ class ShittimPlugin(Star):
         主触发：处于深睡且距上次整理满 `curation_min_interval_hours`。
         兜底触发：不在深睡但距上次已超过 `curation_force_after_hours`——
         睡得太短时深睡阶段可能整段不出现，不兜底就永远不整理。
+
+        只推迟、不丢失：所有守卫都只是「这一 tick 先不做」，下个 60 秒再来看。
+        真正扣动扳机的是 `now - last_curation_at`，所以推迟最多让整理晚几分钟。
         """
         cfg = self.schedule_config
-        if not cfg.curation_enabled or self._curating or not self._memory_active():
+        if (
+            not cfg.curation_enabled
+            or self._curating
+            or self._condensing
+            or not self._memory_active()
+        ):
+            return
+        # 她正在清醒宽限里：刚被叫醒、正在回话。此刻收口会把**她正在聊的
+        # 上下文**整条压掉——和兜底整理必须跳过收口是同一个理由。等宽限过去、
+        # 她真的睡回去再整理；反正节拍判据是「距上次多久」，不会因此漏掉。
+        if self._in_grace(now):
             return
         try:
             last = float(self.sleep_state.load().get("last_curation_at") or 0.0)
@@ -582,7 +604,7 @@ class ShittimPlugin(Star):
         if phase != DEEP and hours >= cfg.curation_force_after_hours:
             logger.warning(
                 "[什亭之枢] 已 %.0f 小时未整理记忆且当前不在深睡，"
-                "执行兜底整理（不清空账本、不重建历史）",
+                "执行兜底整理（不收口、不清空账本）",
                 hours,
             )
             self._spawn(self._run_curation(full_reset=False))
@@ -992,6 +1014,8 @@ class ShittimPlugin(Star):
         except Exception as error:
             logger.error("[什亭之枢] 记录回复失败: %s", error)
 
+        # 短期压缩按条数触发（阈值一到就压一轮），维护管线按小时节流
+        self._schedule_condense_if_due()
         # 维护放后台，绝不阻塞消息链路
         self._schedule_maintenance_if_due()
 
@@ -1344,20 +1368,19 @@ class ShittimPlugin(Star):
     # ══════════════════════════════════════════════════════════
 
     async def run_maintenance(self) -> dict:
-        """执行一次白天的惰性维护（短期压缩 / 降级 / 遗忘 / 晋升 / 合并）。
+        """执行一次白天的惰性维护（降级 / 遗忘 / 晋升 / 合并）。
 
-        **不含收口与归档**：这条路径是「发送消息后」的周期性兜底，宁可少做也
-        不能在清醒状态下清账本（那等于当场失忆）。完整整理走 `_run_curation()`。
+        **不含短期压缩、收口与清空**：
 
-        短期压缩放在这里，是为了白天短期层涨过阈值时能就地压一轮，
-        别让上下文一直涨到晚上。
+        - 收口与清空会把当天的时间线抹掉，只能是深睡期的动作，走 `_run_curation()`。
+        - 短期压缩单独按**条数**触发（见 `_schedule_condense_if_due`）：它的职责是
+          控制上下文长度，跟着「攒了多少条」走才对；而这条维护管线要调模型做降级与
+          合并，只能按小时的节拍跑，混在一起会让压缩被节拍卡住。
         """
         try:
             stats = await self.maintainer.run(
                 curate_budget=self.schedule_config.curate_max_per_run
             )
-            condense_stats = await self.maintainer.condense_short_term()
-            stats["condensed_folded"] = condense_stats.get("folded", 0)
         except Exception as error:
             logger.error("[什亭之枢] 记忆维护失败: %s", error)
             stats = {}
@@ -1369,12 +1392,18 @@ class ShittimPlugin(Star):
         return stats
 
     async def _run_curation(self, *, full_reset: bool) -> dict:
-        """深睡期的一次完整整理（§6，顺序固定）。
+        """一次记忆整理（§6，顺序固定）。
 
+        `full_reset=True`（深睡期）：
             1 降级 → 遗忘 → 晋升 → 合并（maintainer.run，作用于原有那张榜）
             2 短期收口：把短期层压成一条「当天摘要」+ 若干长期记忆
             3 清空短期层（归档原始消息 + 收起摘要）
             4 保留期清理
+
+        `full_reset=False`（清醒期的兜底整理，睡眠窗口被挤没时才会走到）：
+            **只做第 1 步**，绝不收口。收口会把当天整条时间线压掉——那和清空一样
+            是「当场失忆」，只是账面行还在。兜底的全部意义就是「少做，不动她当下的上下文」，
+            长度由白天的 `condense_short_term()` 单独兜住。
 
         **收口必须在清空之前**：短期层一清空，没压过的内容就永远进不了长期记忆。
         所以 `collapse.failed` 时一律跳过第 3 步并告警。
@@ -1385,18 +1414,20 @@ class ShittimPlugin(Star):
         收口是「短期层 → 长期层」唯一的通道（逐批提炼已并入它），所以白天
         攒下的、睡觉时暂存刚放行的，全都在这一步被处理一遍。
         """
-        if self._curating or self._is_terminating:
+        if self._curating or self._condensing or self._is_terminating:
             return {}
         self._curating = True
         started = time.time()
+        collapse: dict = {}
         try:
             cfg = self.schedule_config
             stats = await self.maintainer.run(curate_budget=cfg.curate_max_per_run)
             if self._is_terminating:
                 return {}
-            collapse = await self.maintainer.collapse_short_term(
-                max_rounds=cfg.collapse_max_rounds
-            )
+            if full_reset:
+                collapse = await self.maintainer.collapse_short_term(
+                    max_rounds=cfg.collapse_max_rounds
+                )
             stats["condensed_entries"] = collapse.get("entries", 0)
             stats["condensed_rounds"] = collapse.get("rounds", 0)
             stats["condensed_folded"] = collapse.get("folded", 0)
@@ -1406,7 +1437,7 @@ class ShittimPlugin(Star):
             # 而且不报任何错——这正是「没整理完就不许清账本」的由来。
             reason = ""
             if not full_reset:
-                reason = "本次是兜底整理（清醒状态下不清账本）"
+                reason = "本次是兜底整理（清醒状态下不收口、不清账本）"
             elif collapse.get("failed"):
                 reason = "短期收口未完成，原始条目还没进长期记忆"
             elif not self.extractor.available:
@@ -1458,6 +1489,40 @@ class ShittimPlugin(Star):
             return
         self._last_maintenance_at = now
         self._spawn(self.run_maintenance())
+
+    def _schedule_condense_if_due(self) -> None:
+        """短期层涨过阈值就把最旧的一批压掉一轮。
+
+        与 `run_maintenance()` 分开触发：压缩的判据是**条数**，不是时间——
+        「超过 300 条才压」，所以它得跟着消息量走，而不是被小时节拍卡住。
+        调用点是「收到消息」与「她发出消息」两处，因为两条路径都会让账本变长。
+
+        实际是否动手由 `condense_short_term()` 自己决定（先数条数，不到阈值
+        直接返回），这里只负责三件事：节流（热路径上少查两次库）、防重入
+        （一次模型调用在进行中时不再入队）、以及**不 await**（绝不阻塞消息链路）。
+        """
+        if not self._memory_active() or self._condensing or self._curating:
+            return
+        now = time.time()
+        if now - self._last_condense_check < _CONDENSE_CHECK_SECONDS:
+            return
+        self._last_condense_check = now
+        self._condensing = True
+        self._spawn(self._condense_once())
+
+    async def _condense_once(self) -> None:
+        try:
+            stats = await self.maintainer.condense_short_term()
+            if stats.get("folded"):
+                logger.info(
+                    "[什亭之枢] 短期压缩触发（条目%d 折叠%d条）",
+                    stats.get("entries", 0),
+                    stats.get("folded", 0),
+                )
+        except Exception as error:
+            logger.error("[什亭之枢] 短期压缩失败: %s", error)
+        finally:
+            self._condensing = False
 
     # ══════════════════════════════════════════════════════════
     #  生命周期
