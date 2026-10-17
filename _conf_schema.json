@@ -25,7 +25,7 @@
         "default": 12
       },
       "extract_include_events": {
-        "description": "压缩时纳入「当天发生的事及其结论」，而不只是稳定事实（关掉更精简，但可能隔天就记不起昨天聊过什么）",
+        "description": "压缩时纳入当天事件及其结论，而非仅保留稳定事实（关闭后更精简，但可能无法回忆前一天的对话）",
         "type": "bool",
         "default": true
       },
@@ -71,22 +71,22 @@
         "default": 2000
       },
       "condense_threshold": {
-        "description": "短期条目（消息 + 摘要）超过此数就压一轮最旧的（条）",
+        "description": "短期条目（消息 + 摘要）超过该数量时，压缩最旧的一批（条）",
         "type": "int",
         "default": 300
       },
       "condense_batch": {
-        "description": "每次压缩取最旧多少条（条）",
+        "description": "单次压缩的批大小，从最旧条目开始（条）",
         "type": "int",
         "default": 100
       },
       "timeline_max_messages": {
-        "description": "全局时间线单次最多取多少条条目（条）",
+        "description": "全局时间线单次最多包含的条目数（条）",
         "type": "int",
         "default": 400
       },
       "timeline_token_budget": {
-        "description": "全局时间线的 token 上限：主脑唯一的上下文，按模型窗口给足；超出从最旧的开始丢",
+        "description": "全局时间线的 token 上限（主脑唯一上下文），超出时从最旧条目开始丢弃",
         "type": "int",
         "default": 8000
       },
@@ -101,17 +101,17 @@
         "default": 10
       },
       "auto_index": {
-        "description": "榜前正文之后多少条只给关键词索引，提示她「还忘了什么」（条）",
+        "description": "榜前正文之后以关键词索引呈现的记忆条数，用于提示仍存在未展开的记忆（条）",
         "type": "int",
         "default": 30
       },
       "recall_top_k": {
-        "description": "recall 工具一次想起的、与话题相关的记忆上限（条）",
+        "description": "recall 工具单次返回的、与话题相关的记忆条数上限（条）",
         "type": "int",
         "default": 5
       },
       "recall_user_top_k": {
-        "description": "recall 工具一次想起的、与发送者相关的记忆上限（条）",
+        "description": "recall 工具单次返回的、与发送者相关的记忆条数上限（条）",
         "type": "int",
         "default": 3
       },
@@ -182,7 +182,7 @@
         "default": true
       },
       "provider_id": {
-        "description": "决策模型（建议轻量，留空则复用记忆压缩模型，都留空则只走规则）",
+        "description": "决策模型（建议使用轻量模型；留空时复用记忆压缩模型，两者均未配置时仅启用规则层）",
         "type": "string",
         "default": "",
         "_special": "select_provider"
@@ -208,7 +208,7 @@
         "default": true
       },
       "aliases": {
-        "description": "她的名字与唤醒词，命中即视为被叫到",
+        "description": "智能体名称与唤醒词，文本命中时视为被点名",
         "type": "list",
         "items": { "type": "string" },
         "default": []
@@ -219,12 +219,12 @@
         "default": true
       },
       "context_messages": {
-        "description": "判定时每个会话取给她看的近期消息上限；当前会话的「前文」也按这个条数补（条）",
+        "description": "判定上下文中每个会话的近期消息条数上限；当前会话的窗口前文按同一上限补充（条）",
         "type": "int",
         "default": 6
       },
       "patrol_enabled": {
-        "description": "群聊巡检：把一小段时间的消息攒起来整体判定一次，不逐条判定",
+        "description": "群聊巡检：聚合一段时间内的消息后统一判定，不逐条调用模型",
         "type": "bool",
         "default": true
       },
@@ -244,14 +244,14 @@
         "default": 60.0
       },
       "patrol_noise_filter": {
-        "description": "噪声预过滤：整段只有图片 / 表情、复读或同一人连刷短句时不调用决策模型",
+        "description": "噪声预过滤：整段仅含图片/表情、重复内容或同一发送者连续短句时，不调用决策模型",
         "type": "bool",
         "default": true
       }
     }
   },
   "focus": {
-    "description": "会话焦点（约束她的主动发言范围）",
+    "description": "会话焦点（限制主动发言的目标会话）",
     "type": "object",
     "items": {
       "timeout_minutes": {
@@ -271,7 +271,7 @@
     "type": "object",
     "items": {
       "enabled": {
-        "description": "启用作息状态机（关闭则退回 7×24 在线）",
+        "description": "启用作息状态机（关闭后不限制在线时段）",
         "type": "bool",
         "default": true
       },
@@ -291,7 +291,7 @@
         "default": "12:00"
       },
       "wake_notice_lead_minutes": {
-        "description": "起床前多久转为浅睡（这段时间可被叫醒，分钟）",
+        "description": "起床前多久切换为浅睡（该时段允许叫醒，分钟）",
         "type": "int",
         "default": 120
       },
@@ -311,7 +311,7 @@
         "default": 3
       },
       "wake_grace_minutes": {
-        "description": "被叫醒后的清醒宽限时长，超时无信号即回到浅睡（分钟）",
+        "description": "被叫醒后的清醒宽限时长；超时且无新信号则回到浅睡（分钟）",
         "type": "int",
         "default": 10
       },
@@ -321,7 +321,7 @@
         "default": true
       },
       "curation_force_after_hours": {
-        "description": "兜底：距上次整理超过这么多小时仍未整理（如整晚没进深睡）则强制跑一次维护，但不清空账本（小时）",
+        "description": "兜底策略：距上次整理超过该时长仍未整理（例如未进入深睡）时强制执行一次维护，但不清理账本（小时）",
         "type": "int",
         "default": 48
       },
@@ -357,7 +357,7 @@
         "default": true
       },
       "silence_origin_after_say": {
-        "description": "去别的会话发言后不再回原会话收尾汇报",
+        "description": "在其他会话发言后，不再返回原会话补充汇报",
         "type": "bool",
         "default": true
       },

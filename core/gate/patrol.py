@@ -1,46 +1,43 @@
-"""群聊巡检：把「逐条判定」改成「攒一小段，再看一眼」。
+"""群聊巡检：将逐条判定改为窗口聚合判定。
 
-## 为什么
+## 设计动机
 
-原来的决断层对每条群聊消息都要问一次轻量模型，代价有三个：
+逐条调用轻量模型存在以下问题：
 
-- **成本**：群里闲聊越密，模型调用越多。
-- **延迟闯祸**：一次调用撞上上游超时重试，判定可能几十秒后才回来。
-  于是她拿着「很久以前那条消息」的判断去干预「现在」的对话——实测出现过
-  95 秒后才放行一条早已翻篇的图片，她突然插一句驴唇不对马嘴的话。
-- **抖动**：同类的消息时而拦时而放，看起来前后矛盾。
+- **成本**：群消息越密集，模型调用次数越多。
+- **延迟风险**：调用遇到上游超时重试时，判定结果可能延迟数十秒返回，
+  导致对已经过时的消息执行放行。
+- **一致性**：同类消息的判定结果不稳定，表现为拦截策略前后矛盾。
 
-改成像人一样：听到一句话不急，等对方把这段说完，再决定要不要接。
-判断为不回就安静一阵，过后重新开始听。
+窗口聚合的做法是：等待一段对话结束（或达到封顶时长）后统一判定；
+判定为不回复时进入冷却期，冷却结束后重新收集。
 
 ## 机制
 
-防抖是目的，扣押是实现原理（沿用天使之心验证过的做法）：
+防抖是目的，事件扣押是实现方式：
 
-- 群聊里的普通消息不在处理器里立即判定，而是**扣押**在窗口里。
-- 窗口内又来消息 → 旧事件 KILL，只留最后一条事件持有窗口。
-- 窗口安静满 window 秒（或自首次消息起满 max_wait 秒）→ 拿这段消息判一次。
-- 判「不回」→ 该会话进入 cooldown 冷却，冷却期内连窗口都不开。
-- 判「回」→ 放行最后一条事件。被 KILL 的那些消息由账本合并回
-  `req.contexts`，所以主脑照样看得到整段对话，不会漏掉前文。
+- 群聊普通消息不在处理器中立即判定，而是**扣押**在窗口内。
+- 窗口内出现新消息时，旧事件以 KILL 结束，仅最后一条事件持有窗口。
+- 窗口安静满 `patrol_window_seconds`（或自开启起满 `patrol_max_wait_seconds`）后判定一次。
+- 判定为不回复 → 该会话进入 `patrol_cooldown_seconds` 冷却期，冷却期内不开启窗口。
+- 判定为回复 → 放行最后一条事件。被 KILL 的消息仍记录在账本中，主脑通过全局时间线读取完整对话。
 
-## 噪声不进模型
+## 噪声不进入模型
 
-窗口内如果只有图片/表情、整段复读、或同一个人连刷短句，直接判不回，
-而且**不进冷却**：它不值得花一次模型调用，也不该让她因此沉默一分钟。
+窗口内若仅含图片/表情、整段重复内容，或同一发送者连续发送短句，直接判定为不回复，
+且**不进入冷却**：这类内容不值得消耗模型调用，也不应导致会话长时间静默。
 
-## 放行的是最后一条事件
+## 放行最后一条事件
 
-AstrBot 一条消息一个事件，`stop_event()` 只能决定这一条的命运。所以窗口里
-只有最后一条能被放行——这正是「只放行最后边界事件」的含义。
+AstrBot 每条消息对应一个事件，`stop_event()` 只能作用于当前事件。
+因此窗口内只有最后一条事件可以被放行，即「仅放行最后边界事件」。
 
-## 私聊防抖（silent 窗口）
+## 私聊防抖（静默窗口）
 
-私聊不走模型判定（规则层直接定「要回」），但同样不该立刻回：对方常常把一句
-话拆成好几条发，她抢在第二条前面回就成了打断。所以私聊也开窗，只是**静默
-模式**——等最后一条消息之后安静满 `private_debounce_seconds` 秒就放行，
-不问模型、不进冷却、不计入「上次判定时刻」。计时基准跟着最新那条走，
-对方一直说就一直等，不设封顶。
+私聊不走模型判定（规则层直接判定为需要回复），但同样不应立即回复：用户常将一句话
+拆成多条发送，立即回复会造成打断。因此私聊也开启窗口，但为**静默模式**：最后一条
+消息之后安静满 `private_debounce_seconds` 秒即放行，不询问模型、不进入冷却、
+不更新判定锚点。计时基准跟随最新消息，不设封顶。
 """
 
 from __future__ import annotations
@@ -58,19 +55,18 @@ from ..memory.ledger import format_message_line
 PROCESS = "PROCESS"
 KILL = "KILL"
 
-# 判定占用该会话时，窗口到期后退让重试的间隔与次数上限。
-# 上限存在的意义：宁可这一轮沉默，也不要无休止地等一个慢调用。
+# 判定占用该会话时，窗口到期后的退让重试间隔与次数上限。
+# 设置上限用于避免因单次慢调用无限期推迟判定：超过上限后按不回复处理。
 _RETRY_DELAY = 0.5
 _MAX_TIMER_RETRY = 20
 
-# 「同一个人连刷」的判定门槛：连续这么多条、且每条都这么短，才当噪声。
-# 定得偏保守是刻意的——一个人连说几句短话也可能是正经内容，
-# 误杀比漏判更伤人格。
+# 连续短句噪声的判定门槛：连续条数与单条最大长度。
+# 阈值刻意保守——连续短句也可能是正常内容，误判正常对话的代价更高。
 _BURST_MIN_MESSAGES = 5
 _BURST_MAX_CHARS = 6
 
-# 窗口起点往前留的宽限：记账（priority 100）发生在扣押（priority 90）之前，
-# 第一条消息的入库时间因此略早于窗口开启时刻，不给宽限就会被漏掉。
+# 窗口起点向前保留的宽限：记账（priority 100）先于扣押（priority 90）执行，
+# 第一条消息的入库时间略早于窗口开启时刻，无宽限时会遗漏该条消息。
 _WINDOW_GRACE_SECONDS = 1.0
 
 
@@ -83,19 +79,19 @@ class PatrolRecord:
     future: asyncio.Future
     version: int
     delay: float
-    # 窗口首次开启的时刻。续窗保持不变，作为 max_wait 封顶的基准，
-    # 否则群里一直有人说话就能无限推迟判定。
+    # 窗口首次开启时刻。续窗时保持不变，作为 max_wait 封顶的基准，
+    # 避免持续发言导致判定被无限期推迟。
     opened_at: float
     timer: asyncio.Task | None = None
-    # 静默窗口（私聊防抖）：到点直接放行，不问模型、不进冷却。
+    # 静默窗口（私聊防抖）：到期直接放行，不调用模型、不进入冷却。
     silent: bool = False
 
 
 def noise_reason(rows: list) -> str:
-    """这段消息是否属于「不值得开一次模型」的噪声。
+    """判断这段消息是否属于无需调用模型的噪声。
 
-    只收高置信度的三类，宁可漏判也不要误杀正常对话：
-    整段只有图片表情、整段复读、同一个人连刷极短句。
+    仅匹配三类高置信度噪声，优先避免误判正常对话：
+    整段仅含图片/表情、整段内容重复、同一发送者连续发送极短句。
     """
     texts = [str(row["content"] or "").strip() for row in rows]
     texts = [text for text in texts if text]
@@ -129,11 +125,11 @@ class PatrolManager:
         self._decider = decider
         self._lock = asyncio.Lock()
         self._records: dict[str, PatrolRecord] = {}
-        # 正在判定中的会话：跨 await 的判定必须串行，否则两轮会互相踩
+        # 正在判定中的会话：跨 await 的判定必须串行，避免两轮判定并发读写同一段账本
         self._judging: set[str] = set()
         self._cooldown_until: dict[str, float] = {}
-        # 上次判定的时刻。下次判据从它算起，这样冷却期间攒下的对话
-        # 不会凭白丢掉——她该一次看清这段时间里到底发生了什么。
+        # 上次判定时刻。后续判定的起点由它计算，使冷却期间产生的对话
+        # 仍会进入下一次判定上下文。
         self._last_judged_at: dict[str, float] = {}
         self._version_seq = 0
         self._closed = False
@@ -146,16 +142,16 @@ class PatrolManager:
     async def hold(
         self, chat_id: str, event: Any, *, silent: bool = False
     ) -> asyncio.Future | None:
-        """把这条消息扣押进窗口。
+        """将该消息扣押进窗口。
 
         Args:
-            silent: 私聊防抖模式。窗口到期后不再问模型，直接放行最后一条事件，
-                因此既不进冷却也不占用判定。计时基准是**最后一条消息**而不是
-                首次开窗时刻——对方一直说，她就一直等。
+            silent: 私聊防抖模式。窗口到期后不调用模型，直接放行最后一条事件，
+                因此不进入冷却，也不占用判定流程。计时基准为**最后一条消息**，
+                而非首次开窗时刻。
 
         Returns:
             Future: 调用方 await，结果为 PROCESS（放行）或 KILL（拦下）。
-            None:   冷却中，调用方应立即拦下这条事件，连窗口都不开。
+            None:   处于冷却期，调用方应立即拦下该事件，不开启窗口。
         """
         if self._closed or not chat_id:
             return None
@@ -199,7 +195,7 @@ class PatrolManager:
             return future
 
     async def cleanup(self) -> None:
-        """插件卸载：所有扣押中的事件一律按拦下收场。"""
+        """插件卸载：所有扣押中的事件统一按拦下处理。"""
         self._closed = True
         async with self._lock:
             records = list(self._records.values())
@@ -219,7 +215,7 @@ class PatrolManager:
         return self._version_seq
 
     def _window_delay(self, opened_at: float, now: float) -> float:
-        """本次要等多久才判定：窗口时长与封顶剩余取小。"""
+        """本次判定的等待时长：窗口时长与封顶剩余时间取较小值。"""
         try:
             window = float(self._config.patrol_window_seconds)
             max_wait = float(self._config.patrol_max_wait_seconds)
@@ -228,12 +224,12 @@ class PatrolManager:
         window = max(window, 0.01)
         remaining = max_wait - (now - opened_at)
         if remaining <= 0:
-            # 已经等够封顶时长：立刻判，不能再拖
+            # 已达到封顶时长：立即判定，不再延迟
             return 0.01
         return max(0.01, min(window, remaining))
 
     def _silent_delay(self) -> float:
-        """私聊防抖的静默时长。不设封顶：对方一直说，她就一直等。"""
+        """私聊防抖的静默时长。不设封顶，计时基准始终跟随最新消息。"""
         try:
             seconds = float(self._config.private_debounce_seconds)
         except (TypeError, ValueError):
@@ -241,7 +237,7 @@ class PatrolManager:
         return max(seconds, 0.01)
 
     def _kill(self, record: PatrolRecord, reason: str) -> None:
-        """把一条窗口记录作废（取消定时、结束等待）。"""
+        """作废一条窗口记录（取消定时器并结束等待）。"""
         if record.timer and not record.timer.done():
             record.timer.cancel()
         if record.future and not record.future.done():
@@ -249,7 +245,7 @@ class PatrolManager:
         logger.debug("[什亭之枢] 巡检窗口作废 | %s | %s", record.chat_id, reason)
 
     async def _silent_timer(self, record: PatrolRecord) -> None:
-        """私聊防抖：静默满时长就直接放行最后一条，不问模型、不进冷却。"""
+        """私聊防抖：静默满时长后直接放行最后一条事件，不调用模型、不进入冷却。"""
         try:
             await asyncio.sleep(record.delay)
             async with self._lock:
@@ -281,8 +277,8 @@ class PatrolManager:
                         # 已被更新的消息取代，或已被清理
                         return
                     if record.chat_id in self._judging:
-                        # 上一轮判定还没结束：让开，等它跑完再判，
-                        # 否则两轮判定会同时读写同一段账本
+                        # 上一轮判定尚未结束：等待其完成后再判定，
+                        # 避免两轮判定并发读写同一段账本
                         if attempt < _MAX_TIMER_RETRY:
                             continue
                         self._records.pop(record.chat_id, None)
@@ -305,7 +301,7 @@ class PatrolManager:
                     "开口" if should_reply else "沉默",
                     reason,
                 )
-                # 先落日志再唤醒等待方：调用方的「拦/放」日志要排在理由之后
+                # 先写日志再唤醒等待方，使调用方的拦截/放行日志排在判定理由之后
                 self._finish(record, PROCESS if should_reply else KILL)
                 return
         except asyncio.CancelledError:
@@ -329,9 +325,9 @@ class PatrolManager:
             return 60.0
 
     async def _decide(self, record: PatrolRecord) -> tuple[bool, str, bool]:
-        """判定这一窗消息。返回 (要不要开口, 理由, 是否计入冷却)。"""
-        # 起点取「上次判定之后」与「本次窗口开启」中更早的那个：冷却期间
-        # 攒下的对话同样要给她看，否则她会莫名其妙地缺失一段记忆。
+        """判定当前窗口内的消息。返回 (是否回复, 判定理由, 是否计入冷却)。"""
+        # 起点取「上次判定时刻」与「本次窗口开启时刻」中较早者：
+        # 冷却期间产生的对话也必须进入本次判定上下文，否则会缺失一段记忆。
         since = record.opened_at - _WINDOW_GRACE_SECONDS
         anchor = self._last_judged_at.get(record.chat_id)
         if anchor is not None:
@@ -356,10 +352,10 @@ class PatrolManager:
         return bool(decision.should_reply), decision.reason, True
 
     def _history_before(self, chat_id: str, first_row) -> list[str]:
-        """窗口开始前这个会话的几句原文。
+        """窗口开始前该会话的若干条消息。
 
-        判定对象是「上次判定之后的增量」，安静一段时间后它可能只剩
-        「不懂」这样一句。把紧邻的前文一并交给模型，它才看得出这句在接什么。
+        判定对象是「上次判定之后的增量」，静默一段时间后可能只剩一条
+        缺少上下文的短句。补充紧邻的前文后，模型才能判断该短句的指代对象。
         """
         try:
             limit = int(self._config.context_messages)

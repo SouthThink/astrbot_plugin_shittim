@@ -209,7 +209,7 @@ __marimo__/
 *.zip
 docs/
 
-# 本地构建：打包脚本与产物只在开发机使用，不入库
 /build.ps1
 build/
+plan/
 

@@ -19,16 +19,16 @@ _COLUMN_MIGRATIONS = (
     # gated=1 表示这条消息不在 AstrBot 的历史里：要么被决断层拦下，
     # 要么是插件主动发出的。跨会话上下文档据此把主脑看不到的内容补进去。
     ("short_term_messages", "gated", "INTEGER NOT NULL DEFAULT 0"),
-    # source 取值 live / backfill / sleep。回填的历史又旧又多，塞进 req.contexts 会撑爆
-    # 窗口，所以合并回上下文时只处理 live 那批；睡眠期收到的消息同样不参与合并，
-    # 改由起床提示块按 token 预算呈现。
+    # source 取值 live / backfill / sleep。回填的历史数据量大且时间久远，
+    # 全部注入 req.contexts 会超出上下文窗口，因此合并回上下文时只处理 live；
+    # 睡眠期收到的消息同样不参与合并，改由起床提示块按 token 预算呈现。
     ("short_term_messages", "source", "TEXT NOT NULL DEFAULT 'live'"),
-    # 图片消息转述出来的文字。AstrBot 只会把图片转成「[图片]」占位，
-    # 所以账本里得自己补一句描述，否则她永远「看不到」那张图。
+    # 图片消息的转述文本。AstrBot 只会把图片转成「[图片]」占位，
+    # 因此账本需额外记录一句描述，否则该图片在上下文中不可见。
     ("short_term_messages", "image_caption", "TEXT NOT NULL DEFAULT ''"),
-    # staged=1 表示这条消息仍在「睡眠期暂存区」：不参与整理、不参与归档。
-    # 起床时统一置 0，纳入正常流程。与 source 分开是因为 source 是永久事实
-    # （「睡觉时收到」永远成立），而「是否参与整理」只在睡眠期间成立。
+    # staged=1 表示该消息仍处于「睡眠期暂存区」：不参与整理、不参与归档。
+    # 起床时统一置 0，纳入正常流程。与 source 分开是因为 source 记录的是永久事实
+    # （「睡觉时收到」始终成立），而「是否参与整理」仅在睡眠期间成立。
     ("short_term_messages", "staged", "INTEGER NOT NULL DEFAULT 0"),
     # archived_at > 0 表示这条消息已归档（每日整理时移出常规路径）。
     # "整理完短期记忆为空"是**从常规查询与上下文中排除**，不是物理删除；
@@ -61,9 +61,9 @@ _POST_MIGRATION_INDEXES = (
     "ON short_term_messages (condensed_at, archived_at, id)",
     "CREATE INDEX IF NOT EXISTS idx_mem_promoted "
     "ON memories (tier, promoted_at DESC)",
-    # strength 已退役（权重召回被位置榜取代），旧库上这个索引只会误导后来者
+    # strength 已退役（权重召回被位置榜取代），旧库上的该索引只会造成误导
     "DROP INDEX IF EXISTS idx_mem_tier",
-    # extracted 的「待提炼」通道已并入短期收口（压缩即提炼），这个索引只会拖慢记账
+    # extracted 的「待提炼」通道已并入短期收口（压缩即提炼），该索引只会增加记账开销
     "DROP INDEX IF EXISTS idx_stm_pending",
 )
 
@@ -169,7 +169,7 @@ CREATE TABLE IF NOT EXISTS user_ledger (
     PRIMARY KEY (platform, user_id)
 );
 
--- 会话焦点：她当前在关注哪些会话（只约束主动发言，不约束被动接话）
+-- 会话焦点：当前处于关注状态的会话（只约束主动发言，不约束被动接话）
 CREATE TABLE IF NOT EXISTS session_focus (
     chat_id      TEXT PRIMARY KEY,
     chat_label   TEXT NOT NULL DEFAULT '',
@@ -208,10 +208,10 @@ CREATE TABLE IF NOT EXISTS sleep_state (
 class _NullCursor:
     """连接已关闭时的空游标。
 
-    插件卸载（terminate）会关闭连接，但此时可能仍有 handler 停留在 await 里
-    （例如等决策模型返回）。它们恢复后会继续读写，于是撞上「Cannot operate on
-    a closed database」。与其在每个调用点判空，不如在这里给出一个无副作用的
-    替身，让这些迟到的写入静默失效。
+    插件卸载（terminate）会关闭连接，但此时可能仍有 handler 停留在 await 中
+    （例如等待决策模型返回）。其恢复后会继续读写，从而触发「Cannot operate on
+    a closed database」。与其在每个调用点判空，不如在此提供一个无副作用的
+    替身对象，使迟到的写入静默失效。
     """
 
     lastrowid = 0

@@ -1,31 +1,35 @@
-"""什亭之枢 —— 让智能体拥有统一人格、跨会话记忆与主动行动能力。
+"""什亭之枢 —— 为智能体提供统一人格、跨会话记忆与主动行动能力。
 
-## 四条链路
+## 五条链路
 
 **拦放链路（接管官方 LLM）**
   所有消息 → 记入短期账本 + 刷新该会话焦点 → 决断层规则层
-    ├─ 上游指令 / 私聊 / 被点名 / 无文本 → 当场定夺
-    └─ 群聊里的普通消息 → 巡检窗口：攒一小段对话再判一次
-         ├─ 不回 → stop_event()，官方 LLM 完全不触发，该会话安静一阵
-         └─ 要回 → 置位 is_at_or_wake_command，放行主脑生成回复
+    ├─ 上游指令 / 私聊 / 被点名 / 无文本 → 立即判定
+    └─ 群聊普通消息 → 巡检窗口：累积一段对话后统一判定
+         ├─ 不回复 → stop_event()，官方 LLM 不触发，该会话进入静默
+         └─ 回复 → 置位 is_at_or_wake_command，放行主脑生成回复
 
-  不逐条判定是有原因的：单条消息看不出「这轮问答已经闭环」，而一次慢调用
-  的判定若迟到几十秒，她会拿着过期判断去干预已经在聊别的话题的群。
+  不逐条判定的原因：单条消息无法反映「本轮问答是否已结束」；且单次耗时较长的
+  判定若延迟数十秒，结果可能已与当前话题不符。
 
-**焦点链路（她在哪）**
-  她可以同时在多个会话里"在场"，像一个人同时开着几个聊天窗口。
-  收到某会话的消息 → 该会话获得焦点；安静超过 N 分钟 → 焦点失效（她休息了）。
-  焦点**只约束主动发言**：被动接话永远不受限，任何消息都能唤醒她。
+**作息链路（当前是否清醒）**
+  阶段由时间与配置实时推导，仅持久化事实（窗口起止、叫醒时刻等）。
+  深睡拦截全部消息；浅睡需累积唤醒信号；命令消息始终放行。
+
+**焦点链路（当前在哪些会话）**
+  可同时在多个会话中「在场」。收到某会话消息 → 该会话获得焦点；
+  安静超过 N 分钟 → 焦点失效。
+  焦点**只约束主动发言**，被动接话不受限制，任何消息均可触发唤醒。
 
 **记忆链路**
-  短期：跨会话原始消息总账，带来源标记，保证她不会把 A 群的话回到 B 群；
-        条目超阈值时压成摘要，深睡期收口成「当天摘要」并清空
-  长期：压缩时顺带产出的条目，排在一条「最后一次被想起」的位置榜上，
-        尾部逐级变模糊、最终被遗忘
-  永久：被反复用到或被明确要求记住的记忆，不排榜、不降级、不遗忘
+  短期：跨会话原始消息总账，带来源标记，避免 A 群的消息回复到 B 群；
+        条目超阈值时压成摘要，深睡期收口为「当天摘要」并清空
+  长期：压缩时一并产出的条目，排列在「最后一次被想起」的位置榜上，
+        尾部逐级降低精度，最终被遗忘
+  永久：被反复使用或被明确要求记住的记忆，不参与榜序、不降级、不遗忘
 
-**行动链路（跨会话穿梭）**
-  list_sessions 看有哪些会话 → say 过去说一句 → leave_session / rest 离开
+**行动链路（跨会话操作）**
+  list_sessions 查看会话 → say 发送消息 → leave_session / rest 离开
 """
 
 from __future__ import annotations
@@ -129,24 +133,24 @@ _PRIORITY_INJECT = -10
 # 坏图清理：与记忆开关无关，且要看得到所有插件处理后的最终上下文，
 # 因此排在注入之后，作为发往模型前的最后一道保险。
 _PRIORITY_IMAGE_GUARD = -20
-# 结果装饰：放在最后，让其它插件先跑完，我们最后决定要不要发
+# 结果装饰：置于最后执行，待其它插件完成后由本插件决定是否发送
 _PRIORITY_DECORATE = -100
 # 发送后收口
 _PRIORITY_AFTER_SENT = 100
 
-# AstrBot 内置的「给用户发消息」工具。它参数写错时会静默发到当前会话，
-# 由我们逐请求摘除，跨会话发言统一走 say。
+# AstrBot 内置的消息发送工具。参数错误时会静默发送到当前会话，
+# 因此由本插件逐请求移除；跨会话发言统一使用 say。
 _BUILTIN_SEND_TOOL = "send_message_to_user"
 
-# 休息状态机落地前的临时兜底：距上次维护超过该时长就在回复后补跑一次
+# 休息状态机落地前的临时兜底：距上次维护超过该时长时，在回复后补跑一次
 _MAINTENANCE_FALLBACK_SECONDS = 24 * 3600
 
-# 短期压缩的检查节流：判据是「条目总数」，而计数要走一次带索引的查询。
-# 记账是热路径，所以两次检查之间至少隔这么久；压缩本身不赶这几十秒。
+# 短期压缩的检查节流：触发条件为条目总数，计数需要一次带索引查询。
+# 记账属于热路径，两次检查之间至少间隔该时长；压缩本身可容忍该延迟。
 _CONDENSE_CHECK_SECONDS = 30.0
 
-# 作息检查节拍。60 秒足够捕捉入睡/起床跨越，且这个 tick 只做纯算术，
-# 真正耗时的整理由 P3 的深睡调度单独触发。
+# 作息检查节拍。60 秒足以覆盖入睡/起床的边界变化，且该 tick 仅执行纯算术；
+# 耗时整理由深睡调度单独触发。
 _SLEEP_TICK_SECONDS = 60.0
 
 # 阶段的中文说法：日志、工具返回、记忆页面共用同一套，避免三处各写一份
@@ -154,18 +158,18 @@ _PHASE_LABELS = {AWAKE: "清醒", SLEEP_LIGHT: "浅睡", DEEP: "深睡"}
 
 
 def _persona_dialogs(contexts) -> list[dict]:
-    """取出 AstrBot 插在上下文最前的人格**预设对话**。
+    """取出 AstrBot 插入在上下文最前的人格**预设对话**。
 
-    AstrBot 在 `_ensure_persona_and_skills()` 里把人格的 `begin_dialogs` 用
-    `req.contexts[:0] = ...` 插到最前，且每条都带 `_no_save`；随后才轮到
-    本插件的 `on_llm_request`。我们整体替换上下文时必须把它们原样保留，
-    否则人格的「说话示例」会被静默抹掉。
+    AstrBot 在 `_ensure_persona_and_skills()` 中将人格的 `begin_dialogs` 通过
+    `req.contexts[:0] = ...` 插入最前，且每条都带 `_no_save`；随后才执行
+    本插件的 `on_llm_request`。整体替换上下文时必须原样保留这些条目，
+    否则人格预设对话会被静默移除。
 
-    **人格说明本身不在 contexts 里**——它在 `req.system_prompt`（
-    `# Persona Instructions`），本插件从不改写那一栏。
+    **人格说明本身不在 contexts 中**——它位于 `req.system_prompt`
+    （`# Persona Instructions`），本插件不改写该字段。
 
-    只取**头部连续**的 `_no_save` 段：AstrBot 插入的是连续的一段，而插件在
-    别处追加的系统条目（如文件解析结果）不带这个标记，不会被误认。
+    仅取**头部连续**的 `_no_save` 段：AstrBot 插入的是连续一段，而插件在
+    其他位置追加的系统条目（如文件解析结果）不带该标记，不会被误判。
     """
     kept: list[dict] = []
     for item in contexts or []:
@@ -251,7 +255,7 @@ class ShittimPlugin(Star):
             self.schedule_config.wake_signal_window_minutes * 60,
             self.schedule_config.wake_signal_threshold,
         )
-        # 群聊巡检：把「每条消息问一次模型」改成「攒一小段再判一次」
+        # 群聊巡检：将「每条消息调用一次模型」改为「累积一小段后统一判定」
         self.patrol = PatrolManager(
             self.decision_config, self.short_term, self.decider
         )
@@ -292,13 +296,13 @@ class ShittimPlugin(Star):
             len(self.focus.list_focused(200)),
         )
 
-        # 先把窗口算出来，让睡眠门在第一个 tick 之前就能工作；再启动周期检查。
+        # 先计算窗口，使睡眠门在首个 tick 之前即可工作；随后启动周期检查。
         self._refresh_sleep_window()
         self._ensure_sleep_tick()
         self._init_curation_clock()
         if not self.schedule_config.enabled:
-            # 作息关掉后 tick 不再运行，暂存区从此没人负责放行；这里兜一下，
-            # 否则睡眠期间收到的消息会永远卡在 staged=1（既不整理也不清空）。
+            # 作息关闭后 tick 不再运行，暂存区将无人负责放行；此处兜底放行，
+            # 否则睡眠期消息会永久停留在 staged=1（既不整理也不清理）。
             self.short_term.release_staged()
 
     # ══════════════════════════════════════════════════════════
@@ -313,7 +317,7 @@ class ShittimPlugin(Star):
         )
 
     def _sleep_phase(self, now: float | None = None) -> str:
-        """当前作息阶段。只读内存快照，不做任何 IO。"""
+        """当前作息阶段。仅读取内存快照，不执行 IO。"""
         if not self._schedule_active():
             return AWAKE
         window = self._sleep_window
@@ -383,10 +387,10 @@ class ShittimPlugin(Star):
         self._sleep_tick_started = True
 
     def _init_curation_clock(self) -> None:
-        """首次运行时把「上次整理」设为现在。
+        """首次运行时将「上次整理」初始化为当前时刻。
 
-        否则 `last_curation_at = 0` 会被算成「已经很久没整理」，插件一装上就
-        立刻跑一次整理——表现为装完就见她"沉默了一会儿"还动了记忆。
+        否则 `last_curation_at = 0` 会被判定为长期未整理，插件首次启动时
+        会立即执行一次整理。
         """
         try:
             if not float(self.sleep_state.load().get("last_curation_at") or 0.0):
@@ -400,10 +404,10 @@ class ShittimPlugin(Star):
 
     @filter.event_message_type(filter.EventMessageType.ALL, priority=_PRIORITY_RECORD)
     async def record_incoming_message(self, event: AstrMessageEvent):
-        """把收到的消息记入短期账本，并刷新该会话的焦点。
+        """将收到的消息记入短期账本，并刷新该会话的焦点。
 
-        不回复、不干预，只记账。必须先于决断层执行：无论后面这条消息被放行
-        还是被拦下，它都要进入她的记忆。被拦下的消息会被标记为 gated。
+        不回复、不干预，仅执行记账。必须先于决断层执行：无论消息被放行
+        还是被拦下，都需要进入记忆。被拦下的消息会被标记为 gated。
         """
         if not self.enabled or self._is_terminating:
             return
@@ -415,24 +419,23 @@ class ShittimPlugin(Star):
                 return  # 自己的消息由 after_message_sent 记录，避免重复入账
             content = event.get_message_outline() or ""
             if not content.strip():
-                # 图片/表情这类无文本消息：用占位描述入账，让她的经历不留空白。
-                # 决断层那边拿到的仍是空文本，所以照样不会触发回复。
+                # 图片 / 表情等无文本消息：以占位描述记账，避免对话流出现空缺。
+                # 决断层读取的仍是空文本，因此不会触发回复。
                 content = describe_non_text(event)
             if not content.strip():
                 return
             chat_kind, chat_label = describe_chat(event)
             chat_id = event.unified_msg_origin or ""
 
-            # 睡眠期间照常记账，但**不刷新焦点**：否则每个说话的会话都会重新
-            # 拿到主动发言资格，与入睡收口的 focus.rest() 直接相抵。
-            # 宽限期内她是醒着的（正在回话），那段消息按实时消息算，不当睡眠期。
+            # 睡眠期照常记账，但**不刷新焦点**：否则每个发言会话都会重新获得
+            # 主动发言资格，抵消入睡时的 focus.rest()。
+            # 宽限期内按实时消息处理，不计入睡眠期。
             now = time.time()
             sleeping = (
                 self._sleep_phase(now) in SLEEP_PHASES and not self._in_grace(now)
             )
             if not sleeping:
-                # 有人在这个会说话，她就会看过去：刷新焦点。
-                # 焦点只约束主动发言，所以这里对「接不接话」没有任何影响。
+                # 有消息的会话获得焦点。焦点仅约束主动发言，不影响是否接话。
                 self.focus.touch(chat_id, chat_label)
 
             if not self._memory_active():
@@ -454,14 +457,14 @@ class ShittimPlugin(Star):
             if message_id:
                 # 供决断层在拦下这条消息时回填标记
                 set_extra(event, EXTRA_MESSAGE_ID, message_id)
-                # 图里是什么，得自己问一次视觉模型：AstrBot 只给「[图片]」占位
+                # 图片内容需要单独调用视觉模型：AstrBot 仅提供「[图片]」占位
                 self._schedule_image_caption(event, message_id)
             self.memory_store.upsert_user(
                 platform_of(event) or "unknown",
                 sender_id,
                 sender_name,
             )
-            # 账本刚变长，顺手看一眼要不要压一轮（节流在函数里，热路径只多一次比较）
+            # 账本长度已变化，检查是否需要压缩（节流在函数内部，热路径仅增加一次比较）
             self._schedule_condense_if_due()
         except Exception as error:
             logger.error("[什亭之枢] 记录消息失败: %s", error)
@@ -472,22 +475,22 @@ class ShittimPlugin(Star):
 
     @filter.event_message_type(filter.EventMessageType.ALL, priority=_PRIORITY_SLEEP)
     async def sleep_gate(self, event: AstrMessageEvent):
-        """睡眠期间拦下一切**非命令**消息，且不让它们进任何模型判定。
+        """睡眠期间拦下所有**非命令**消息，且不进入任何模型判定。
 
-        为什么必须排在决断层（90）之前：决断层的规则层对私聊是直接放行的
-        （`always_reply_private`），睡眠判定若晚于它，私聊会直接穿透给主脑，
-        "睡觉时不进模型"就成了空话。
+        必须早于决断层（90）：决断层规则层会对私聊直接放行
+        （`always_reply_private`），若睡眠判定晚于它，私聊消息会直接进入主脑，
+        「睡眠期不调用模型」的约束将失效。
 
         判定顺序：
 
-        1. 上游指令 —— 让路。需求是「忽略一切**非命令**消息」，命令必须穿透，
-           否则睡眠期间连 `/` 指令都用不了。放行不等于解除睡眠、也不开宽限。
+        1. 上游指令 —— 放行。需求是「忽略所有**非命令**消息」，命令必须穿透，
+           否则睡眠期间无法执行 `/` 指令。放行不代表解除睡眠，也不开启宽限。
         2. 清醒 —— 交回原有链路。
         3. 宽限期内（刚被叫醒）—— 放行。
-        4. 浅睡 —— 累计 @/私聊信号，达标就叫醒，并放行触发叫醒的这一条。
+        4. 浅睡 —— 累计 @/私聊信号，达到阈值即叫醒，并放行触发叫醒的消息。
         5. 深睡 —— 一律拦下，不计数、不响应。
 
-        整条链路零 token：只看时间轴与计数，不调用任何模型。
+        整条链路零 token：仅读取时间轴与计数，不调用任何模型。
         """
         if not self._schedule_active():
             return
@@ -509,11 +512,11 @@ class ShittimPlugin(Star):
                 return
             self._block(event)
         except Exception as error:
-            # 睡眠门自己出问题不该让机器人陪葬：放行，交给原生链路
+            # 睡眠门自身异常不应导致机器人整体失效：放行，交由原生链路处理
             logger.error("[什亭之枢] 睡眠门异常，已放行: %s", error)
 
     def _is_wake_signal(self, event, chat_id: str) -> bool:
-        """叫醒信号只认 @ 她 与私聊；群聊里的普通消息不算。"""
+        """唤醒信号仅认 @ 与私聊；群聊中的普通消息不算。"""
         if is_private_chat(chat_id):
             return True
         return bool(getattr(event, "is_at_or_wake_command", False))
@@ -521,10 +524,10 @@ class ShittimPlugin(Star):
     # ── 作息收口 ──────────────────────────────────────────
 
     def _on_fall_asleep(self) -> None:
-        """入睡收口：收回全部焦点、清零叫醒信号。
+        """入睡收口：收回全部焦点、清零唤醒信号。
 
-        静默执行，不做睡前告别——主动广播"我睡了"会把这件事变成公开信息，
-        而她只该表现为"没回应"。
+        静默执行，不做睡前告别——主动广播「我睡了」会使该状态成为公开信息，
+        正确表现应为「没有回应」。
         """
         try:
             count = self.focus.rest()
@@ -547,7 +550,7 @@ class ShittimPlugin(Star):
                 self.focus.touch(chat_id, label)
             self._wake_signals.clear()
             self._grace_until = 0.0
-            # 起床提示待注入：由 P2 的注入通道消费，注入后清标记。
+            # 起床提示待注入：由作息事件注入通道消费，注入后清除标记。
             self.sleep_state.save(wake_notice_pending=1, grace_until=0.0)
         except Exception as error:
             logger.error("[什亭之枢] 起床收口失败: %s", error)
@@ -559,7 +562,7 @@ class ShittimPlugin(Star):
         )
 
     def _on_awakened(self, chat_id: str, now: float) -> None:
-        """被叫醒：开启清醒宽限，并让她在那个会话有资格说话。"""
+        """被叫醒：开启清醒宽限，并使该会话恢复主动发言资格。"""
         grace_seconds = max(int(self.schedule_config.wake_grace_minutes), 0) * 60
         self._grace_until = now + grace_seconds
         self._wake_signals.clear(chat_id)
@@ -597,12 +600,12 @@ class ShittimPlugin(Star):
         self._grace_until = float(state.get("grace_until") or 0.0)
 
         if str(state.get("plan_date") or "") != window.plan_date:
-            # 跨入新一轮作息：先结算上一轮（若已过起床点），再开启这一轮。
-            # 结算必须放在 reset 之后，否则 wake_notice_pending 会被重置掉。
+            # 跨入新一轮作息：先结算上一轮（若已过起床时间），再开启本轮。
+            # 结算必须在 reset 之后执行，否则 wake_notice_pending 会被重置。
             previous_wake = float(state.get("wake_at") or 0.0)
-            # 新一轮回到基础时间表：推迟只对「当次作息」生效。必须用归零后的
-            # 推迟量**重算**窗口——直接把算好的 window 写回去，等于把今晚的
-            # 顺延带进明天，推迟会一天天累积下去。
+            # 新一轮恢复基础时间表：推迟仅对当次作息生效。必须使用归零后的
+            # 推迟量重新计算窗口；若直接写回已计算的 window，会将本次顺延
+            # 带入次日，导致推迟量逐日累积。
             window = plan_window(now, self.schedule_config, 0.0)
             self._sleep_window = window
             self.sleep_state.reset_round(window, 0.0)
@@ -622,24 +625,24 @@ class ShittimPlugin(Star):
                 self._on_wake_up()
             self.sleep_state.save(phase=phase)
 
-        # 整理节拍与阶段转换无关：即使这一 tick 没有跨阶段，也要看一眼到没到点。
+        # 整理节拍与阶段转换无关：即使本次 tick 未发生阶段变化，也需检查是否满足整理条件。
         self._maybe_curate(phase, window, now)
 
     def _maybe_curate(self, phase: str, window, now: float) -> None:
-        """按节拍触发记忆整理（§9.1）。只在 tick 里调用。
+        """按节拍触发记忆整理（§9.1）。仅由 tick 调用。
 
-        **主触发：本轮深睡窗口里还没整理过**（`last_curation_at < window.sleep_at`）。
-        这是「每晚一次」最准确的表达——不依赖「距上次满 24 小时」那种绝对节拍。
+        **主触发：本轮深睡窗口内尚未整理**（`last_curation_at < window.sleep_at`）。
+        该判据直接对应当前睡眠轮次，不依赖「距上次满 24 小时」的绝对时间间隔。
 
-        为什么不用 24 小时：节拍的锚点是「上次整理**完成**的时刻」，
-        于是第一次会落在启动当晚：22:56 装好、01:30 进深睡，只隔 2.5 小时，
-        一夜都被判据挡掉；之后每次还要再叠上整理本身的耗时，锚点会逐日漂移。
-        按「本轮窗口」判就只问一句「这一夜整理过了吗」，天然对齐、不会漂。
+        不使用 24 小时间隔的原因：该间隔以上次整理**完成**时刻为锚点。
+        若插件在启动当晚 22:56 加载、01:30 进入深睡，间隔仅 2.5 小时，
+        整夜都会被判据阻止；此外每次整理耗时还会使锚点逐日偏移。
+        按「本轮窗口」判断只需确认本轮是否已整理，不会产生累积偏差。
 
-        兜底触发：不在深睡但距上次已超过 `curation_force_after_hours`——
-        睡得太短时深睡窗口可能整段不出现，不兜底就永远不整理。
+        兜底触发：不在深睡且距上次整理超过 `curation_force_after_hours`。
+        睡眠时长过短时深睡窗口可能不出现，缺少兜底将导致永不整理。
 
-        只推迟、不丢失：所有守卫都只是「这一 tick 先不做」，下个 60 秒再来看。
+        所有守卫仅推迟执行，不会丢失：本次 tick 条件不满足时，下个 tick 重新检查。
         """
         cfg = self.schedule_config
         if (
@@ -649,9 +652,9 @@ class ShittimPlugin(Star):
             or not self._memory_active()
         ):
             return
-        # 她正在清醒宽限里：刚被叫醒、正在回话。此刻收口会把**她正在聊的
-        # 上下文**整条压掉——和兜底整理必须跳过收口是同一个理由。等宽限过去、
-        # 她真的睡回去再整理；判据是「本轮还没整理」，不会因此漏掉。
+        # 处于清醒宽限（刚被叫醒、正在回复）时不执行整理：收口会压缩当前
+        # 正在使用的上下文，与兜底整理跳过收口的原因一致。宽限结束后再次
+        # 检查；主判据基于本轮窗口，不会因此遗漏。
         if self._in_grace(now):
             return
         try:
@@ -681,17 +684,17 @@ class ShittimPlugin(Star):
 
     @filter.event_message_type(filter.EventMessageType.ALL, priority=_PRIORITY_GATE)
     async def gate_official_llm(self, event: AstrMessageEvent):
-        """在 AstrBot 官方 LLM 被触发之前做拦放判定。
+        """在 AstrBot 官方 LLM 触发之前执行拦放判定。
 
-        **规则层**能定的（上游指令、私聊、被点名、空文本）当场定夺；剩下的
-        群聊普通消息交给**巡检器**：把这条事件扣押进窗口，等这段对话说完再
-        判一次要不要接话——而不是每来一句就问一次模型。
+        **规则层**可确定的（上游指令、私聊、被点名、空文本）在此直接处理；
+        其余群聊普通消息交由**巡检器**：扣押事件，等待一段对话结束后统一判定
+        是否需要接话，而非逐条调用模型。
 
-        私聊是个中间态：规则层已经定了「要回」，但回之前同样要攒一攒
-        （`_gate_private_debounce`），免得抢在对方第二条消息前面插嘴。
+        私聊为中间态：规则层仅判定需要回复，但回复前同样进入静默窗口
+        （`_gate_private_debounce`），避免打断用户连续发言。
 
-        要回 → 置位 is_at_or_wake_command 强行唤醒主脑，让它生成回复；
-        不回 → stop_event()，官方 LLM 完全不触发。
+        需要回复 → 设置 `is_at_or_wake_command` 以唤醒主脑生成回复；
+        不回复 → `stop_event()`，官方 LLM 不触发。
         """
         if not self._gate_active():
             return
@@ -699,7 +702,7 @@ class ShittimPlugin(Star):
         try:
             ruled = self.decider.rule_decide(event)
         except Exception as error:
-            # 决断层自己出问题不该让机器人陪葬：放行，交给原生链路
+            # 决断层异常不应影响机器人运行：放行并交由原生链路处理
             logger.error("[什亭之枢] 决断层异常，已放行: %s", error)
             return
 
@@ -713,23 +716,23 @@ class ShittimPlugin(Star):
         await self._gate_by_patrol(event)
 
     async def _gate_private_debounce(self, event: AstrMessageEvent, ruled) -> None:
-        """私聊防抖：静默满 `private_debounce_seconds` 秒没有新消息才唤醒主脑。
+        """私聊防抖：静默满 `private_debounce_seconds` 秒且无新消息后唤醒主脑。
 
-        私聊本身不需要模型判定要不要回，但需要等：对方常把一句话拆成几条发，
-        立刻回就成了打断。窗口沿用巡检器（静默模式），窗口内旧事件 KILL，
-        只留最后一条持有窗口；被 KILL 的那些由账本合并回 `req.contexts`，
-        所以主脑读到的仍是完整一段，只是等这段说完再一起回。
+        私聊无需模型判定是否回复，但需要等待：用户常将一句话拆成多条发送，
+        立即回复会造成打断。窗口复用巡检器的静默模式：窗口内旧事件以 KILL
+        结束，仅最后一条持有窗口；被 KILL 的消息仍记录在账本中，主脑通过
+        全局时间线读取完整对话，只是等到该段结束后统一回复。
         """
         seconds = self._private_debounce_seconds()
         chat_id = event.unified_msg_origin or ""
         if seconds <= 0 or not chat_id:
-            # 未配置防抖（或取不到会话标识）：退回立即放行
+            # 未配置防抖或取不到会话标识：立即放行
             self._apply_decision(event, ruled)
             return
 
         future = await self.patrol.hold(chat_id, event, silent=True)
         if future is None:
-            # 只有插件正在卸载时才会走到这里，交给卸载流程收场
+            # 仅在插件卸载时进入此分支，交由卸载流程处理
             return
 
         verdict = await future
@@ -746,18 +749,18 @@ class ShittimPlugin(Star):
             logger.info("[什亭之枢] 拦截官方 LLM [私聊防抖] 被更新的消息取代")
 
     def _private_debounce_seconds(self) -> float:
-        """私聊防抖时长；配置取不到时按「不防抖」处理，宁可立刻回也不无声拖延。"""
+        """私聊防抖时长；配置不可用时按「不防抖」处理，优先立即回复而非静默延迟。"""
         try:
             return max(float(self.decision_config.private_debounce_seconds), 0.0)
         except (TypeError, ValueError):
             return 0.0
 
     async def _gate_by_patrol(self, event: AstrMessageEvent) -> None:
-        """群聊里的普通消息：扣押进窗口，攒一段再判。"""
+        """群聊普通消息：扣押进窗口，聚合一段后判定。"""
         chat_id = event.unified_msg_origin or ""
 
         if not self.decision_config.patrol_enabled:
-            # 巡检关闭：退回逐条判定，用账本里最新这条当判据
+            # 巡检关闭：退化为逐条判定，以账本中最新消息作为判据
             chat_label, lines, before = self._latest_window(chat_id)
             decision = await self.decider.judge_window(
                 chat_id, chat_label, lines, before=before
@@ -769,14 +772,14 @@ class ShittimPlugin(Star):
 
         future = await self.patrol.hold(chat_id, event)
         if future is None:
-            # 冷却中：安静地拦下，连窗口都不开
+            # 处于冷却期：直接拦下，不开启窗口
             if not self._is_terminating:
                 self._block(event)
             return
 
         verdict = await future
-        # 等窗口的这几秒里插件可能已被重载或卸载，此时不该再动这个事件：
-        # 新实例的巡检会重新判定，我们插手只会两边打架。
+        # 等待窗口期间插件可能已被重载或卸载，此时不应继续处理该事件：
+        # 新实例的巡检会重新判定，继续处理会导致两个实例冲突。
         if self._is_terminating:
             logger.debug("[什亭之枢] 插件已卸载，放弃本次巡检结果")
             return
@@ -878,18 +881,18 @@ class ShittimPlugin(Star):
 
     @filter.on_llm_request(priority=_PRIORITY_INJECT)
     async def inject_memory_context(self, event: AstrMessageEvent, req):
-        """在请求发给主模型前，把上下文换成一整条全局时间线，并注入记忆。
+        """在请求发送给主模型前，将上下文替换为全局时间线，并注入记忆。
 
-        必须排在会重写 req.contexts 的插件（天使之心，50）**之后**：它用自己
-        重建的历史整体覆盖 contexts，我们后跑才能把上下文换成自己的时间线，
-        而不是被它抹掉。排序语义见 _PRIORITY_INJECT。
+        必须晚于会重写 `req.contexts` 的插件（天使之心，50）：该插件会用
+        自行重建的历史覆盖 contexts，本插件后执行才能将上下文替换为时间线，
+        避免被覆盖。优先级语义见 `_PRIORITY_INJECT`。
 
-        结果顺序就是模型的读取顺序：
+        结果顺序即模型读取顺序：
 
             ① 永久记忆 → ② 长期记忆 →（全局时间线）→ 当前消息 → ③ 作息事件提示
 
-        ①② 是**长期背景**，插在时间线之前；③ 是**时效事件**（刚被叫醒、刚起床），
-        追加在最新处。放反了就会把"刚刚发生的事"讲成很久以前的事。
+        ①② 为**长期背景**，插入时间线之前；③ 为**时效事件**（刚被叫醒、刚起床），
+        追加在最新处。顺序反转会将近期事件描述为较早发生的事件。
         """
         if not self._memory_active() and not self._schedule_active():
             return
@@ -902,8 +905,8 @@ class ShittimPlugin(Star):
                 chat_id = event.unified_msg_origin or ""
                 self._inject_memory_blocks(event, req, chat_id)
 
-            # 作息事件提示：独立于记忆系统——她睡着时发生了什么，与记忆是否
-            # 启用无关，只要作息开着就该告诉她。
+            # 作息事件提示独立于记忆系统：睡眠期间发生的事件与记忆是否启用无关，
+            # 只要作息功能开启就应注入。
             self._inject_schedule_notice(req)
         except Exception as error:
             logger.error("[什亭之枢] 记忆注入失败: %s", error)
@@ -911,16 +914,16 @@ class ShittimPlugin(Star):
     def _inject_memory_blocks(
         self, event: AstrMessageEvent, req, chat_id: str
     ) -> None:
-        """用全局时间线重建上下文，再把记忆块插到最前。"""
-        # 1) 时间线：丢弃 AstrBot 的按会话历史，整体换成她的单一记忆流。
-        #    必须在插入记忆块之前做，否则下一个请求会把我们注入的块也当历史。
+        """使用全局时间线重建上下文，并将记忆块插入最前。"""
+        # 1) 时间线：丢弃 AstrBot 的按会话历史，替换为统一的记忆流。
+        #    必须在插入记忆块之前执行，否则下次请求会将注入块视为历史消息。
         self._rebuild_timeline(req, chat_id)
 
         prefix: list[dict] = []
 
         # 2) 记忆块：① 永久记忆全量 → ② 榜前 auto_top 条正文 → ③ 其后 auto_index
-        #    条只给关键词的索引。**自动插入不算「被想起」**：只有她主动 recall 才
-        #    算，否则榜前那几条会互相把对方永远按在最前面，榜就冻住了。
+        #    条关键词索引。**自动插入不计入「被想起」**：仅主动 recall 才计入，
+        #    否则榜前条目会相互提升排名，导致榜单停止更新。
         permanent = self.memory_store.permanents()
         bodies, index = self.memory_store.auto_injection()
         for block in build_memory_blocks(
@@ -935,19 +938,18 @@ class ShittimPlugin(Star):
             req.contexts = prefix + req.contexts
 
     def _rebuild_timeline(self, req, chat_id: str) -> None:
-        """把整条时间线写回 req.contexts。
+        """将整条时间线写回 `req.contexts`。
 
-        AstrBot 的历史是**按会话隔离**的，而她是同一个人：切会话不该换记忆。
-        所以这里不再叠加，而是整体替换——她读到的永远是自己一天的连续经历，
-        只有最后那条消息换了个人。
+        AstrBot 的历史按会话隔离，而本插件采用统一人格：切换会话不应切换记忆。
+        因此不做叠加，而是整体替换——主脑始终读取连续的经历，仅最后一条消息
+        来自不同会话。
 
-        但**人格的预设对话要留下**（见 `_persona_dialogs`）：它们是「她平时
-        怎么说话」的示例，属于稳定人格，不是经历，排在时间线之前。
+        人格预设对话需要保留（见 `_persona_dialogs`）：它们属于稳定人格，
+        而非经历，排在时间线之前。
 
-        出任何问题都退回 AstrBot 原生历史（不清空 contexts），宁可上下文
-        不符合预期，也不要让她面对一片空白。
+        发生异常时保留 AstrBot 原生历史（不清空 contexts），优先保证上下文可用。
         """
-        # 必须在替换前取：这些条目马上就要被整体换掉
+        # 必须在替换前读取：这些条目随后会被整体替换
         persona = _persona_dialogs(getattr(req, "contexts", None))
         try:
             entries = self.short_term.timeline_entries(
@@ -971,11 +973,11 @@ class ShittimPlugin(Star):
     def _notice_kind(self, state: dict) -> str:
         """待注入的作息事件类型；没有则返回空串。
 
-        起床优先于叫醒：起床发生在窗口末尾，若那一刻还挂着一条没来得及注入的
-        叫醒提示，该说的也是「你睡醒了」而不是「你被叫醒了」。
+        起床优先于叫醒：起床发生在窗口末尾，若该时刻仍存在未注入的叫醒提示，
+        应提示的内容是「你睡醒了」而非「你被叫醒了」。
 
-        两种提示共用 `wake_notice_fired_at` 作为「已注入」的水位线：叫醒只在
-        `awakened_at` 高于它时才算待注入，注入后水位线抬高，自然就不重复了。
+        两种提示共用 `wake_notice_fired_at` 作为「已注入」水位线：叫醒仅在
+        `awakened_at` 高于该水位线时才算待注入，注入后抬高水位线即可去重。
         """
         if int(state.get("wake_notice_pending") or 0) == 1:
             return NOTICE_WAKE
@@ -986,10 +988,10 @@ class ShittimPlugin(Star):
         return ""
 
     def _inject_schedule_notice(self, req) -> None:
-        """把作息事件提示追加到上下文最新处，并消费待注入标记。
+        """将作息事件提示追加到上下文末尾，并消费待注入标记。
 
-        必须持久化「是否已注入」：注入块每轮请求都会重建，不记标记的话这条
-        提示会在她醒来后的每一轮对话里重复出现。
+        必须持久化「是否已注入」：注入块每轮请求都会重建，若不记录标记，
+        该提示会在醒来后的每一轮对话中重复出现。
         """
         if not self._schedule_active():
             return
@@ -1007,8 +1009,8 @@ class ShittimPlugin(Star):
             total = 0
             digest: list[tuple[str, int, str]] = []
             if kind == NOTICE_WAKE:
-                # 睡眠期消息的起点必须是**本轮**入睡时刻：plan_window() 此刻
-                # 已经翻到下一轮了，只有 last_sleep_start() 找得回上一次入睡。
+                # 睡眠期消息的起点必须是**本轮**入睡时刻：plan_window() 此时
+                # 已切换到下一轮，只有 last_sleep_start() 能取到上一次入睡时刻。
                 sleep_at = last_sleep_start(
                     now,
                     self.schedule_config,
@@ -1035,11 +1037,11 @@ class ShittimPlugin(Star):
 
     @filter.on_llm_request(priority=_PRIORITY_IMAGE_GUARD)
     async def guard_broken_images(self, event: AstrMessageEvent, req):
-        """发往模型前摘掉读不到的图片引用。
+        """请求发往模型前摘除不可用的图片引用。
 
-        与记忆系统解耦：一张坏图会让**整条请求**被上游 400 拒绝，AstrBot 随即
-        把这轮切给备用模型——人格和工具全变，这与记忆是否启用毫无关系。
-        排在所有上下文构建插件之后，才看得到它们放进来的图片。
+        与记忆系统解耦：单个失效图片会导致**整条请求**被上游以 400 拒绝，
+        AstrBot 随即切换到备用模型，导致人格与工具全部改变，这与记忆是否启用
+        无关。该处理器排在所有上下文构建插件之后，才能看到它们加入的图片。
         """
         self._strip_broken_images(req)
 
@@ -1049,15 +1051,15 @@ class ShittimPlugin(Star):
 
     @filter.on_decorating_result(priority=_PRIORITY_DECORATE)
     async def drop_origin_reply_after_leaving(self, event: AstrMessageEvent):
-        """她本轮已前往别的会话时，丢掉原会话的收尾发言。
+        """本轮已前往其他会话时，丢弃原会话的收尾发言。
 
-        没有这一步，她就会「走过去说了一句，再跑回来汇报一句」——像隔空喊话
-        加复命，而不是一个真的走过去说话的人。她应该说在那边，不是说在这边。
+        若缺少该步骤，会出现「前往目标会话发言后又返回原会话汇报」的行为，
+        与真实的跨会话发言不符。发言应发生在目标会话，而非原会话。
 
-        注意这不影响她在调用 say **之前**说的话：那部分在工具调用时就已发出，
-        所以「好，我这就去」这类过渡语照常送达，被丢掉的只是走之后的收尾汇报。
+        注意这不影响调用 `say` **之前**的发言：该部分在工具调用时已发送，
+        因此「好，我这就去」一类过渡语仍会送达，仅丢弃离开后的收尾汇报。
 
-        放在极低优先级，让其它插件的结果装饰先跑完，我们最后再决定要不要发。
+        该处理器使用最低优先级，待其它插件的结果装饰完成后，再决定是否发送。
         """
         if not self._proactive_config().get("silence_origin_after_say", True):
             return
@@ -1071,7 +1073,7 @@ class ShittimPlugin(Star):
             if chain:
                 result.chain = []
                 logger.info(
-                    "[什亭之枢] 她已前往 %s，原会话本轮发言已省略",
+                    "[什亭之枢] 已前往 %s，原会话本轮发言已省略",
                     get_extra(event, EXTRA_LEFT_TO, ""),
                 )
         except Exception as error:
@@ -1079,7 +1081,7 @@ class ShittimPlugin(Star):
 
     @filter.after_message_sent(priority=_PRIORITY_AFTER_SENT)
     async def after_message_sent(self, event: AstrMessageEvent):
-        """记录她自己的回复，并在后台触发压缩与维护。"""
+        """记录助手自身的回复，并在后台触发压缩与维护。"""
         if self._is_terminating or not self._memory_active():
             return
         try:
@@ -1203,7 +1205,7 @@ class ShittimPlugin(Star):
                 if not chat_id:
                     return f"找不到会话「{session}」，可以先用 list_sessions 看看有哪些。"
             else:
-                # 默认只翻当前会话：一次搜遍所有群与私聊，结果会长到她读不完
+                # 默认仅查询当前会话：搜索全部群聊与私聊会导致结果超出可读范围
                 chat_id = event.unified_msg_origin or ""
                 if not chat_id:
                     return "当前会话标识不可用，请指定 session。"
@@ -1277,8 +1279,8 @@ class ShittimPlugin(Star):
             logger.error("[什亭之枢] 计算新作息窗口失败: %s", error)
             return f"推迟失败：{error}"
 
-        # 起床被 `wake_latest` 夹住时，实际能推的比请求的少——如实说明，
-        # 不要静默地「推了一半」，否则她以为自己熬到了三点其实十点就得起
+        # 起床时间受 wake_latest 限制时，实际可推迟时长可能小于请求值；
+        # 必须如实返回，避免模型认为已推迟到目标时间而实际未达到。
         gained = (new_window.wake_at - window.wake_at) / 3600.0
         if gained < hours - 0.01:
             if gained <= 0.01:
@@ -1293,7 +1295,7 @@ class ShittimPlugin(Star):
                 sleep_at=new_window.sleep_at,
                 wake_at=new_window.wake_at,
             )
-            # 立刻重算内存里的窗口快照，本 tick 之后的状态推导就用新窗口
+            # 立即重算内存中的窗口快照，后续状态推导使用新窗口
             self._refresh_sleep_window()
         except Exception as error:
             logger.error("[什亭之枢] 保存推迟作息失败: %s", error)
@@ -1356,7 +1358,7 @@ class ShittimPlugin(Star):
         if self._allowed_targets and target_key not in self._allowed_targets:
             return f"错误：目标 {target_key} 不在允许的白名单中"
 
-        # 先看后发：没关注过那个地方就先别开口，把语境递给她再说
+        # 先看后发：未关注目标会话时先返回其近期对话，确认后再发言
         gate = self._check_say_gate(event, umo, force)
         if gate is not None:
             return gate
@@ -1370,8 +1372,8 @@ class ShittimPlugin(Star):
             logger.error("[什亭之枢] 发言失败 | %s | %s", umo, error)
             return f"发送失败：{error}"
 
-        # AstrBot 找不到对应平台实例时只打警告并返回 False，不会抛异常。
-        # 不检查返回值就会把失败当成功报给她，她会以为话已经带到了。
+        # AstrBot 找不到对应平台实例时仅记录警告并返回 False，不会抛出异常。
+        # 若不检查返回值，发送失败会被误报为成功。
         if sent is False:
             logger.warning("[什亭之枢] 发言未被平台接受 | %s", umo)
             return (
@@ -1380,14 +1382,14 @@ class ShittimPlugin(Star):
             )
 
         self._send_timestamps.append(time.time())
-        # 她「去」了那里：刷新焦点，之后那边有人说话她会正常参与
+        # 已前往目标会话：刷新焦点，后续该会话的消息会正常参与
         label = self.short_term.label_for_chat(umo)
         self.focus.touch(umo, label)
-        # 标记「她本轮已经离开原会话」：收尾时据此不再回原会话汇报
+        # 标记本轮已离开原会话，收尾时据此跳过原会话汇报
         if umo != (event.unified_msg_origin or ""):
             set_extra(event, EXTRA_LEFT_TO, umo)
-        # 写回短期账本。主动说出的话不在 AstrBot 的历史里，标 gated 让
-        # 上下文档知道「这条主脑看不到」，避免她忘记自己说过。
+        # 写回短期账本。主动发言不在 AstrBot 的历史中，标记 gated 供上下文
+        # 构建时识别，避免模型遗漏自己说过的话。
         self.short_term.add(
             chat_id=umo,
             chat_label=label,
@@ -1564,15 +1566,14 @@ class ShittimPlugin(Star):
         )
 
     # ══════════════════════════════════════════════════════════
-    #  官方历史回填
+    #  图片转述
     # ══════════════════════════════════════════════════════════
 
     def _schedule_image_caption(self, event: AstrMessageEvent, message_id: int) -> None:
-        """把图片转述丢到后台。
+        """将图片转述任务放入后台。
 
-        不能在这里等视觉模型：记账是事件链的第一环，卡住它会把后面所有插件
-        的处理一起拖慢。引用必须**当场**取出来——图片的临时文件、链接都可能
-        在我们睡一觉之后失效。
+        不能在此等待视觉模型：记账位于事件链首环，阻塞会影响后续所有插件的
+        处理。图片引用必须**当场**取出——临时文件与链接可能随后失效。
         """
         if not self.memory_config.vision_enabled or not message_id:
             return
@@ -1584,7 +1585,7 @@ class ShittimPlugin(Star):
         self._spawn(self._caption_message(message_id, refs))
 
     async def _caption_message(self, message_id: int, refs: list[str]) -> None:
-        """转述回来就回填账本，她与记忆页面便都能看到图里是什么了。"""
+        """转述完成后回填账本，供判定、上下文与记忆页面使用。"""
         try:
             caption = await self.captioner.describe(refs)
         except Exception as error:
@@ -1602,12 +1603,12 @@ class ShittimPlugin(Star):
     async def run_maintenance(self) -> dict:
         """执行一次白天的惰性维护（降级 / 遗忘 / 晋升 / 合并）。
 
-        **不含短期压缩、收口与清空**：
+        **不包含短期压缩、收口与清空**：
 
-        - 收口与清空会把当天的时间线抹掉，只能是深睡期的动作，走 `_run_curation()`。
-        - 短期压缩单独按**条数**触发（见 `_schedule_condense_if_due`）：它的职责是
-          控制上下文长度，跟着「攒了多少条」走才对；而这条维护管线要调模型做降级与
-          合并，只能按小时的节拍跑，混在一起会让压缩被节拍卡住。
+        - 收口与清空会移除当天时间线，仅能在深睡期执行，见 `_run_curation()`。
+        - 短期压缩按**条数**单独触发（见 `_schedule_condense_if_due`）：其职责是
+          控制上下文长度，应跟随条目数量触发；而该维护管线需要调用模型执行降级
+          与合并，只能按小时节拍运行，混合后会使压缩受小时节拍限制。
         """
         try:
             stats = await self.maintainer.run(
@@ -1616,7 +1617,7 @@ class ShittimPlugin(Star):
         except Exception as error:
             logger.error("[什亭之枢] 记忆维护失败: %s", error)
             stats = {}
-        # 焦点记录也在这里顺手清理，避免表长期膨胀
+        # 同时清理焦点记录，避免表长期膨胀
         try:
             self.focus.prune()
         except Exception as error:
@@ -1624,27 +1625,27 @@ class ShittimPlugin(Star):
         return stats
 
     async def _run_curation(self, *, full_reset: bool) -> dict:
-        """一次记忆整理（§6，顺序固定）。
+        """执行一次记忆整理（§6，顺序固定）。
 
         `full_reset=True`（深睡期）：
-            1 降级 → 遗忘 → 晋升 → 合并（maintainer.run，作用于原有那张榜）
-            2 短期收口：把短期层压成一条「当天摘要」+ 若干长期记忆
+            1 降级 → 遗忘 → 晋升 → 合并（maintainer.run，作用于现有位置榜）
+            2 短期收口：将短期层压缩为一条「当天摘要」与若干长期记忆
             3 清空短期层（归档原始消息 + 收起摘要）
             4 保留期清理
 
-        `full_reset=False`（清醒期的兜底整理，睡眠窗口被挤没时才会走到）：
-            **只做第 1 步**，绝不收口。收口会把当天整条时间线压掉——那和清空一样
-            是「当场失忆」，只是账面行还在。兜底的全部意义就是「少做，不动她当下的上下文」，
-            长度由白天的 `condense_short_term()` 单独兜住。
+        `full_reset=False`（清醒期兜底整理，仅在睡眠窗口未出现时执行）：
+            **仅执行第 1 步**，不执行收口。收口会移除当天时间线，与清空同样
+            会导致当前上下文不可用。兜底策略的目标是减少操作、不影响当前上下文，
+            长度控制由白天的 `condense_short_term()` 负责。
 
-        **收口必须在清空之前**：短期层一清空，没压过的内容就永远进不了长期记忆。
-        所以 `collapse.failed` 时一律跳过第 3 步并告警。
+        **收口必须在清空之前**：短期层清空后，未压缩的内容将无法进入长期记忆。
+        因此 `collapse.failed` 时一律跳过第 3 步并记录告警。
 
-        收口放在维护之后，是为了让当天摘要**确定性地落在榜首**：它最后写入，
-        同刻并列时 id 最大。榜序即「她记得最牢的」，当天摘要必须是第一条。
+        收口安排在维护之后，使当天摘要**确定性地位于榜首**：它最后写入，
+        同刻并列时 id 最大。榜单顺序代表记忆强度，当天摘要必须位于第一条。
 
-        收口是「短期层 → 长期层」唯一的通道（逐批提炼已并入它），所以白天
-        攒下的、睡觉时暂存刚放行的，全都在这一步被处理一遍。
+        收口是「短期层 → 长期层」的唯一通道（逐批提炼已并入该步骤），
+        白天积累与睡眠期暂存后放行的消息均在此步骤中处理。
         """
         if self._curating or self._condensing or self._is_terminating:
             return {}
@@ -1665,8 +1666,8 @@ class ShittimPlugin(Star):
             stats["condensed_folded"] = collapse.get("folded", 0)
             stats["day_summary"] = 1 if collapse.get("day_summary") else 0
 
-            # 清空的硬保护：收口没成功就**不清**。否则那一天的内容会静默消失，
-            # 而且不报任何错——这正是「没整理完就不许清账本」的由来。
+            # 清空保护：收口未成功时不执行清空。否则当天内容会静默丢失，
+            # 且不会产生任何错误——这是「未完成整理不得清空账本」约束的来源。
             reason = ""
             if not full_reset:
                 reason = "本次是兜底整理（清醒状态下不收口、不清账本）"
@@ -1723,15 +1724,15 @@ class ShittimPlugin(Star):
         self._spawn(self.run_maintenance())
 
     def _schedule_condense_if_due(self) -> None:
-        """短期层涨过阈值就把最旧的一批压掉一轮。
+        """短期层超过阈值时，将最旧的一批压缩一轮。
 
-        与 `run_maintenance()` 分开触发：压缩的判据是**条数**，不是时间——
-        「超过 300 条才压」，所以它得跟着消息量走，而不是被小时节拍卡住。
-        调用点是「收到消息」与「她发出消息」两处，因为两条路径都会让账本变长。
+        与 `run_maintenance()` 分开触发：压缩的判据是**条数**而非时间——
+        条目数超过阈值才执行，因此应跟随消息量触发，而不受小时节拍限制。
+        调用点为「收到消息」与「发出消息」两处，两条路径都会增加账本长度。
 
-        实际是否动手由 `condense_short_term()` 自己决定（先数条数，不到阈值
-        直接返回），这里只负责三件事：节流（热路径上少查两次库）、防重入
-        （一次模型调用在进行中时不再入队）、以及**不 await**（绝不阻塞消息链路）。
+        是否执行由 `condense_short_term()` 内部决定（先统计条目数，未达阈值
+        直接返回）。本方法仅负责三件事：节流（减少热路径上的数据库查询）、
+        防重入（模型调用进行中不再入队）、以及**不 await**（不阻塞消息链路）。
         """
         if not self._memory_active() or self._condensing or self._curating:
             return
@@ -1766,7 +1767,7 @@ class ShittimPlugin(Star):
         self.memory_config = MemoryConfig.from_dict(self.config)
         self.decision_config = DecisionConfig.from_dict(self.config)
         self.focus_config = FocusConfig.from_dict(self.config)
-        # 作息配置也必须重读，否则改了入睡/起床时刻要重载插件才生效
+        # 作息配置也需要重新读取，避免修改入睡/起床时间后必须重载插件才生效
         self.schedule_config = ScheduleConfig.from_dict(self.config)
         self.short_term.update_config(self.memory_config)
         self.memory_store.update_config(self.memory_config)
@@ -1777,7 +1778,7 @@ class ShittimPlugin(Star):
         self.patrol.update_config(self.decision_config)
         self.focus.update_config(self.focus_config)
         self._allowed_targets = self._load_allowed_targets()
-        # 作息：换新配置后重建计数窗口并立即重算快照，不必等下一个 tick
+        # 作息：使用新配置重建计数窗口并立即重算快照，无需等待下一个 tick
         self._wake_signals = WakeSignalCounter(
             self.schedule_config.wake_signal_window_minutes * 60,
             self.schedule_config.wake_signal_threshold,
@@ -1801,7 +1802,7 @@ class ShittimPlugin(Star):
         if pending:
             await asyncio.gather(*pending, return_exceptions=True)
         self._background_tasks.clear()
-        # 扣押中的窗口事件一律按拦下收场，否则它们会一直挂在等待里
+        # 扣押中的窗口事件统一按拦下处理，避免其永久处于等待状态
         await self.patrol.cleanup()
         self.db.close()
         logger.info("[什亭之枢] 已卸载，记忆库已关闭")
@@ -1841,12 +1842,13 @@ class ShittimPlugin(Star):
         )
 
     def _strip_broken_images(self, req) -> None:
-        """请求发出前摘掉读不到的图片引用。
+        """请求发出前摘除不可用的图片引用。
 
-        上游只接受 base64 / http(s) 的图片 URL。本地图片由 AstrBot 在 provider
-        层转 base64，一旦转换失败（文件被清理、路径失效、内容为空）它会**原样
-        透传**，严格的上游直接 400 —— 而 AstrBot 随后会把这轮切给备用模型，
-        语气突变、工具调用多半失效。一张坏图的代价不该是整个回合。
+        上游仅接受 base64 / http(s) 形式的图片 URL。本地图片由 AstrBot 在
+        provider 层转为 base64；一旦转换失败（文件被清理、路径失效、内容为空），
+        引用会被**原样透传**，严格的上游会直接返回 400，AstrBot 随后将本轮
+        切换到备用模型，导致语气突变、工具调用大概率失效。单个失效图片不应
+        影响整个回合。
         """
         if not self.memory_config.strip_invalid_images:
             return
@@ -1869,7 +1871,7 @@ class ShittimPlugin(Star):
             return
         if dropped:
             logger.warning(
-                "[什亭之枢] 已摘除 %d 个读不到的图片引用，避免整条请求被上游拒绝: %s",
+                "[什亭之枢] 已摘除 %d 个不可用的图片引用，避免整条请求被上游拒绝: %s",
                 len(dropped),
                 " | ".join(ref[:120] for ref in dropped[:3]),
             )
@@ -1907,15 +1909,15 @@ class ShittimPlugin(Star):
     def _check_say_gate(
         self, event: AstrMessageEvent, umo: str, force: bool
     ) -> str | None:
-        """主动发言前的闸：确认她在关注这个会话。返回 None 表示放行。
+        """主动发言前置检查：确认是否关注目标会话。返回 None 表示放行。
 
-        不直接硬拒，而是把那边的最近对话递给她：她读完后带 force=true 重发即可。
-        这样既保住了「先看语境再开口」，又不会让工具循环在「没资格」和
-        「不知道该说什么」之间空转。
+        不直接拒绝，而是返回目标会话的近期对话；确认后可带 `force=true`
+        重新调用。该设计保留「先看语境再发言」的约束，同时避免工具在
+        「无资格」与「无内容」之间反复调用。
         """
         if force or not self.focus_config.require_focus_for_say:
             return None
-        # 目标就是当前会话，她显然就在这儿
+        # 目标为当前会话，直接放行
         if umo == (event.unified_msg_origin or ""):
             return None
         if self.focus.is_focused(umo):
@@ -1924,7 +1926,7 @@ class ShittimPlugin(Star):
         rows = self.short_term.recent_of_chat(umo, 12)
         label = self.short_term.label_for_chat(umo)
         if not rows:
-            # 从没见过的会话，没有语境可读，不额外设障
+            # 从未见过的会话没有可读语境，不额外限制
             return None
 
         idle = self.focus.idle_seconds(umo)

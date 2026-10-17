@@ -1,33 +1,33 @@
-"""图片引用的可用性检查与坏图摘除。
+"""图片引用的可用性检查与失效引用摘除。
 
-这里只做一件事：在请求发出前，把**确定读不到**的图片引用摘掉。
+本模块只负责一件事：在请求发出前去除**确定不可用**的图片引用。
 
-为什么必须做：一张失效的图片会让**整条请求**被上游 400 拒绝，而 AstrBot
-随后会把这一轮切给备用模型——语气突变、工具调用多半失效。代价远大于
-「这张图没传过去」。摘掉后坏图只影响它自己。
+必要性：单个失效图片会导致**整条请求**被上游以 400 拒绝，AstrBot 随后会将
+本轮请求切换到备用模型，造成语气突变、工具调用大概率失效。其代价远大于
+「该图片未传递」。摘除后失效图片只影响自身。
 
-（本模块过去还承担「从 AstrBot 官方会话历史回填短期记忆」。上下文改为
-全局时间线整体重建之后，官方历史不再进她的视野，回填一并退役。）
+（本模块此前还承担「从 AstrBot 官方会话历史回填短期记忆」。上下文改为全局
+时间线整体重建后，官方历史不再进入上下文，回填逻辑一并移除。）
 """
 
 from __future__ import annotations
 
 import os
 
-# 上游只接受这几种图片引用。其余（本地路径）由 AstrBot 在 provider 层转 base64；
-# 转换失败的会**原样透传**，严格的上游就会直接 400 并让整条请求失败。
+# 上游仅接受这几种图片引用。其余（本地路径）由 AstrBot 在 provider 层转为 base64；
+# 转换失败的引用会被**原样透传**，严格的上游会直接返回 400 并导致整条请求失败。
 _REMOTE_IMAGE_PREFIXES = ("data:", "http://", "https://")
 _FILE_PREFIX = "file://"
 
-# 整条消息只剩坏图时留下的文本，让「这里本来有张图」这件事不至于彻底消失
+# 整条消息只剩失效图片时写入的文本，保留「此处原本有图片」这一信息
 BROKEN_IMAGE_PLACEHOLDER = "[图片已失效]"
 
 
 def is_usable_image_ref(ref: str, cache_path: str = "") -> bool:
-    """这个图片引用能不能安全地交给上游。
+    """判断该图片引用能否安全地交给上游。
 
     远端引用与 data URL 一律放行；本地路径要求文件确实存在且非空，
-    否则它一定会被原样透传出去触发 400。
+    否则会被原样透传并触发 400。
     """
     ref = (ref or "").strip()
     if not ref:
@@ -52,7 +52,7 @@ def _image_ref_of(part: dict) -> str:
 
 
 def strip_invalid_images(contexts: list) -> tuple[list, list[str]]:
-    """摘掉读不到的图片引用，返回 (处理后的 contexts, 被摘掉的引用)。"""
+    """摘除不可用的图片引用，返回 (处理后的 contexts, 被摘除的引用)。"""
     if not isinstance(contexts, list):
         return contexts, []
 
@@ -85,7 +85,7 @@ def strip_invalid_images(contexts: list) -> tuple[list, list[str]]:
             result.append(entry)
             continue
         new_entry = dict(entry)
-        # 整条消息只剩坏图时补一个文本占位，别让这条消息变成空内容
+        # 整条消息只剩失效图片时补一个文本占位，避免消息内容变为空
         new_entry["content"] = kept or [
             {"type": "text", "text": BROKEN_IMAGE_PLACEHOLDER}
         ]
@@ -95,7 +95,7 @@ def strip_invalid_images(contexts: list) -> tuple[list, list[str]]:
 
 
 def strip_invalid_image_urls(urls: list) -> tuple[list, list[str]]:
-    """同上，但作用于 req.image_urls 这种「字符串列表」形式。"""
+    """与 strip_invalid_images 相同，但作用于 req.image_urls 这类字符串列表。"""
     if not isinstance(urls, list):
         return urls, []
     kept: list = []

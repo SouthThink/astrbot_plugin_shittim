@@ -1,15 +1,16 @@
-"""决断层：在 AstrBot 官方 LLM 被触发之前，决定要不要回。
+"""决断层：在 AstrBot 官方 LLM 被触发之前判定是否回复。
 
-分两层，边界很清晰：
+分为两层，职责边界明确：
 
-- **规则层** `rule_decide()`：同步、零 token。上游指令、空文本、私聊、被点名
-  都在这里当场定夺，返回 None 表示「这条得再看看」。私聊定的是「要回」，
-  但要回不等于立刻回——它带上 `debounce` 标记，由上层攒够静默时长再唤醒主脑。
-- **模型层** `judge_window()`：给一段窗口内的对话做判断。调用方是巡检器
-  （`patrol.PatrolManager`），它负责攒够一段时间再叫这一层，而不是每来一句
-  就调一次模型。
+- **规则层** `rule_decide()`：同步执行、不消耗 token。上游指令、空文本、私聊、
+  被点名均在此直接判定；返回 None 表示「交由巡检层继续判断」。私聊判定结果
+  为「需要回复」，但并非立即回复——它带有 `debounce` 标记，由上层在静默时长
+  满足后再唤醒主脑。
+- **模型层** `judge_window()`：对窗口内的一段对话进行判定。调用方是巡检器
+  （`patrol.PatrolManager`），由巡检器累积一段时间后调用，而非每条消息都
+  触发一次模型调用。
 
-两个层的失败都收敛为「不回」：宁可她安静，也不要不受控地开口。
+两层判定失败时统一收敛为「不回复」：优先保证行为可控，避免无约束发言。
 """
 
 from __future__ import annotations
@@ -39,11 +40,11 @@ SOURCE_FALLBACK = "fallback"
 # 决策模型输出里 should_reply 的各种真值写法
 _TRUE_WORDS = {"true", "1", "yes", "y", "是", "真", "需要", "回复"}
 
-# 人格提示词最多取这么多字：判定要的是「她是什么样的人」，不是完整人设文档。
-# 1200 字足够覆盖常用的精简人设（实测「爱丽丝简化版」812 字），
-# 再往上每次判定都要多付几千 token，而判定本身只需要性格与语气。
+# 人格提示词的最大字数：判定需要的是人设特征，而非完整人设文档。
+# 1200 字足以覆盖常用的精简人设（实测「爱丽丝简化版」812 字），
+# 继续增大只会使每次判定多消耗数千 token，而判定本身只需要性格与语气。
 _PERSONA_MAX_CHARS = 1200
-# 人格几乎不变，取一次缓存一段时间即可，避免每条窗口都去翻配置
+# 人格极少变化，取一次并缓存一段时间即可，避免每个窗口都重新读取配置
 _PERSONA_CACHE_SECONDS = 300.0
 
 _WINDOW_PROMPT = """你是「{alias}」，正在「{chat_label}」。
@@ -92,16 +93,16 @@ _WINDOW_PROMPT = """你是「{alias}」，正在「{chat_label}」。
 class Decision:
     """一次拦放判定。
 
-    passthrough=True 表示「完全不要动这个事件」：既不拦也不置唤醒标志，
-    原样交给 AstrBot 原生流程。上游指令走这条路，避免指令消息被我们
-    的置位动作额外喂给 LLM。
+    passthrough=True 表示「不修改该事件」：既不拦截，也不设置唤醒标志，
+    原样交给 AstrBot 原生流程。上游指令走此路径，避免指令消息因唤醒标志
+    被额外送入 LLM。
     """
 
     should_reply: bool
     reason: str
     source: str  # rule | model | fallback
     passthrough: bool = False
-    # 要回，但别立刻回：交给上层攒一小段（私聊防抖），别在对方打字打一半时插嘴
+    # 需要回复，但不立即回复：交由上层聚合一段静默时间（私聊防抖），避免打断用户连续发言
     debounce: bool = False
 
 
@@ -121,7 +122,7 @@ class DecisionEngine:
         self._memory_config = memory_config
         self._short_term = short_term
         self._memory_store = memory_store
-        # 人格文本缓存：chat_id -> (取到的时刻, 文本)
+        # 人格文本缓存：chat_id -> (读取时刻, 文本)
         self._persona_cache: dict[str, tuple[float, str]] = {}
 
     def update_config(self, decision_config, memory_config) -> None:
@@ -131,25 +132,25 @@ class DecisionEngine:
     # ── 规则层 ────────────────────────────────────────────
 
     def rule_decide(self, event) -> Decision | None:
-        """能靠规则定的直接定；返回 None 表示「交给巡检窗口再看」。
+        """可由规则判定的在此直接判定；返回 None 表示「交由巡检窗口继续判断」。
 
-        规则层是同步的、不花 token 的：上游指令、空文本、私聊、被点名都在
-        这里当场定夺。剩下的群聊普通消息才是巡检的活——攒一小段再判一次，
-        而不是每来一句就问一次模型。
+        规则层同步执行、不消耗 token：上游指令、空文本、私聊、被点名均在此
+        直接判定。剩余的群聊普通消息交由巡检处理——累积一小段后整体判定一次，
+        而非每条消息都调用一次模型。
         """
         chat_id = getattr(event, "unified_msg_origin", "") or ""
         text = get_message_text(event)
 
-        # 上游指令必须让路，否则 /命令 会失效。这里连唤醒标志都不碰。
+        # 上游指令必须放行，否则 /命令 会失效。此路径不修改唤醒标志。
         if self._config.allow_upstream_commands and is_upstream_command_event(event):
-            return Decision(True, "上游指令，原样让路", SOURCE_RULE, passthrough=True)
+            return Decision(True, "上游指令，原样放行", SOURCE_RULE, passthrough=True)
 
         if not text:
             return Decision(False, "没有可回应的文本内容", SOURCE_RULE)
 
         if is_private_chat(chat_id) and self._config.always_reply_private:
-            # 私聊一定要回，但不立刻回：对方常把一句话拆成几条发，
-            # 等她安静下来再一次性回应，免得抢在中间打断。
+            # 私聊必须回复，但不立即回复：对方常把一句话拆成多条发送，
+            # 等待其安静下来后再一次性回应，避免在中间打断。
             return Decision(True, "私聊", SOURCE_RULE, debounce=True)
 
         if self._is_mentioned(event, text) and self._config.always_reply_when_mentioned:
@@ -158,7 +159,7 @@ class DecisionEngine:
         return None
 
     def _is_mentioned(self, event, text: str) -> bool:
-        """被 @ / 命中 AstrBot 唤醒 / 文本里出现她的名字。"""
+        """被 @ / 命中 AstrBot 唤醒 / 文本中出现别名。"""
         if bool(getattr(event, "is_at_or_wake_command", False)):
             return True
         return any(alias and alias in text for alias in self._config.aliases)
@@ -172,15 +173,15 @@ class DecisionEngine:
         lines: list[str],
         before: list[str] | None = None,
     ) -> Decision:
-        """判定「这段时间的对话」要不要接一句。
+        """判定一段时间内的对话是否需要接话。
 
-        与逐条判定的区别在判据本身：她听到的是一整段，而不是被切成一条条、
-        彼此脱节的碎片。所以模型能看出「这轮问答已经闭环了」或「他们在等
-        别人回」，而不是对着一句「应该可以」独自猜上下文。
+        与逐条判定的区别在于判据粒度：输入是一段连续对话，而非彼此
+        缺乏关联的单条消息，因此模型可以判断话题是否已经结束、是否在等待
+        其他人回应，而不是仅根据孤立语句推测上下文。
 
-        `before` 是窗口开始前这个会话里刚说过的几句。判定对象仍然是窗口内的
-        增量，但「不懂」「那他呢」这类话只有配上紧邻的前文才判得准——
-        没有它，模型只能判「无明确上下文」然后沉默。
+        `before` 是窗口开始前该会话的若干条消息。判定对象仍为窗口内的增量，
+        但「不懂」「那他呢」一类语句需要紧邻前文才能判断指代对象；
+        缺少前文时，模型只能以「无明确上下文」为由判定为不回复。
         """
         provider = self._resolve_provider()
         if provider is None:
@@ -255,13 +256,13 @@ class DecisionEngine:
         return self._config.aliases[0] if self._config.aliases else "你"
 
     async def _persona_block(self, chat_id: str) -> str:
-        """取当前生效的人格提示词，供判定层判断「她会怎么接话」。
+        """读取当前生效的人格提示词，供判定层判断「这个人会如何接话」。
 
-        判定层原本只看窗口与记忆，模型只能按「有没有人叫我」来判断，
-        于是把沉默当成安全答案。人格是「她想不想说」的一半依据：
-        活泼、爱接话的人格和冷淡、克制的人格，对同一段对话的答案本就不同。
+        判定层原本只读取窗口与记忆，模型只能依据「是否有人叫我」判断，
+        因而倾向于把沉默当作安全答案。人格是「是否愿意开口」的另一半依据：
+        活泼、偏好接话的人格与冷淡、克制的人格，对同一段对话的判断本就不同。
 
-        取不到就返回空串，判定照常进行——人格只是加强项，不是前置条件。
+        读取失败时返回空串，判定照常进行——人格是增强项，不是前置条件。
         """
         now = time.time()
         cached = self._persona_cache.get(chat_id or "")
@@ -285,11 +286,11 @@ class DecisionEngine:
         return text
 
     def _format_memories(self, text: str) -> str:
-        """给决策层看的记忆片段：永久记忆 + 按这段话召回的长期记忆。
+        """提供给决策层的记忆片段：永久记忆 + 按这段话召回的长期记忆。
 
-        永久记忆是她的稳定认知（认定的事、重要的人），判定时先摆出来，
-        模型才知道哪些话题「和她有关」；召回部分只在有相关记忆时追加。
-        取不到就返回占位说明，不影响判定。
+        永久记忆是稳定认知（已确认的事、重要的人），判定时优先列出，
+        模型才能判断哪些话题与自身相关；召回部分仅在存在相关记忆时追加。
+        读取失败时返回占位说明，不影响判定。
         """
         lines: list[str] = []
         seen: set[str] = set()

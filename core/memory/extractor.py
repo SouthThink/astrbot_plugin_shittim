@@ -1,12 +1,12 @@
 """长期记忆的压缩与合并：调用独立配置的轻量模型。
 
 `condense()` 是短期层通向长期层的**唯一**通道：把一段对话压成摘要的同时，
-顺带产出值得长期记住的条目。`compress()` 让旧记忆的正文变模糊，`merge()`
-把陈旧而相似的记忆并成一条。
+一并产出值得长期保留的条目。`compress()` 使旧记忆的正文变模糊，`merge()`
+把陈旧且相似的记忆并成一条。
 
-可靠性约定（这些不是可选项，是防止记忆污染的必要约束）：
+可靠性约束（均为强制项，用于防止记忆污染）：
 - 产出必须带 source_quote 原文锚点，禁止模型推断或改写
-- 明确要求保留否定词，防止「不喜欢」被写成「喜欢」
+- 必须保留否定词，防止「不喜欢」被写成「喜欢」
 - 合并只允许使用已有信息，禁止引入新信息
 - 模型输出一律经过 _normalize_item 校验，越界字段被丢弃或截断
 """
@@ -30,10 +30,10 @@ _MAX_QUOTE_CHARS = 200
 _MAX_KEYWORDS = 12
 _MAX_TAGS = 8
 
-# 提高覆盖的关键一条：不只记「稳定事实」，也记「当天发生的事」。
-# 「第二天问昨天那件事就失忆」的根因就在旧 prompt 把它归进了「一次性闲聊」。
-# 但覆盖提高会让条目变多，所以留了 extract_include_events 开关（配合名次驱动的
-# 降级一起用：广度靠压缩时多记，长度靠名次沉下去后变模糊）。
+# 扩大覆盖范围的关键条款：除「稳定事实」外，也记录「当天发生的事件」。
+# 旧提示词把此类内容归入「一次性闲聊」，导致次日追问昨日事件时无法回忆。
+# 覆盖扩大后条目数量会增加，因此提供 extract_include_events 开关，
+# 并与名次驱动的降级配合：压缩阶段多记录以扩大广度，名次下沉后再压缩正文长度。
 _EVENTS_CLAUSE = """- 今天聊到的事及其结论：谁在做什么、讨论出了什么结果。哪怕只是一次
   临时讨论，只要有了结论就要记下来
 """
@@ -157,7 +157,7 @@ class MemoryExtractor:
 
     @property
     def available(self) -> bool:
-        """未配置压缩模型时不启用压缩，避免静默走主模型烧额度。"""
+        """未配置压缩模型时不启用压缩，避免静默回退到主模型消耗额度。"""
         if not self._config.extract_provider_id:
             return False
         return self._get_provider() is not None
@@ -166,10 +166,10 @@ class MemoryExtractor:
         """把一条记忆压得更短（§9.6 的「精简」级）。
 
         与压缩 / 合并共用同一个模型与同一份配置，不引入第三套模型设置——
-        三套模型各改同一批数据、规则不同，出了问题无法回溯是哪一次改的。
+        多套模型处理同一批数据且规则不同，出问题后无法回溯是哪一次修改导致。
 
-        `source_quote` 不参与压缩：锚点永远指向原文，压缩只是让正文更模糊。
-        压不动（输出为空、或没变短）时返回空串，调用方保留原正文。
+        `source_quote` 不参与压缩：锚点始终指向原文，压缩只降低正文精度。
+        无法压缩（输出为空或未变短）时返回空串，由调用方保留原正文。
         """
         text = (content or "").strip()
         if not text or not self.available:
@@ -185,17 +185,18 @@ class MemoryExtractor:
     async def condense(
         self, records_text: str, *, max_summary_chars: int
     ) -> tuple[str, list[dict]] | None:
-        """把一段对话压成摘要，并**顺带**提炼长期记忆（§4.2）。
+        """把一段对话压成摘要，并**同时**提炼长期记忆（§4.2）。
 
         这是「短期层 → 长期层」唯一的通道：每一次调用同时产出「1 条摘要」与
-        「N 条长期记忆」，两者都是从原文来的**兄弟**，不是「先摘摘要、再从摘要
-        提炼」的父子关系——后者等于压两遍，细节会掉光。
+        「N 条长期记忆」，两者都直接来自原文，互为**兄弟**关系；若改为「先摘
+        摘要、再从摘要提炼」的父子关系，等于压缩两次，细节会大量丢失。
 
-        `max_summary_chars` 由调用方给：中间层的摘要够当背景就行，最后那一压
-        产出的是「当天摘要」，要能承载一整天的轮廓。
+        `max_summary_chars` 由调用方指定：中间层摘要只需作为背景，最后一次
+        压缩产出的是「当天摘要」，需要承载一整天的轮廓。
 
-        返回 None 表示这次压缩不成立（模型没给出可用摘要）。调用方因此**必须**
-        保留原始条目、不标记 `condensed_at`：那一段会永久退出上下文且不报错。
+        返回 None 表示本次压缩不成立（模型未给出可用摘要）。调用方因此**必须**
+        保留原始条目、不标记 `condensed_at`，否则该段内容会永久退出上下文且
+        不产生任何报错。
         """
         text = (records_text or "").strip()
         if not text or not self.available:
@@ -253,7 +254,7 @@ class MemoryExtractor:
                 merged.append(normalized)
             if len(merged) >= 2:
                 break
-        # 合并必须真的减少条目数，否则等于白白引入一次改写风险
+        # 合并必须确实减少条目数，否则只会额外引入一次改写风险
         if len(merged) >= len(memories):
             return []
         return merged
@@ -289,7 +290,7 @@ class MemoryExtractor:
             return None
         quote = _clamp_str(entry.get("source_quote"), _MAX_QUOTE_CHARS)
         if require_quote and not quote:
-            # 没有原文锚点的记忆无法回溯，宁可丢弃
+            # 缺少原文锚点的记忆无法回溯，直接丢弃
             logger.debug("[什亭之枢] 丢弃无原文锚点的提炼结果: %s", content[:40])
             return None
         try:

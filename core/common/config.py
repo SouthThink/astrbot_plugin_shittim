@@ -42,53 +42,52 @@ class MemoryConfig:
 
     # ── 压缩 ──────────────────────────────────────────────
     extract_provider_id: str = ""
-    extract_max_items: int = 12           # 单次压缩最多顺带产出几条长期记忆
+    extract_max_items: int = 12           # 单次压缩同时产出的长期记忆条数上限
     extract_min_strength: float = 1.0     # 低于该强度的压缩结果直接丢弃（仅作质量闸门，不再入库）
-    # 压缩时是否纳入「当天发生的事」，而不只是稳定事实。关掉可让长期记忆更精简，
-    # 代价是「第二天问昨天那件事」会失忆（见计划 §9.4）
+    # 压缩时是否纳入当天事件及其结论，而非仅保留稳定事实。关闭后长期记忆更精简，
+    # 代价是无法回忆前一天的对话（见计划 §9.4）
     extract_include_events: bool = True
-    # 遗忘阶梯（§10.1）：名次沉到榜尾后，还要满足「降级次数」与「连续多久没被召回」
-    forget_min_curations: int = 6         # 至少经历过这么多轮降级
-    forget_stale_days: int = 7            # 连续这么多天未被召回
+    # 遗忘条件（§10.1）：名次进入榜尾后，还需同时满足降级次数与未召回时长
+    forget_min_curations: int = 6         # 所需最少降级轮次
+    forget_stale_days: int = 7            # 连续未召回天数
 
     # ── 短期层 ────────────────────────────────────────────
-    # 跨会话语境：按会话配额取，而不是全局取最近 N 条——
-    # 否则一个话痨群能把其它所有会话挤出她的经历之外。
-    # 只给决断层与巡检看（它们的提示词装不下整条时间线）
-    short_term_context_per_chat: int = 6  # 每个会话取最近几条
-    short_term_context_chats: int = 6     # 最多纳入几个会话
-    short_term_context_tokens: int = 2000 # 这块的 token 预算
-    # 短期压缩（§4.2）：条目总数超过阈值时，把最旧的一批压成一条摘要。
-    # 每次整理**只压一轮**，爆发日不会一口气压到底。
-    condense_threshold: int = 300         # 条目总数超过它才压缩
-    condense_batch: int = 100             # 每次压缩取最旧多少条
+    # 跨会话语境：按会话配额读取，而非全局取最近 N 条，避免高频会话
+    # 挤占其它会话的展示配额。仅供决断层与巡检使用（提示词无法容纳完整时间线）
+    short_term_context_per_chat: int = 6  # 每个会话的消息条数
+    short_term_context_chats: int = 6     # 最多纳入的会话数
+    short_term_context_tokens: int = 2000 # 该部分的 token 预算
+    # 短期压缩（§4.2）：条目总数超过阈值时，将最旧的一批压缩为一条摘要。
+    # 单次整理仅执行一轮压缩，避免消息高峰期一次性压缩全部条目。
+    condense_threshold: int = 300         # 触发压缩的条目总数阈值
+    condense_batch: int = 100             # 单次压缩的条目数
     # ── 全局时间线（主脑唯一的上下文）────────────────────
-    # 所有会话按时间排成同一条脉络，切会话不换上下文。见 memory/timeline.py。
-    # 它是「今天」的全部，所以预算要按模型窗口给足：超了从**最旧的**开始丢，
-    # 她可以忘记很早以前说的，但不能忘记刚刚发生的。
-    timeline_max_messages: int = 400      # 单次最多取多少条条目（SQL 层硬上限）
+    # 所有会话按时间排列为同一条时间线，切换会话不切换上下文。见 memory/timeline.py。
+    # 时间线覆盖当天全部消息，预算应结合模型窗口设置；超出后从最旧条目开始丢弃，
+    # 优先保留最近发生的对话。
+    timeline_max_messages: int = 400      # 单次返回的条目数上限（SQL 层硬上限）
     timeline_token_budget: int = 8000     # 整条时间线的 token 上限
-    # 请求发出前摘掉读不到的图片引用：一张坏图会让整条请求被上游 400 拒绝，
-    # 而 AstrBot 会因此把这轮切给备用模型（人格与工具全变）
+    # 请求发出前移除无法读取的图片引用：单张坏图会导致上游以 400 拒绝整条请求，
+    # AstrBot 随后会将本轮切换到备用模型（人格与工具均会变化）
     strip_invalid_images: bool = True
 
     # ── 图片转文字 ────────────────────────────────────────
-    # AstrBot 只把图片转成「[图片]」占位，账本里得自己补一句描述，
-    # 否则她「看不到」群里发的图，记忆页面也只显示一个占位。
+    # AstrBot 仅提供「[图片]」占位，账本需要补充图片描述，
+    # 否则判定与记忆页面只能看到占位符。
     vision_enabled: bool = True
-    vision_provider_id: str = ""          # 留空则用 AstrBot 设置的「图片转述模型」
-    vision_prompt: str = ""               # 留空则用内置的中文提示词
-    vision_max_images: int = 2            # 单条消息最多转述几张图
+    vision_provider_id: str = ""          # 留空则使用 AstrBot 配置的图片转述模型
+    vision_prompt: str = ""               # 留空则使用内置中文提示词
+    vision_max_images: int = 2            # 单条消息最多转述的图片数
 
     # ── 记忆块（自动插入）────────────────────────────────
-    # 榜前 N 条给正文；其后 M 条只给一行关键词索引（元记忆：让她知道自己
-    # 还忘了些什么，才会去 recall）。再往后不进上下文。
-    auto_top: int = 10                    # 榜前多少条给完整正文
-    auto_index: int = 30                  # 之后多少条只给关键词索引
-    # 自动插入的 token 预算：永久记忆 + 榜前正文 + 索引三段共用
+    # 榜前 N 条提供完整正文；其后 M 条仅提供关键词索引（用于提示仍存在
+    # 未展开的记忆）。更靠后的条目不进入上下文。
+    auto_top: int = 10                    # 提供完整正文的榜前条数
+    auto_index: int = 30                  # 仅提供关键词索引的后续条数
+    # 自动插入的 token 预算：永久记忆、榜前正文与关键词索引共用
     recall_token_budget: int = 1600
-    # 工具召回（「我想想」）的参数：按关键词相关性取，与榜序无关
-    recall_top_k: int = 5                 # 消息相关记忆条数
+    # 工具召回参数：按关键词相关性排序，与榜序无关
+    recall_top_k: int = 5                 # 话题相关记忆条数
     recall_user_top_k: int = 3            # 用户相关记忆条数
     recall_min_score: float = 0.18        # 低于该分数的记忆不返回
 
@@ -156,37 +155,36 @@ class MemoryConfig:
 class DecisionConfig:
     """决断层配置：控制「官方 LLM 什么时候被触发」。
 
-    这是接管对话的总闸。enabled=False 时插件完全不拦，退回 AstrBot 原生行为。
+    这是接管对话的总开关。enabled=False 时插件不拦截任何消息，交由 AstrBot 原生流程处理。
     """
 
     enabled: bool = True
-    # 决策模型；留空则复用记忆压缩模型；都留空则走规则兜底
+    # 决策模型；留空时复用记忆压缩模型；两者均未配置时仅启用规则层判定
     provider_id: str = ""
-    # 私聊直接放行（不花决策模型的 token）
+    # 私聊直接放行（不调用决策模型）
     always_reply_private: bool = True
-    # 私聊防抖：发出后静默这么久没有下一条消息才唤醒主脑（秒），0 表示立即回。
-    # 防的是「对方还在一条条打字，她就已经插嘴了」——连续几条应是同一轮，
-    # 攒齐再一起看，回一句就够了。
+    # 私聊防抖：最后一条消息之后静默该时长才唤醒主脑（秒），0 表示立即回复。
+    # 用于避免用户连续发送多条消息时被中途打断：连续多条视为同一轮，聚合后再回复。
     private_debounce_seconds: float = 10.0
-    # 被 @ / 叫到名字直接放行
+    # 被 @ 或命中名称时直接放行
     always_reply_when_mentioned: bool = True
-    # 上游指令（/命令、skill）必须让路，否则指令会失效
+    # 上游指令（/命令、skill）优先放行，否则指令将无法执行
     allow_upstream_commands: bool = True
-    # 她的名字 / 唤醒词，命中即视为被叫到
+    # 智能体名称 / 唤醒词，文本命中时视为被点名
     aliases: tuple[str, ...] = ()
-    # 决策时给她看的近期消息条数（每个会话各取这么多）
+    # 判定上下文中每个会话的近期消息条数上限
     context_messages: int = 6
     # ── 群聊巡检 ──────────────────────────────────────────
-    # 不逐条判定，而是把一小段时间的消息攒起来判一次：既是省 token，
-    # 更是因为单条判定会让模型看不到「这轮对话已经闭环了」。
+    # 不逐条判定，而是聚合一段时间内的消息后统一判定：既降低 token 消耗，
+    # 也避免单条判定缺少对话上下文。
     patrol_enabled: bool = True
-    patrol_window_seconds: float = 5.0     # 群里安静这么久就判一次
-    patrol_max_wait_seconds: float = 20.0  # 一直有人说话时的封顶，否则永远不判
-    patrol_cooldown_seconds: float = 60.0  # 判「不回」后，该会话多久不再开窗
-    patrol_noise_filter: bool = True       # 整段只有图片/复读/连刷时不花模型调用
+    patrol_window_seconds: float = 5.0     # 会话静默达到该时长后判定一次
+    patrol_max_wait_seconds: float = 20.0  # 持续发言时的最长等待时间，超过后立即判定
+    patrol_cooldown_seconds: float = 60.0  # 判定为不回复后的会话冷却时长
+    patrol_noise_filter: bool = True       # 整段仅含图片/重复内容/连续短句时跳过模型调用
     # 移除 AstrBot 内置的 send_message_to_user。
-    # 该工具在参数写错时会静默把消息发到当前会话（实测已造成一次错发），
-    # 而且绕过会话解析与焦点校验。既然由我们的 say 接管跨会话发言，就该关掉它。
+    # 该工具参数错误时会静默发送到当前会话（实测已造成误发），且绕过会话解析
+    # 与焦点校验。跨会话发言统一由 say 处理，因此默认移除该工具。
     disable_builtin_send_tool: bool = True
 
     @classmethod
@@ -237,13 +235,13 @@ class DecisionConfig:
 
 @dataclass(frozen=True)
 class FocusConfig:
-    """会话焦点配置：约束她的主动发言范围。
+    """会话焦点配置：约束主动发言范围。
 
-    焦点只约束「主动发言」。任何会话来了消息都会唤醒她并进入决断层判断，
-    所以把 timeout_minutes 调小只会让她更难主动开口，不会让她收不到消息。
+    焦点只约束「主动发言」。任何会话收到消息都会触发唤醒并进入决断层判断，
+    因此调小 timeout_minutes 只会降低主动发言频率，不会影响消息接收。
     """
 
-    # 会话安静多久后收回她的主动发言资格
+    # 会话静默多久后收回主动发言资格
     timeout_minutes: float = 30.0
     # 主动发言前是否必须持有焦点
     require_focus_for_say: bool = True
@@ -263,21 +261,20 @@ class FocusConfig:
 class ScheduleConfig:
     """全局作息状态机配置。
 
-    只提供「时刻」与「阈值」，状态本身由时间轴推导（见 core/schedule/state.py）——
-    这样重启后不需要恢复任何中间态，算一次就知道她在哪一档。
-    enabled=False 时睡眠门完全不介入，退回 7×24 在线。
+    仅提供「时刻」与「阈值」，状态本身由时间轴推导（见 core/schedule/state.py），
+    因此重启后无需恢复中间状态。enabled=False 时睡眠门不介入。
     """
 
     enabled: bool = True
-    # 基础作息：入睡 / 起床 / 起床上限，形如 "23:30"
+    # 基础作息：入睡 / 起床 / 起床上限，格式 "HH:MM"
     sleep_at: str = "23:30"
     wake_at: str = "07:00"
     wake_latest: str = "12:00"
-    # 起床前多久转为浅睡（这段时间可被叫醒）
+    # 起床前多久切换为浅睡（该时段允许叫醒）
     wake_notice_lead_minutes: int = 120
-    # 浅睡满多久转入深睡
+    # 浅睡持续多久后转入深睡
     light_until_deep_minutes: int = 120
-    # 叫醒信号：同一会话、窗口内累计多少次 @/私聊即叫醒
+    # 叫醒信号：同一会话在时间窗口内累计的 @/私聊次数达到阈值即叫醒
     wake_signal_window_minutes: int = 5
     wake_signal_threshold: int = 3
     # 被叫醒后的清醒宽限时长
@@ -285,16 +282,16 @@ class ScheduleConfig:
 
     # ── 深睡期记忆整理（§9）────────────────────────────────
     curation_enabled: bool = True
-    # 主触发不看时间，只看「本轮深睡窗口里整理过没有」——每晚进 DEEP 就整理一次。
-    # 这个值是**兜底**：距上次整理超过这么久仍未整理（深睡窗口整段没出现，
-    # 比如连续熬夜晚睡），就强制跑一次维护，但**不收口、不清空账本**。
+    # 主触发条件与本轮深睡窗口绑定，每次进入 DEEP 后整理一次。
+    # 该参数为兜底策略：距上次整理超过该时长仍未整理（例如深睡窗口未出现），
+    # 则强制执行一次维护，但不收口、不清理账本。
     curation_force_after_hours: int = 48
-    # 单次整理内「短期收口」的安全轮数上限（树状压缩，100:1 收缩）；
-    # 触顶仍剩多条摘要则跳过清空短期层——宁可留着也不能丢
+    # 单次整理中短期收口的安全轮数上限（树状压缩，100:1 收缩）；
+    # 达到上限仍存在多条摘要时跳过清空，保留数据
     collapse_max_rounds: int = 20
-    # 单轮降级最多重写多少条正文（控模型成本）
+    # 单轮降级最多重写的正文条数（控制模型成本）
     curate_max_per_run: int = 20
-    # 整理后把清醒期账本移入归档（从常规查询排除，数据保留）
+    # 整理后将清醒期账本移入归档（从常规查询排除，数据保留）
     daily_reset_enabled: bool = True
     # 归档消息保留天数，到期物理删除
     archive_retention_days: int = 90

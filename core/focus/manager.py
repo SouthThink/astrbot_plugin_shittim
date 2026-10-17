@@ -1,24 +1,24 @@
-"""会话焦点：她当前在关注哪些会话。
+"""会话焦点：当前处于关注状态的会话。
 
 ## 焦点的作用范围
 
 **只约束主动发言**，不约束被动接话。
 
-- 被动接话：任何会话来了消息都会唤醒她，交给决断层判断该不该回。不受焦点限制。
-- 主动发言：她只能往自己有焦点的会话主动说话（`say`）。
+- 被动接话：任何会话收到消息都会触发唤醒，交由决断层判断是否回复，不受焦点限制。
+- 主动发言：只能向拥有焦点的会话主动发言（`say`）。
 
-这样设计是为了让她「像人一样」：别人跟你说话你随时能答，但你不会跑到
-一个早就没人说话的房间对着空气自言自语。
+该设计的目的是让主动行为符合人类习惯：有人对自己说话时随时可以回应，
+但不会前往一个早已无人发言的会话自说自话。
 
 ## 生命周期
 
-- 收到某会话的新消息        → 该会话获得 / 刷新焦点
-- 她主动去某会话说话（say） → 该会话获得 / 刷新焦点
-- 某会话安静超过 timeout    → 焦点失效，她「休息」了
-- 她主动 leave / rest       → 立即失效
+- 收到某会话的新消息         → 该会话获得 / 刷新焦点
+- 主动向某会话发言（say）    → 该会话获得 / 刷新焦点
+- 某会话安静超过 timeout     → 焦点失效
+- 主动 leave / rest          → 立即失效
 
-注意：焦点失效不是「离场」——下一条消息仍会把她唤醒、仍会进决断层判断。
-它只是收回了她「主动开口」的资格。
+注意：焦点失效不等于「离场」——下一条消息仍会触发唤醒，仍会进入决断层判断，
+它只收回「主动开口」的资格。
 """
 
 from __future__ import annotations
@@ -45,7 +45,7 @@ class FocusManager:
     # ── 写入 ──────────────────────────────────────────────
 
     def touch(self, chat_id: str, chat_label: str | None = None) -> None:
-        """让某会话获得或刷新焦点（新消息到达、被叫、她主动去）。"""
+        """使某会话获得或刷新焦点（新消息到达、被叫、主动前往）。"""
         if not chat_id:
             return
         now = time.time()
@@ -73,7 +73,7 @@ class FocusManager:
         )
 
     def leave(self, chat_id: str) -> bool:
-        """她主动离开某会话：收回该会话的主动发言资格。"""
+        """主动离开某会话：收回该会话的主动发言资格。"""
         if not self.get_record(chat_id):
             return False
         self._db.execute(
@@ -82,7 +82,7 @@ class FocusManager:
         return True
 
     def rest(self) -> int:
-        """她主动去休息：一次性收回所有会话的主动发言资格。"""
+        """主动进入休息：一次性收回所有会话的主动发言资格。"""
         cursor = self._db.execute(
             "UPDATE session_focus SET left = 1 WHERE left = 0"
         )
@@ -106,7 +106,7 @@ class FocusManager:
         )
 
     def is_focused(self, chat_id: str) -> bool:
-        """该会话是否仍在她的关注中（未主动离开，且未超时）。"""
+        """该会话是否仍在关注中（未主动离开，且未超时）。"""
         row = self.get_record(chat_id)
         if row is None or int(row["left"] or 0) == 1:
             return False

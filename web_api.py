@@ -4,10 +4,10 @@
 把每个含 `index.html` 的子目录认成一个页面（标题默认取目录名，可用
 `.astrbot-plugin/i18n/<locale>.json` 覆盖）。
 
-前端拿到的是宿主注入的 `window.AstrBotPluginPage` 桥，它传**相对**路径
+前端通过宿主注入的 `window.AstrBotPluginPage` 桥调用接口，该桥传递**相对**路径
 （如 `overview`），宿主自动补成 `/api/plug/astrbot_plugin_shittim/overview`。
 
-这里只有读，没有任何写：记忆是她的，页面只负责让主人看得见。
+本模块只提供读取，不包含任何写入操作：记忆数据归插件所有，页面仅负责展示。
 """
 
 from __future__ import annotations
@@ -31,7 +31,7 @@ except ImportError:  # pragma: no cover - 旧版回退 quart
 
     _HAS_WEB_API = False
 
-# 分页上限：页面一次最多看这么多条，避免把整库拉进浏览器
+# 分页上限：单个请求最多返回的条数，避免一次性加载整库数据
 _MAX_LIMIT = 200
 _DEFAULT_LIMIT = 50
 
@@ -104,7 +104,7 @@ def _short_term_item(row) -> dict:
         "sender_name": str(row["sender_name"] or ""),
         "role": str(row["role"] or "user"),
         "content": str(row["content"] or ""),
-        # 图片转述出来的文字：页面据此把「[图片]」补成看得见的内容
+        # 图片转述文本：页面据此把「[图片]」替换为可读内容
         "image_caption": caption,
         "created_at": float(row["created_at"] or 0.0),
         "gated": bool(row["gated"]),
@@ -142,7 +142,7 @@ def _memory_item(memory) -> dict:
         "keywords": memory.keywords,
         "chat_label": memory.chat_label or "",
         "user_name": memory.user_name or "",
-        # 位置榜：名次即她的记忆排序，等级由名次推导
+        # 位置榜：名次即记忆排序依据，等级由名次推导
         "rank": memory.rank,
         "rank_total": memory.rank_total,
         "level": memory.level,
@@ -163,7 +163,7 @@ class MemoryPageAPI:
         self._plugin = plugin
 
     async def overview(self) -> Any:
-        """总览：各层条数、会话数、她在关注的会话数、当前作息。"""
+        """总览：各层条数、会话数、关注中的会话数、当前作息。"""
         short_term = self._plugin.short_term
         tiers = self._plugin.memory_store.count_by_tier()
         chats = short_term.list_known_chats(500)
@@ -174,7 +174,7 @@ class MemoryPageAPI:
         try:
             sleep = self._plugin.sleep_snapshot()
         except Exception:
-            # 只是展示用：读不到作息不该让整个总览失败
+            # 仅用于展示：作息数据不可用时不应导致整个总览接口失败
             sleep = None
         return _ok(
             {
@@ -189,7 +189,7 @@ class MemoryPageAPI:
         )
 
     async def chats(self) -> Any:
-        """会话列表：她的短期账本里出现过哪些会话。"""
+        """会话列表：短期账本中出现过的会话。"""
         rows = self._plugin.short_term.list_known_chats(500)
         return _ok(
             [
@@ -205,7 +205,7 @@ class MemoryPageAPI:
         )
 
     async def short_term(self) -> Any:
-        """短期账本分页；带 chat_id 就只看那个会话。"""
+        """短期账本分页；传入 chat_id 时仅返回该会话。"""
         chat_id = (_query_raw("chat_id") or "").strip() or None
         limit, offset = _paging(
             _query_int("limit", _DEFAULT_LIMIT), _query_int("offset", 0)
@@ -221,17 +221,17 @@ class MemoryPageAPI:
         )
 
     async def summaries(self) -> Any:
-        """短期层里「压过的那些段落」：它们与时间线里的摘要块同源。
+        """短期层中已压缩的段落：与时间线中的摘要块同源。
 
-        摘要不进消息分页（它没有 sender / 时间线以外的属性），单独给一个
-        视图，页面就能把「原始消息 + 摘要」拼回她真正读到的那条脉络。
+        摘要不进入消息分页（缺少 sender 等消息属性），因此单独提供一个视图，
+        页面可将「原始消息 + 摘要」还原为上下文实际读取的顺序。
         """
         limit, _ = _paging(_query_int("limit", _DEFAULT_LIMIT), 0)
         rows = self._plugin.short_term.list_summaries(limit)
         return _ok({"items": [_summary_item(row) for row in rows]})
 
     async def memories(self) -> Any:
-        """长期 / 永久记忆分页，按位置榜倒序（她记得最牢的排最前）。"""
+        """长期 / 永久记忆分页，按位置榜倒序（近期被想起的排在前面）。"""
         tier = (_query_raw("tier") or "long").strip()
         if tier not in _VALID_TIERS:
             return _err("tier 只能是 long 或 permanent")

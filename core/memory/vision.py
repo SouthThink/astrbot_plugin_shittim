@@ -1,27 +1,27 @@
-"""图片转文字：让她真的「看得见」群里发的图。
+"""图片转述：把消息中的图片转换为文本描述并写回账本。
 
-## 为什么自己做
+## 独立实现的原因
 
-AstrBot 自带的图片转述只发生在**主脑的请求链路**上：它把图交给视觉模型，
-描述只存在于那一次请求里。而记账、决断、跨会话语境块、记忆页面用的都是
-**我们这份账本**——账本里图片永远是 `[图片]` 这个占位。于是：
+AstrBot 内置的图片转述只作用于**主脑请求链路**：描述仅存在于该次请求内。
+而记账、决断、跨会话语境块与记忆页面读取的都是**本插件的账本**，
+账本中图片始终为 `[图片]` 占位符，因此：
 
-- 判定时她看到的是「[图片]」，无从判断该不该接话
-- 记忆页面上也只能看到一个占位，主人看不到图里是什么
+- 决断层只能看到占位符，无法据此判断是否参与对话
+- 记忆页面同样只显示占位符，无法呈现图片内容
 
-所以在消息到达时自己转述一次，把描述写回账本，后面所有环节都自动受益。
+因此在消息到达时单独转述一次并写回账本，后续所有环节均可直接使用。
 
-## 用哪个模型
+## 模型选择
 
-默认复用 AstrBot 全局设置里的「图片转述模型」
-（`provider_settings.default_image_caption_provider_id`），
-也就是 WebUI 里配好的那个；插件配置里填了 provider 则以插件为准。
+默认复用 AstrBot 全局设置中的图片转述模型
+（`provider_settings.default_image_caption_provider_id`）；
+插件配置中指定了 provider 时以插件配置为准。
 
-## 拿不到图怎么办
+## 图片引用失效处理
 
-上游的图片链接会过期、本地临时文件会被清理。这里只在**消息到达的那一刻**
-处理：当场把本地文件读成 data URL 交给模型，读完即走，不长期保存图片。
-读不到就如实放弃，账本里继续留占位——宁可没有描述，也不要编一段出来。
+上游链接可能过期，本地临时文件可能被清理，因此仅在**消息到达时**处理：
+当场把本地文件读取为 data URL 交给模型，不长期保存图片。
+读取失败时保留占位符，不生成推测性描述。
 """
 
 from __future__ import annotations
@@ -39,9 +39,9 @@ except ImportError:  # pragma: no cover
 
     logger = logging.getLogger(__name__)
 
-# 读图上限：单张图超过这个大小就不转述了，避免把大图塞进请求
+# 单张图片大小上限：超出则不转述，避免大图占用请求体积
 _MAX_IMAGE_BYTES = 10 * 1024 * 1024
-# 描述长度上限：一句话足矣，长了会污染上下文
+# 描述文本长度上限：过长会占用上下文预算
 _MAX_CAPTION_CHARS = 200
 
 _DEFAULT_PROMPT = (
@@ -52,7 +52,7 @@ _DEFAULT_PROMPT = (
 
 
 def _sniff_mime(raw: bytes) -> str:
-    """按文件魔数猜图片类型，猜不出按 jpeg 处理。"""
+    """按文件魔数推断图片类型，无法识别时按 jpeg 处理。"""
     if raw.startswith(b"\xff\xd8\xff"):
         return "image/jpeg"
     if raw.startswith(b"\x89PNG\r\n\x1a\n"):
@@ -99,12 +99,12 @@ def _read_local(path: str) -> bytes:
 
 
 def to_model_ref(ref: str) -> str:
-    """把一条图片引用整理成模型能直接吃的形式。
+    """把一条图片引用转换为模型可直接使用的形式。
 
-    - 本地文件 → data URL（上游只认 base64 与 http(s)，本地路径会被原样透传）
+    - 本地文件 → data URL（上游仅接受 base64 与 http(s)，本地路径会被原样透传）
     - `base64://` → data URL
-    - http(s) 与 data URL → 原样
-    拿不到内容时返回空串，调用方据此跳过。
+    - http(s) 与 data URL → 原样返回
+    内容不可用时返回空串，由调用方跳过。
     """
     ref = (ref or "").strip()
     if not ref:
@@ -128,7 +128,7 @@ def to_model_ref(ref: str) -> str:
 
 
 class ImageCaptioner:
-    """把消息里的图片转成一句话，写回账本。"""
+    """把消息中的图片转成一句描述，写回账本。"""
 
     def __init__(self, db, config, astr_context) -> None:
         self._db = db
@@ -142,10 +142,10 @@ class ImageCaptioner:
 
     @staticmethod
     def collect_refs(event, limit: int) -> list[str]:
-        """从事件的消息链里取图片引用，最多取 limit 条。
+        """从事件的消息链中提取图片引用，最多 limit 条。
 
-        优先 `path`（AstrBot 归一化后的本地路径），再退到 `file` / `url`。
-        用类名而不是 isinstance 判断，免得绑死某个 AstrBot 版本的导入路径。
+        优先 `path`（AstrBot 归一化后的本地路径），其次 `file` / `url`。
+        按类名而非 isinstance 判断，避免绑定特定 AstrBot 版本的导入路径。
         """
         try:
             components = event.get_messages() or []
@@ -167,17 +167,17 @@ class ImageCaptioner:
     # ── 转述 ──────────────────────────────────────────────
 
     async def describe(self, refs: list[str]) -> str:
-        """给一批图片生成一句描述（取第一张成功的）。失败返回空串。"""
+        """为一批图片生成一句描述（取第一张成功的）。失败返回空串。"""
         provider = self._resolve_provider()
         if provider is None:
             logger.warning(
                 "[什亭之枢] 没有可用的图片转述模型（插件配置与 AstrBot 的"
-                "「图片转述模型」都为空），图片只会留下「[图片]」占位"
+                "「图片转述模型」均为空），图片只能保留「[图片]」占位"
             )
             return ""
         if not self._supports_image(provider):
             logger.warning(
-                "[什亭之枢] 图片转述模型不支持图片输入，已跳过（请换一个视觉模型）"
+                "[什亭之枢] 图片转述模型不支持图片输入，已跳过（请改用视觉模型）"
             )
             return ""
 
@@ -220,7 +220,7 @@ class ImageCaptioner:
             return None
 
     def _global_config(self):
-        """AstrBot 全局配置；拿不到就返回空 dict。"""
+        """AstrBot 全局配置；不可用时返回空 dict。"""
         try:
             config = self._astr_context.get_config()
         except Exception:
@@ -228,7 +228,7 @@ class ImageCaptioner:
         return config if isinstance(config, dict) else {}
 
     def _global_caption_provider_id(self) -> str:
-        """WebUI 里「图片转述模型」的配置值。"""
+        """WebUI 中「图片转述模型」的配置值。"""
         config = self._global_config()
         settings = config.get("provider_settings")
         if not isinstance(settings, dict):
@@ -246,8 +246,8 @@ class ImageCaptioner:
     def _supports_image(provider) -> bool:
         """模型是否声明支持图片。
 
-        未声明时按支持处理：有些适配器不填 modalities，一刀切拦掉会让功能
-        直接失效；真发不过去，调用处还有异常兜底。
+        未声明时按支持处理：部分适配器不填 modalities，一律拦截会导致功能
+        直接失效；实际调用失败时由调用处的异常处理兜底。
         """
         try:
             modalities = provider.provider_config.get("modalities")
