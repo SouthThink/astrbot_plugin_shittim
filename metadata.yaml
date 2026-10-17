@@ -16,7 +16,7 @@ desc: |
   - 三层记忆与位置榜：榜前按「最近被想起」排序，尾部逐级变模糊直至遗忘
   - 短期记忆自动压缩：条目超阈值压成摘要，深睡期收口成当天摘要并清空账本
   - 深睡期记忆整理：压缩 / 树状收口 / 名次降级 / 阶梯遗忘 / 清空账本
-version: v1.4.2 # 插件版本号
+version: v1.5.0 # 插件版本号
 author: SouthThink # 作者
 repo: https://github.com/SouthThink/astrbot_plugin_shittim # 插件的仓库地址
 astrbot_version: ">=4.17.0"

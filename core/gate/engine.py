@@ -21,6 +21,7 @@ except ImportError:  # pragma: no cover
 
     logger = logging.getLogger(__name__)
 
+import time
 from dataclasses import dataclass
 
 from ..common.event_utils import (
@@ -29,6 +30,7 @@ from ..common.event_utils import (
     is_upstream_command_event,
 )
 from ..common.model_json import parse_model_json
+from ..memory.store import TIER_PERMANENT
 
 SOURCE_RULE = "rule"
 SOURCE_MODEL = "model"
@@ -37,7 +39,17 @@ SOURCE_FALLBACK = "fallback"
 # 决策模型输出里 should_reply 的各种真值写法
 _TRUE_WORDS = {"true", "1", "yes", "y", "是", "真", "需要", "回复"}
 
-_WINDOW_PROMPT = """你是「{alias}」的思考层。下面是你刚在「{chat_label}」听到的一小段对话。
+# 人格提示词最多取这么多字：判定要的是「她是什么样的人」，不是完整人设文档。
+# 1200 字足够覆盖常用的精简人设（实测「爱丽丝简化版」812 字），
+# 再往上每次判定都要多付几千 token，而判定本身只需要性格与语气。
+_PERSONA_MAX_CHARS = 1200
+# 人格几乎不变，取一次缓存一段时间即可，避免每条窗口都去翻配置
+_PERSONA_CACHE_SECONDS = 300.0
+
+_WINDOW_PROMPT = """你是「{alias}」，正在「{chat_label}」。
+
+【你是什么样的人】
+{persona}
 
 【你最近看到的事】
 {recent}
@@ -52,20 +64,23 @@ _WINDOW_PROMPT = """你是「{alias}」的思考层。下面是你刚在「{chat
 {content}
 
 【判断标准】
-需要你开口：
-- 有人直接叫你、在问你、或在等你回应
-- 话题与你的记忆、身份或职责有关
-- 你有能补充的信息
+你是一个有自己性格、记忆和情绪的人，正在这个群里生活。你要判断的不是
+「有没有人叫我」，而是「这段话里有没有我想接的东西」。
 
-不需要开口：
-- 别人之间的对话，你插进去很突兀
-- 与你无关的闲聊、复读、表情、刷屏
-- 这轮问答已经闭环，或他们明显没在等谁
-- 你没有什么可说的
+想开口，通常是因为：
+- 有人直接叫你、问你，或在等你回应
+- 话题碰到你的记忆、经历、喜好、身份，你有话可说
+- 有人抛出观点或情绪，你有自己的看法、感受，或者想追问
+- 气氛正适合你插一句：吐槽、附和、玩笑、补充都算
 
-宁可不开口，也不要硬凑话，沉默是完全允许的。
-如果这段话里没有人在等你，就不要回。
-如果你刚刚已经回应过同一话题，不要重复回应。
+可以不开口：
+- 纯粹的刷屏、复读、表情、链接搬运，没有任何可接的内容
+- 这明显是两个人之间的私事，你插进去会打断
+- 同一个话题你刚说过，再说就是重复
+
+参与群聊是被允许的，不必等到被点名。正常的对话里，多数时候你都能找到
+自然的接话点；但如果确实没有，沉默也没问题。不要为了说话而说话，
+也不要因为怕打扰而一直旁观。
 
 【输出】
 只输出 JSON，不要解释，不要代码块围栏：
@@ -106,6 +121,8 @@ class DecisionEngine:
         self._memory_config = memory_config
         self._short_term = short_term
         self._memory_store = memory_store
+        # 人格文本缓存：chat_id -> (取到的时刻, 文本)
+        self._persona_cache: dict[str, tuple[float, str]] = {}
 
     def update_config(self, decision_config, memory_config) -> None:
         self._config = decision_config
@@ -177,9 +194,11 @@ class DecisionEngine:
             return Decision(False, "没有可判断的内容", SOURCE_FALLBACK)
 
         history = "\n".join(line for line in (before or []) if line).strip()
+        persona = await self._persona_block(chat_id)
 
         prompt = _WINDOW_PROMPT.format(
             alias=self._alias_label(),
+            persona=persona or "（没有额外的人格设定）",
             recent=self._short_term.build_recent_block(
                 per_chat=self._config.context_messages,
                 max_chats=3,
@@ -235,14 +254,64 @@ class DecisionEngine:
     def _alias_label(self) -> str:
         return self._config.aliases[0] if self._config.aliases else "你"
 
+    async def _persona_block(self, chat_id: str) -> str:
+        """取当前生效的人格提示词，供判定层判断「她会怎么接话」。
+
+        判定层原本只看窗口与记忆，模型只能按「有没有人叫我」来判断，
+        于是把沉默当成安全答案。人格是「她想不想说」的一半依据：
+        活泼、爱接话的人格和冷淡、克制的人格，对同一段对话的答案本就不同。
+
+        取不到就返回空串，判定照常进行——人格只是加强项，不是前置条件。
+        """
+        now = time.time()
+        cached = self._persona_cache.get(chat_id or "")
+        if cached is not None and now - cached[0] < _PERSONA_CACHE_SECONDS:
+            return cached[1]
+
+        manager = getattr(self._astr_context, "persona_manager", None)
+        if manager is None:
+            return ""
+        try:
+            persona = await manager.get_default_persona_v3(chat_id)
+        except Exception as error:
+            logger.debug("[什亭之枢] 读取人格失败: %s", error)
+            return ""
+        if isinstance(persona, dict):
+            prompt = persona.get("prompt") or ""
+        else:
+            prompt = getattr(persona, "prompt", "") or ""
+        text = str(prompt).strip()[:_PERSONA_MAX_CHARS]
+        self._persona_cache[chat_id or ""] = (now, text)
+        return text
+
     def _format_memories(self, text: str) -> str:
-        """给决策层看的记忆片段。取不到就返回占位说明，不影响判定。"""
+        """给决策层看的记忆片段：永久记忆 + 按这段话召回的长期记忆。
+
+        永久记忆是她的稳定认知（认定的事、重要的人），判定时先摆出来，
+        模型才知道哪些话题「和她有关」；召回部分只在有相关记忆时追加。
+        取不到就返回占位说明，不影响判定。
+        """
+        lines: list[str] = []
+        seen: set[str] = set()
+
+        def push(content: str) -> None:
+            value = str(content or "").strip()
+            if value and value not in seen:
+                seen.add(value)
+                lines.append(f"- {value}")
+
+        try:
+            for item in self._memory_store.list_by_tier(TIER_PERMANENT, limit=4):
+                push(getattr(item, "content", ""))
+        except Exception:
+            pass
         try:
             recalled = self._memory_store.recall(
                 query_text=text, top_k=3, user_top_k=0
             )
         except Exception:
-            return "（记忆检索失败）"
-        if not recalled:
-            return "（暂无相关记忆）"
-        return "\n".join(f"- {item.memory.content}" for item in recalled)
+            recalled = []
+        for item in recalled:
+            push(getattr(getattr(item, "memory", None), "content", ""))
+
+        return "\n".join(lines) or "（暂无相关记忆）"
