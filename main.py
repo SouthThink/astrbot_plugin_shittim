@@ -149,6 +149,32 @@ _CONDENSE_CHECK_SECONDS = 30.0
 # 真正耗时的整理由 P3 的深睡调度单独触发。
 _SLEEP_TICK_SECONDS = 60.0
 
+# 阶段的中文说法：日志、工具返回、记忆页面共用同一套，避免三处各写一份
+_PHASE_LABELS = {AWAKE: "清醒", SLEEP_LIGHT: "浅睡", DEEP: "深睡"}
+
+
+def _persona_dialogs(contexts) -> list[dict]:
+    """取出 AstrBot 插在上下文最前的人格**预设对话**。
+
+    AstrBot 在 `_ensure_persona_and_skills()` 里把人格的 `begin_dialogs` 用
+    `req.contexts[:0] = ...` 插到最前，且每条都带 `_no_save`；随后才轮到
+    本插件的 `on_llm_request`。我们整体替换上下文时必须把它们原样保留，
+    否则人格的「说话示例」会被静默抹掉。
+
+    **人格说明本身不在 contexts 里**——它在 `req.system_prompt`（
+    `# Persona Instructions`），本插件从不改写那一栏。
+
+    只取**头部连续**的 `_no_save` 段：AstrBot 插入的是连续的一段，而插件在
+    别处追加的系统条目（如文件解析结果）不带这个标记，不会被误认。
+    """
+    kept: list[dict] = []
+    for item in contexts or []:
+        if isinstance(item, dict) and item.get("_no_save"):
+            kept.append(item)
+            continue
+        break
+    return kept
+
 
 def _plugin_version() -> str:
     """从 metadata.yaml 读版本号，避免与 @register 双处维护。"""
@@ -314,6 +340,33 @@ class ShittimPlugin(Star):
         self._sleep_window = plan_window(
             time.time(), self.schedule_config, postponed
         )
+
+    def sleep_snapshot(self) -> dict | None:
+        """当前作息快照（供记忆页面展示）。作息关闭时返回 None。
+
+        现算而不存中间态：阶段是 `phase_at()` 的纯函数结果，落库只会多一份
+        可能过期的真值。公开（无下划线）是因为 `web_api` 只读接口要调它。
+        """
+        if not self.schedule_config.enabled or self._is_terminating:
+            return None
+        now = time.time()
+        try:
+            state = self.sleep_state.load()
+            postponed = float(state.get("postponed_hours") or 0.0)
+            window = plan_window(now, self.schedule_config, postponed)
+            phase = phase_at(now, window, self.schedule_config)
+            last = float(state.get("last_curation_at") or 0.0)
+        except Exception as error:
+            logger.error("[什亭之枢] 读取作息快照失败: %s", error)
+            return None
+        return {
+            "phase": phase,
+            "phase_label": _PHASE_LABELS.get(phase, phase),
+            "sleep_at": window.sleep_at,
+            "wake_at": window.wake_at,
+            "postponed_hours": postponed,
+            "last_curation_at": last,
+        }
 
     def _ensure_sleep_tick(self) -> None:
         """启动作息 tick。
@@ -547,7 +600,12 @@ class ShittimPlugin(Star):
             # 跨入新一轮作息：先结算上一轮（若已过起床点），再开启这一轮。
             # 结算必须放在 reset 之后，否则 wake_notice_pending 会被重置掉。
             previous_wake = float(state.get("wake_at") or 0.0)
-            self.sleep_state.reset_round(window, postponed)
+            # 新一轮回到基础时间表：推迟只对「当次作息」生效。必须用归零后的
+            # 推迟量**重算**窗口——直接把算好的 window 写回去，等于把今晚的
+            # 顺延带进明天，推迟会一天天累积下去。
+            window = plan_window(now, self.schedule_config, 0.0)
+            self._sleep_window = window
+            self.sleep_state.reset_round(window, 0.0)
             state = self.sleep_state.load()
             if previous_wake and now >= previous_wake:
                 self._on_wake_up()
@@ -565,17 +623,23 @@ class ShittimPlugin(Star):
             self.sleep_state.save(phase=phase)
 
         # 整理节拍与阶段转换无关：即使这一 tick 没有跨阶段，也要看一眼到没到点。
-        self._maybe_curate(phase, now)
+        self._maybe_curate(phase, window, now)
 
-    def _maybe_curate(self, phase: str, now: float) -> None:
+    def _maybe_curate(self, phase: str, window, now: float) -> None:
         """按节拍触发记忆整理（§9.1）。只在 tick 里调用。
 
-        主触发：处于深睡且距上次整理满 `curation_min_interval_hours`。
+        **主触发：本轮深睡窗口里还没整理过**（`last_curation_at < window.sleep_at`）。
+        这是「每晚一次」最准确的表达——不依赖「距上次满 24 小时」那种绝对节拍。
+
+        为什么不用 24 小时：节拍的锚点是「上次整理**完成**的时刻」，
+        于是第一次会落在启动当晚：22:56 装好、01:30 进深睡，只隔 2.5 小时，
+        一夜都被判据挡掉；之后每次还要再叠上整理本身的耗时，锚点会逐日漂移。
+        按「本轮窗口」判就只问一句「这一夜整理过了吗」，天然对齐、不会漂。
+
         兜底触发：不在深睡但距上次已超过 `curation_force_after_hours`——
-        睡得太短时深睡阶段可能整段不出现，不兜底就永远不整理。
+        睡得太短时深睡窗口可能整段不出现，不兜底就永远不整理。
 
         只推迟、不丢失：所有守卫都只是「这一 tick 先不做」，下个 60 秒再来看。
-        真正扣动扳机的是 `now - last_curation_at`，所以推迟最多让整理晚几分钟。
         """
         cfg = self.schedule_config
         if (
@@ -587,7 +651,7 @@ class ShittimPlugin(Star):
             return
         # 她正在清醒宽限里：刚被叫醒、正在回话。此刻收口会把**她正在聊的
         # 上下文**整条压掉——和兜底整理必须跳过收口是同一个理由。等宽限过去、
-        # 她真的睡回去再整理；反正节拍判据是「距上次多久」，不会因此漏掉。
+        # 她真的睡回去再整理；判据是「本轮还没整理」，不会因此漏掉。
         if self._in_grace(now):
             return
         try:
@@ -595,17 +659,19 @@ class ShittimPlugin(Star):
         except Exception as error:
             logger.error("[什亭之枢] 读取整理节拍失败: %s", error)
             return
-        if not last:
-            return
-        hours = (now - last) / 3600.0
-        if phase == DEEP and hours >= cfg.curation_min_interval_hours:
+        if phase == DEEP and last < float(window.sleep_at):
+            logger.info(
+                "[什亭之枢] 本轮深睡窗口尚未整理，开始整理（上次 %s）",
+                time.strftime("%m-%d %H:%M", time.localtime(last)) if last else "从未",
+            )
             self._spawn(self._run_curation(full_reset=True))
             return
-        if phase != DEEP and hours >= cfg.curation_force_after_hours:
+        force_seconds = max(int(cfg.curation_force_after_hours), 0) * 3600
+        if phase != DEEP and force_seconds and now - last >= force_seconds:
             logger.warning(
                 "[什亭之枢] 已 %.0f 小时未整理记忆且当前不在深睡，"
                 "执行兜底整理（不收口、不清空账本）",
-                hours,
+                (now - last) / 3600.0,
             )
             self._spawn(self._run_curation(full_reset=False))
 
@@ -863,9 +929,14 @@ class ShittimPlugin(Star):
         所以这里不再叠加，而是整体替换——她读到的永远是自己一天的连续经历，
         只有最后那条消息换了个人。
 
+        但**人格的预设对话要留下**（见 `_persona_dialogs`）：它们是「她平时
+        怎么说话」的示例，属于稳定人格，不是经历，排在时间线之前。
+
         出任何问题都退回 AstrBot 原生历史（不清空 contexts），宁可上下文
         不符合预期，也不要让她面对一片空白。
         """
+        # 必须在替换前取：这些条目马上就要被整体换掉
+        persona = _persona_dialogs(getattr(req, "contexts", None))
         try:
             entries = self.short_term.timeline_entries(
                 self.memory_config.timeline_max_messages
@@ -875,11 +946,12 @@ class ShittimPlugin(Star):
                 current_prompt=str(getattr(req, "prompt", "") or ""),
                 token_budget=self.memory_config.timeline_token_budget,
             )
-            req.contexts = rendered
+            req.contexts = persona + rendered
             logger.debug(
-                "[什亭之枢] 时间线重建 | %s | %d 条",
+                "[什亭之枢] 时间线重建 | %s | %d 条（人格预设 %d 条）",
                 chat_id,
                 len(rendered),
+                len(persona),
             )
         except Exception as error:
             logger.error("[什亭之枢] 时间线重建失败，保留原生上下文: %s", error)
@@ -1080,6 +1152,154 @@ class ShittimPlugin(Star):
             return f"会话「{session}」还没有可看的记录。"
         return f"【{rows[0]['chat_label']}】最近的对话：\n" + "\n".join(
             format_message_line(row) for row in rows
+        )
+
+    @filter.llm_tool(name="search_history")
+    async def search_history(
+        self,
+        event: AstrMessageEvent,
+        keyword: str = "",
+        session: str = "",
+        days: int = 7,
+        limit: int = 20,
+    ) -> str:
+        """
+        翻看以前的聊天记录，找回已经想不起来的细节。
+
+        当你记不清某件事是不是真的发生过、想确认某人的原话，或需要一个
+        具体时间点的细节时调用。它翻的是**原始记录**，包括已经不记得的那些。
+
+        只在想确认旧事时用：不要拿它代替回忆，也不要把查到的内容当成
+        本轮回复的主题。
+
+        Args:
+            keyword(string): 要找的关键词，可留空（留空就按时间取最近的记录）
+            session(string): 在哪个会话说；留空表示当前会话，跨会话才填（用 list_sessions 查看）
+            days(number): 往回查多少天，默认7，最多90
+            limit(number): 最多看多少条，默认20，最多50
+        """
+        if not self._memory_active():
+            return "记忆系统未启用。"
+        text = (keyword or "").strip()
+        try:
+            limit = max(1, min(int(limit), 50))
+            max_days = max(int(self.schedule_config.archive_retention_days), 1)
+            days = max(1, min(int(days), max_days))
+            token = (session or "").strip()
+            if token:
+                chat_id = self.short_term.resolve_chat(token)
+                if not chat_id:
+                    return f"找不到会话「{session}」，可以先用 list_sessions 看看有哪些。"
+            else:
+                # 默认只翻当前会话：一次搜遍所有群与私聊，结果会长到她读不完
+                chat_id = event.unified_msg_origin or ""
+                if not chat_id:
+                    return "当前会话标识不可用，请指定 session。"
+            rows = self.short_term.search_history(
+                chat_id=chat_id,
+                keyword=text,
+                since=time.time() - days * 86400,
+                limit=limit,
+            )
+        except Exception as error:
+            logger.error("[什亭之枢] 翻查历史失败: %s", error)
+            return f"翻查失败：{error}"
+        if not rows:
+            scope = "当前会话" if not (session or "").strip() else f"「{session}」"
+            what = f"含「{text}」的" if text else ""
+            return f"{scope}近 {days} 天没有{what}记录。"
+
+        label = str(rows[0]["chat_label"] or "") or chat_id
+        what = f"含「{text}」的" if text else ""
+        head = f"【{label}】近 {days} 天的{what}记录，共 {len(rows)} 条："
+        logger.info(
+            "[什亭之枢] 翻查历史 | %s | 关键词=%s | %d 天内 %d 条",
+            chat_id,
+            text or "-",
+            days,
+            len(rows),
+        )
+        return head + "\n" + "\n".join(format_message_line(row) for row in rows)
+
+    @filter.llm_tool(name="delay_sleep")
+    async def delay_sleep(self, event: AstrMessageEvent, hours: float) -> str:
+        """
+        今晚晚点睡。当你想把眼前这段聊完、或正做到一半不想收尾时调用。
+
+        入睡与起床一起往后顺延，只对今晚这一轮有效，明天照常。已经躺下
+        （浅睡 / 深睡）之后就不能再推迟了。
+
+        Args:
+            hours(number): 推迟几小时，0.5 到 6 之间
+        """
+        if not self._schedule_active():
+            return "作息系统未启用，没法推迟。"
+        try:
+            hours = float(hours)
+        except (TypeError, ValueError):
+            return "错误：hours 必须是数字。"
+        if not 0.5 <= hours <= 6:
+            return "错误：hours 要在 0.5 到 6 小时之间。"
+
+        now = time.time()
+        cfg = self.schedule_config
+        try:
+            state = self.sleep_state.load()
+            postponed = float(state.get("postponed_hours") or 0.0)
+            window = plan_window(now, cfg, postponed)
+            phase = phase_at(now, window, cfg)
+        except Exception as error:
+            logger.error("[什亭之枢] 推迟入睡前读取作息失败: %s", error)
+            return f"推迟失败：{error}"
+
+        if phase != AWAKE:
+            return (
+                f"你已经{_PHASE_LABELS.get(phase, '睡了')}了，"
+                "现在推迟等于中途醒过来。今晚就这样吧。"
+            )
+
+        target = postponed + hours
+        try:
+            new_window = plan_window(now, cfg, target)
+        except Exception as error:
+            logger.error("[什亭之枢] 计算新作息窗口失败: %s", error)
+            return f"推迟失败：{error}"
+
+        # 起床被 `wake_latest` 夹住时，实际能推的比请求的少——如实说明，
+        # 不要静默地「推了一半」，否则她以为自己熬到了三点其实十点就得起
+        gained = (new_window.wake_at - window.wake_at) / 3600.0
+        if gained < hours - 0.01:
+            if gained <= 0.01:
+                return (
+                    f"已经到起床时间上限（{cfg.wake_latest}）了，再推迟就没得睡了。"
+                )
+            return f"起床最晚不能超过 {cfg.wake_latest}，现在最多还能推迟 {gained:.1f} 小时。"
+
+        try:
+            self.sleep_state.save(
+                postponed_hours=target,
+                sleep_at=new_window.sleep_at,
+                wake_at=new_window.wake_at,
+            )
+            # 立刻重算内存里的窗口快照，本 tick 之后的状态推导就用新窗口
+            self._refresh_sleep_window()
+        except Exception as error:
+            logger.error("[什亭之枢] 保存推迟作息失败: %s", error)
+            return f"推迟失败：{error}"
+
+        def _clock(ts: float) -> str:
+            return time.strftime("%H:%M", time.localtime(ts))
+
+        logger.info(
+            "[什亭之枢] 推迟入睡 | +%.1fh（累计 %.1fh）| %s 入睡 / %s 起床",
+            hours,
+            target,
+            _clock(new_window.sleep_at),
+            _clock(new_window.wake_at),
+        )
+        return (
+            f"今晚推迟 {hours:.1f} 小时：{_clock(new_window.sleep_at)} 入睡，"
+            f"{_clock(new_window.wake_at)} 起床。明天照常。"
         )
 
     @filter.llm_tool(name="say")

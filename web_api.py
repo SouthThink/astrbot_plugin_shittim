@@ -163,7 +163,7 @@ class MemoryPageAPI:
         self._plugin = plugin
 
     async def overview(self) -> Any:
-        """总览：各层条数、会话数、她在关注的会话数。"""
+        """总览：各层条数、会话数、她在关注的会话数、当前作息。"""
         short_term = self._plugin.short_term
         tiers = self._plugin.memory_store.count_by_tier()
         chats = short_term.list_known_chats(500)
@@ -171,6 +171,11 @@ class MemoryPageAPI:
             focused = len(self._plugin.focus.list_focused(500))
         except Exception:
             focused = 0
+        try:
+            sleep = self._plugin.sleep_snapshot()
+        except Exception:
+            # 只是展示用：读不到作息不该让整个总览失败
+            sleep = None
         return _ok(
             {
                 "short_term": short_term.count(),
@@ -179,6 +184,7 @@ class MemoryPageAPI:
                 "long": tiers.get("long", 0),
                 "permanent": tiers.get("permanent", 0),
                 "focused": focused,
+                "sleep": sleep,
             }
         )
 

@@ -69,6 +69,19 @@
         gap: 10px;
         margin-bottom: 16px;
       }
+      .sleep-bar {
+        display: flex;
+        flex-wrap: wrap;
+        align-items: center;
+        gap: 10px;
+        padding: 10px 14px;
+        margin-bottom: 16px;
+        background: var(--card);
+        border: 1px solid var(--line);
+        border-radius: 10px;
+        color: var(--muted);
+        font-size: 13px;
+      }
       .stat {
         background: var(--card);
         border: 1px solid var(--line);
@@ -174,6 +187,7 @@
     </div>
 
     <div class="stats" id="stats"></div>
+    <div class="sleep-bar hidden" id="sleep-bar"></div>
 
     <div class="tabs" id="tabs">
       <button data-tab="short" class="active">短期账本</button>
@@ -203,6 +217,7 @@
 
       const el = {
         stats: document.getElementById("stats"),
+        sleepBar: document.getElementById("sleep-bar"),
         tabs: document.getElementById("tabs"),
         filters: document.getElementById("filters"),
         chatFilter: document.getElementById("chat-filter"),
@@ -268,6 +283,13 @@
         return `${Math.floor(sec / 86400)}天前`;
       }
 
+      function fmtClock(ts) {
+        if (!ts) return "—";
+        const d = new Date(ts * 1000);
+        const pad = (n) => String(n).padStart(2, "0");
+        return `${pad(d.getHours())}:${pad(d.getMinutes())}`;
+      }
+
       function tag(text, cls) {
         const span = document.createElement("span");
         span.className = "badge" + (cls ? " " + cls : "");
@@ -310,6 +332,32 @@
           box.append(n, c);
           el.stats.appendChild(box);
         });
+        renderSleepBar(data.sleep);
+      }
+
+      // 作息条：阶段 + 本轮入睡/起床 + 推迟量 + 上次整理。
+      // 阶段是后端现算的（phase_at 纯函数），页面不自己推。
+      function renderSleepBar(sleep) {
+        if (!sleep) {
+          el.sleepBar.replaceChildren();
+          el.sleepBar.classList.add("hidden");
+          return;
+        }
+        const nodes = [];
+        nodes.push(tag(sleep.phase_label || sleep.phase, sleep.phase === "awake" ? "ok" : ""));
+        nodes.push(line(`${fmtClock(sleep.sleep_at)} 入睡 / ${fmtClock(sleep.wake_at)} 起床`));
+        if (sleep.postponed_hours > 0) {
+          nodes.push(line(`（本轮推迟 ${sleep.postponed_hours} 小时）`));
+        }
+        nodes.push(
+          line(
+            sleep.last_curation_at
+              ? `上次整理 ${fmtAge(sleep.last_curation_at)}`
+              : "尚未整理过"
+          )
+        );
+        el.sleepBar.replaceChildren(...nodes);
+        el.sleepBar.classList.remove("hidden");
       }
 
       function renderChats(chats) {

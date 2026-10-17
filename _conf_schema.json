@@ -320,13 +320,8 @@
         "type": "bool",
         "default": true
       },
-      "curation_min_interval_hours": {
-        "description": "距上次整理满这么多小时才整理，即「每晚一次」（小时）",
-        "type": "int",
-        "default": 24
-      },
       "curation_force_after_hours": {
-        "description": "距上次整理超过这么多小时则强制整理一次，但不清空账本（小时）",
+        "description": "兜底：距上次整理超过这么多小时仍未整理（如整晚没进深睡）则强制跑一次维护，但不清空账本（小时）",
         "type": "int",
         "default": 48
       },

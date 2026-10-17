@@ -285,10 +285,9 @@ class ScheduleConfig:
 
     # ── 深睡期记忆整理（§9）────────────────────────────────
     curation_enabled: bool = True
-    # 距上次整理满这么久才整理（「每晚一次」）
-    curation_min_interval_hours: int = 24
-    # 距上次整理超过这么久则强制整理一次，但**不清空、不重建**
-    # （防 DEEP 窗口被挤没：睡得太短时深睡阶段可能整段不出现）
+    # 主触发不看时间，只看「本轮深睡窗口里整理过没有」——每晚进 DEEP 就整理一次。
+    # 这个值是**兜底**：距上次整理超过这么久仍未整理（深睡窗口整段没出现，
+    # 比如连续熬夜晚睡），就强制跑一次维护，但**不收口、不清空账本**。
     curation_force_after_hours: int = 48
     # 单次整理内「短期收口」的安全轮数上限（树状压缩，100:1 收缩）；
     # 触顶仍剩多条摘要则跳过清空短期层——宁可留着也不能丢
@@ -325,9 +324,6 @@ class ScheduleConfig:
             wake_signal_threshold=_get_int(cfg, "schedule.wake_signal_threshold", 3),
             wake_grace_minutes=_get_int(cfg, "schedule.wake_grace_minutes", 10),
             curation_enabled=bool(_get(cfg, "schedule.curation_enabled", True)),
-            curation_min_interval_hours=_get_int(
-                cfg, "schedule.curation_min_interval_hours", 24
-            ),
             curation_force_after_hours=_get_int(
                 cfg, "schedule.curation_force_after_hours", 48
             ),

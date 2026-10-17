@@ -7,7 +7,7 @@
 
 一句话区分职责：**决断层决定「要不要说」，主脑决定「怎么说」，插件决定「说在哪里」。**
 
-作息状态机、深睡期记忆整理（短期收口 / 名次降级 / 阶梯遗忘 / 清空账本）已经落地，见下方「作息链路」与「记忆链路」；`plan/` 里只剩 P6（`search_history` 回查工具）与 P7（`delay_sleep` 工具、记忆页面展示等级）未做，不要提前替这两项写代码。
+作息状态机、深睡期记忆整理（短期收口 / 名次降级 / 阶梯遗忘 / 清空账本）、历史回查（`search_history`）与推迟入睡（`delay_sleep`）都已落地，见下方「作息链路」「记忆链路」与 `plan/20261017_P6P7_历史回查与作息收尾计划.md`。`plan/` 里目前没有待做项。
 
 ## 目录结构
 
@@ -73,13 +73,18 @@ core/
 
 **位置榜取代权重**：长期记忆只按 `promoted_at DESC, id DESC` 排（每晚整理产出、每次召回都刷新为当下）。等级（完整 / 精简 / 关键词）由**名次**推导（榜前 60% / 85% 分档），不落库。沉到**榜尾 5%** 且降级够多次、够久没被召回，才被遗忘。`tier='permanent'` 不在榜上，不降级不遗忘，注入时全量排在最前。
 
-**深睡整理**：触发条件是 `main.py: _maybe_curate()` 里的两个判据——**`phase == DEEP` 且距 `last_curation_at` 满 `curation_min_interval_hours`**（判据与阶段转换无关，每个 60 秒 tick 都看一次，所以真正的触发点是 DEEP 窗口内第一个「满 24h」的刻度）。守卫只推迟不丢失：正在整理、正在压缩、记忆停用、**她处于清醒宽限（刚被叫醒、正在回话）**都跳过，下一 tick 再来。`full_reset=True` 的流程顺序固定——维护（降级 → 遗忘 → 晋升 → 合并）→ 短期收口 → 提升当天摘要 → `clear_short_term()` 清空 → `purge_expired()`。**收口排在维护之后**，当天摘要最后写入（同刻并列靠 id 兜底），于是确定性地落在榜首。`full_reset=False` 的兜底（不在深睡且超过 `curation_force_after_hours`）**只做维护**，不收口也不清空。**关掉作息（`schedule.enabled=False`）则 tick 不跑，永远不会整理。**
+**深睡整理**：触发条件是 `main.py: _maybe_curate()` 里的两个判据——**`phase == DEEP` 且 `last_curation_at < window.sleep_at`（本轮深睡窗口里还没整理过）**。判据与阶段转换无关，每个 60 秒 tick 都看一次，所以真正的触发点是进入 DEEP 后的第一个刻度。**不要改回「距上次满 N 小时」**：那种绝对节拍的锚点是上次整理**完成**时刻，启动当晚（如 22:56 装好、01:30 进深睡，只隔 2.5 小时）会被整夜挡掉，锚点还会逐日漂移。守卫只推迟不丢失：正在整理、正在压缩、记忆停用、**她处于清醒宽限（刚被叫醒、正在回话）**都跳过，下一 tick 再来。`full_reset=True` 的流程顺序固定——维护（降级 → 遗忘 → 晋升 → 合并）→ 短期收口 → 提升当天摘要 → `clear_short_term()` 清空 → `purge_expired()`。**收口排在维护之后**，当天摘要最后写入（同刻并列靠 id 兜底），于是确定性地落在榜首。`full_reset=False` 的兜底（不在深睡且距上次超过 `curation_force_after_hours`）**只做维护**，不收口也不清空。**关掉作息（`schedule.enabled=False`）则 tick 不跑，永远不会整理。**
 
 **清空不等于删除**：`archived_at > 0`（原始消息）与 `condensed_at > 0`（已被压进摘要的消息、被吸收的旧摘要）都只是从常规查询与上下文里排除，数据保留 `archive_retention_days`（默认 90 天）供回查。
 
 ### 行动链路
 
-`main.py` 的 LLM 工具：`list_sessions` / `peek_session` / `say` / `leave_session` / `rest` / `remember` / `recall` / `forget`。
+`main.py` 的 LLM 工具：`list_sessions` / `peek_session` / `say` / `leave_session` / `rest` / `remember` / `recall` / `forget` / `search_history` / `delay_sleep`。
+
+两个「翻旧账 / 改作息」类工具的边界：
+
+- `peek_session` 看**当下**（走 `_LIVE_SQL`），`search_history` 翻**全部**（含已清空与已压进摘要的行）。后者**故意不走 `_LIVE_SQL`**：它的用途就是找回已经不记得的东西，唯一排除的是睡眠期暂存（`staged = 1`）。默认只查当前会话，跨会话必须显式传 `session`；只搜消息不搜摘要（摘要没有 `chat_id`，且它已经作为长期记忆在榜上）。
+- `delay_sleep` 只在**清醒**（`phase == AWAKE`）时生效：睡眠中推迟等于把已开始的睡眠撤回，还会挤掉当晚的整理窗口。推迟量记在 `sleep_state.postponed_hours`，**跨天必须归零**（`_sleep_tick` 的跨天分支里用 0 重算窗口），否则会一天天累积。
 
 ## 核心模块速查
 
@@ -117,9 +122,11 @@ core/
 - **调整压缩质量与形态** → `core/memory/extractor.py` 的 `_CONDENSE_PROMPT` / `_EXTRACT_RULES`；阈值与批大小是 `memory.condense_threshold` / `condense_batch`，顺带产出上限 `extract_max_items`，开关是 `memory.extract_include_events`，摘要长度常量在 `maintenance.py` 顶部。
 - **调整压缩的触发时机** → `main.py: _schedule_condense_if_due()`（调用点在 `record_incoming_message` 与 `after_message_sent`，节流常量 `_CONDENSE_CHECK_SECONDS`）；动手的门槛在 `maintenance.condense_short_term()` 里。
 - **调整位置榜分档或遗忘** → `core/memory/store.py` 顶部的 `DEGRADE_BRIEF_RATIO` / `DEGRADE_KEYWORD_RATIO` / `_FORGET_TAIL_RATIO` 与 `curation_level()` / `is_tail()`；`core/memory/maintenance.py` 的 `_demote()`（含 `_DEMOTE_INTERVAL_HOURS`、`_BRIEF_MAX_CHARS`、`_MERGE_SAFE_RATIO`）与 `_forget()`。遗忘门槛是 `memory.forget_min_curations` / `forget_stale_days`。
-- **调整每日整理节拍** → `schedule` 配置组的 `curation_*` + `main.py: _maybe_curate()`（守卫：`_curating` / `_condensing` / 清醒宽限，只推迟不丢失）与 `_run_curation()`；深睡窗口的边界由 `wake_notice_lead_minutes` / `light_until_deep_minutes` 决定。
+- **调整每日整理节拍** → `schedule` 配置组的 `curation_*` + `main.py: _maybe_curate()`（主判据是「本轮深睡窗口里整理过没有」，兜底才是 `curation_force_after_hours`；守卫：`_curating` / `_condensing` / 清醒宽限，只推迟不丢失）与 `_run_curation()`；深睡窗口的边界由 `wake_notice_lead_minutes` / `light_until_deep_minutes` 决定。
 - **调整清空或保留期** → `core/memory/ledger.py` 的 `clear_short_term()` / `purge_expired()` 与 `main.py` 的 `_run_curation()`；开关是 `schedule.daily_reset_enabled` / `archive_retention_days`。
 - **调整图片转述** → `core/memory/vision.py`（取图、转 data URL、缓存、模型能力检查）。
+- **调整历史回查** → `main.search_history`（参数夹紧、默认当前会话）与 `ledger.search_history()`（SQL 与匹配列）。注意它**绕过 `_LIVE_SQL`**，改动前先想清楚「哪些行本来就不该被翻出来」。
+- **调整推迟入睡** → `main.delay_sleep`（范围、上限判定、时机守卫）+ `sleep_state.postponed_hours` + `core/schedule/state.py: _window_for_day`（顺延与 `wake_latest` 夹取）。**跨天归零在 `_sleep_tick` 里**，别只改工具。
 - **调整主动发言风控** → `proactive` 配置组 + `main.py` 的 `_check_say_gate()` / `_check_rate_limit()`。
 - **调整作息时间或三态行为** → `schedule` 配置组 + `core/schedule/state.py` 的 `plan_window` / `phase_at`；叫醒与暂存放在 `main.py: sleep_gate()` / `_on_wake_up()`。
 
@@ -145,6 +152,8 @@ core/
 **摘要不豁免清空**。「整理完短期层为空」是这套设计的验收点：当天摘要已先提升为长期记忆，其余摘要与原始消息一起收口。不要给摘要开例外，否则「刚起床时短期记忆是空的」不成立。
 
 **名次的唯一事实源是查询填进去的 `rank` / `rank_total`**。等级由 `curation_level()` 推导、不入库——想加一档就改推导函数，不要新增「等级」列（两个字段早晚会不同步）。凡是要用等级的地方（页面、降级、遗忘）都必须走 `store.board()` / `ranked()` / `list_page()`，它们才会把名次填上。
+
+**人格说明在 `system_prompt`，人格预设对话在 `contexts` 最前**。本插件从不写 `req.system_prompt`，所以 `# Persona Instructions` 那一段永远安全；但 AstrBot 在 `_ensure_persona_and_skills()` 里会把人格的 `begin_dialogs` 用 `req.contexts[:0] = ...` 插到最前（每条带 `_no_save`），**随后**才轮到我们的 `on_llm_request` 整体替换 `req.contexts`。所以必须先用 `_persona_dialogs()` 把头部那段留下来，否则「她平时怎么说话」的示例会被静默抹掉。识别靠「头部连续的 `_no_save`」：AstrBot 插的是连续一段，而它别处追加的系统条目（如文件解析结果）不带这个标记。
 
 **生命周期**：耗时 `await`（尤其等模型）之后要检查 `self._is_terminating`；插件卸载后数据库连接会关，`core/common/db.py` 的 `_NullCursor` 负责让迟到的读写静默失效，不要依赖它做正确性保证。
 

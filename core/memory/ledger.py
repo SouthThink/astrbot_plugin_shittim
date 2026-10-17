@@ -606,6 +606,48 @@ class ShortTermLedger:
         )
         return list(reversed(rows))
 
+    def search_history(
+        self,
+        *,
+        chat_id: str | None,
+        keyword: str = "",
+        since: float = 0.0,
+        limit: int = 20,
+    ) -> list[sqlite3.Row]:
+        """按关键词翻聊天记录，返回时间正序。
+
+        **故意不走 `_LIVE_SQL`**：这个工具的用途就是「翻旧账」，已经清空
+        （`archived_at`）与已经压进摘要（`condensed_at`）的行正是它要找的东西。
+        唯一排除的是睡眠期暂存（`staged = 1`）——那批消息在她醒来前不该存在。
+
+        关键词同时匹配正文、发言人名字与图片描述：她「看见过」那张图，
+        就该能凭描述把它找回来。
+        """
+        limit = max(int(limit), 1)
+        clauses = ["staged = 0", "created_at >= ?"]
+        params: list = [float(since)]
+        if chat_id:
+            clauses.append("chat_id = ?")
+            params.append(chat_id)
+        text = (keyword or "").strip()
+        if text:
+            like = f"%{text}%"
+            clauses.append(
+                "(content LIKE ? OR sender_name LIKE ? OR image_caption LIKE ?)"
+            )
+            params.extend([like, like, like])
+        params.append(limit)
+        rows = self._db.query(
+            f"""
+            SELECT * FROM short_term_messages
+             WHERE {' AND '.join(clauses)}
+             ORDER BY created_at DESC, id DESC
+             LIMIT ?
+            """,
+            tuple(params),
+        )
+        return list(reversed(rows))
+
     def page(
         self, chat_id: str | None, limit: int, offset: int
     ) -> tuple[list[sqlite3.Row], int]:
