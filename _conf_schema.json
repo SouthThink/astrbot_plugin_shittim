@@ -219,7 +219,7 @@
         "default": true
       },
       "context_messages": {
-        "description": "判定时每个会话取给她看的近期消息上限（条）",
+        "description": "判定时每个会话取给她看的近期消息上限；当前会话的「前文」也按这个条数补（条）",
         "type": "int",
         "default": 6
       },

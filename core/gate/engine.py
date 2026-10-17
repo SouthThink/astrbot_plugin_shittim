@@ -45,6 +45,9 @@ _WINDOW_PROMPT = """你是「{alias}」的思考层。下面是你刚在「{chat
 【你记得的事】
 {memory}
 
+【这段对话之前】（只是用来理解上下文，不是要你回应的）
+{history}
+
 【这段对话】（按发生顺序）
 {content}
 
@@ -146,13 +149,21 @@ class DecisionEngine:
     # ── 模型层 ────────────────────────────────────────────
 
     async def judge_window(
-        self, chat_id: str, chat_label: str, lines: list[str]
+        self,
+        chat_id: str,
+        chat_label: str,
+        lines: list[str],
+        before: list[str] | None = None,
     ) -> Decision:
         """判定「这段时间的对话」要不要接一句。
 
         与逐条判定的区别在判据本身：她听到的是一整段，而不是被切成一条条、
         彼此脱节的碎片。所以模型能看出「这轮问答已经闭环了」或「他们在等
         别人回」，而不是对着一句「应该可以」独自猜上下文。
+
+        `before` 是窗口开始前这个会话里刚说过的几句。判定对象仍然是窗口内的
+        增量，但「不懂」「那他呢」这类话只有配上紧邻的前文才判得准——
+        没有它，模型只能判「无明确上下文」然后沉默。
         """
         provider = self._resolve_provider()
         if provider is None:
@@ -165,6 +176,8 @@ class DecisionEngine:
         if not body:
             return Decision(False, "没有可判断的内容", SOURCE_FALLBACK)
 
+        history = "\n".join(line for line in (before or []) if line).strip()
+
         prompt = _WINDOW_PROMPT.format(
             alias=self._alias_label(),
             recent=self._short_term.build_recent_block(
@@ -175,6 +188,7 @@ class DecisionEngine:
             or "（暂无近期消息）",
             memory=self._format_memories(body),
             chat_label=chat_label or "群聊",
+            history=history or "（这段对话就是开头）",
             content=body,
         )
 

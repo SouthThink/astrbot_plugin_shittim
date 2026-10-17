@@ -37,7 +37,7 @@ core/
 - `core/gate/engine.py: rule_decide()` —— 同步、零 token。上游指令 / 私聊 / 被点名 / 无文本在这里当场定夺，返回 `None` 表示「交给巡检」。
 - `core/gate/patrol.py: PatrolManager` —— 群聊里的普通消息**扣押进窗口**，攒一小段再整体判一次。
 - 私聊是个中间态：规则层定的只是「要回」，`Decision.debounce=True` 把它交给 `main.py: _gate_private_debounce()`，用巡检器的**静默窗口**攒够 `decision.private_debounce_seconds` 秒（默认 10）才唤醒主脑。静默窗口不问模型、不进冷却、不设封顶，计时基准跟着最新那条消息走。
-- `core/gate/engine.py: judge_window()` —— 面向「一段对话」的模型判定，调用方是巡检器，不直接被事件处理器调用。
+- `core/gate/engine.py: judge_window()` —— 面向「一段对话」的模型判定，调用方是巡检器，不直接被事件处理器调用。判据 = **窗口内的增量 + 该会话紧邻的前文**（`ledger.messages_before()`）：安静一阵后窗口里常常只剩「不懂」一句，没有前文模型只能判「无明确上下文」。
 
 放行 = `event.is_at_or_wake_command = True`；拦下 = `event.stop_event()` + `_mark_gated()`。
 
@@ -113,7 +113,7 @@ core/
 
 - **调整群聊参与时机** → `core/gate/engine.py: rule_decide()` 与 `core/gate/patrol.py`。窗口/封顶/冷却/噪声都在 `DecisionConfig` 的 `patrol_*`。
 - **调整私聊回复节奏** → `DecisionConfig.private_debounce_seconds`（0 = 立即回，默认 10）。实现是 `patrol.hold(..., silent=True)` 的静默窗口，被 KILL 的消息仍在时间线上（账本即上下文）。
-- **调整判定质量** → `core/gate/engine.py` 的 `_WINDOW_PROMPT`。记住判据是**一段对话**，不是单条消息。
+- **调整判定质量** → `core/gate/engine.py` 的 `_WINDOW_PROMPT`。记住判据是**一段对话**，不是单条消息；窗口前文由 `patrol._history_before()` 用 `context_messages` 补，别把它删成「只看增量」。
 - **调整注入顺序或内容** → `main.py: inject_memory_context()`。顺序 = 模型读取顺序：永久记忆 → 长期记忆 →（全局时间线）→ 当前消息 → 作息事件提示。前两段是长期背景，插在时间线**之前**（`_inject_memory_blocks()`）；作息提示是时效事件，追加在**最新处**（`_inject_schedule_notice()`）。
 - **调整时间线的范围或形态** → `core/memory/timeline.py` 与 `ledger.py: timeline_entries()`；预算/上限是 `memory.timeline_token_budget` / `timeline_max_messages`。
 - **改账本结构** → `core/common/db.py` 三处一起改；已有库靠 `_COLUMN_MIGRATIONS` 补列。

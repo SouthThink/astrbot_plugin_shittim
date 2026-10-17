@@ -349,5 +349,32 @@ class PatrolManager:
 
         lines = [format_message_line(row) for row in rows]
         chat_label = str(rows[-1]["chat_label"] or "")
-        decision = await self._decider.judge_window(record.chat_id, chat_label, lines)
+        before = self._history_before(record.chat_id, rows[0])
+        decision = await self._decider.judge_window(
+            record.chat_id, chat_label, lines, before=before
+        )
         return bool(decision.should_reply), decision.reason, True
+
+    def _history_before(self, chat_id: str, first_row) -> list[str]:
+        """窗口开始前这个会话的几句原文。
+
+        判定对象是「上次判定之后的增量」，安静一段时间后它可能只剩
+        「不懂」这样一句。把紧邻的前文一并交给模型，它才看得出这句在接什么。
+        """
+        try:
+            limit = int(self._config.context_messages)
+        except (TypeError, ValueError):
+            limit = 6
+        if limit <= 0:
+            return []
+        try:
+            rows = self._short_term.messages_before(
+                chat_id,
+                float(first_row["created_at"]),
+                int(first_row["id"]),
+                limit,
+            )
+        except Exception as error:
+            logger.debug("[什亭之枢] 读取判定前文失败: %s", error)
+            return []
+        return [format_message_line(row) for row in rows]

@@ -587,6 +587,34 @@ class ShortTermLedger:
         )
         return list(reversed(rows))
 
+    def messages_before(
+        self,
+        chat_id: str,
+        before_at: float,
+        before_id: int,
+        limit: int = 6,
+    ) -> list[sqlite3.Row]:
+        """取某会话在指定条目**之前**的若干条消息（按时间正序）。
+
+        判定看的是「上次判定之后的增量」，而增量往往只有一两句
+        （「不懂」「那他呢」）。没有前文，模型只能猜代词指什么，
+        于是判出一堆「无明确上下文」的沉默。这里补上窗口开始前的
+        那段对话，让判据从「一句话」变成「一段话」。
+        """
+        if limit <= 0:
+            return []
+        rows = self._db.query(
+            f"""
+            SELECT * FROM short_term_messages
+             WHERE chat_id = ? AND {_LIVE_SQL}
+               AND (created_at < ? OR (created_at = ? AND id < ?))
+             ORDER BY created_at DESC, id DESC
+             LIMIT ?
+            """,
+            (chat_id, float(before_at), float(before_at), int(before_id), int(limit)),
+        )
+        return list(reversed(rows))
+
     def messages_since(
         self, chat_id: str, since: float, limit: int = 30
     ) -> list[sqlite3.Row]:

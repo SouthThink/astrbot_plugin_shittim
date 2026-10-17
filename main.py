@@ -758,8 +758,10 @@ class ShittimPlugin(Star):
 
         if not self.decision_config.patrol_enabled:
             # 巡检关闭：退回逐条判定，用账本里最新这条当判据
-            chat_label, lines = self._latest_window(chat_id)
-            decision = await self.decider.judge_window(chat_id, chat_label, lines)
+            chat_label, lines, before = self._latest_window(chat_id)
+            decision = await self.decider.judge_window(
+                chat_id, chat_label, lines, before=before
+            )
             if self._is_terminating:
                 return
             self._apply_decision(event, decision)
@@ -812,12 +814,22 @@ class ShittimPlugin(Star):
         event.stop_event()
         self._mark_gated(event)
 
-    def _latest_window(self, chat_id: str) -> tuple[str, list[str]]:
-        """逐条判定模式下的判据：该会话账本里最新的一条。"""
-        rows = self.short_term.recent_of_chat(chat_id, 1)
+    def _latest_window(self, chat_id: str) -> tuple[str, list[str], list[str]]:
+        """逐条判定模式下的判据：最新一条 + 它前面那几句。
+
+        只看最新一条等于逼模型猜「不懂」「那他呢」指的是什么，
+        所以把紧邻的前文一并带上，判定对象仍是最新这条。
+        """
+        try:
+            limit = max(int(self.decision_config.context_messages), 0)
+        except (TypeError, ValueError):
+            limit = 6
+        rows = self.short_term.recent_of_chat(chat_id, limit + 1)
         if not rows:
-            return "", []
-        return str(rows[-1]["chat_label"] or ""), [format_message_line(rows[-1])]
+            return "", [], []
+        latest = rows[-1]
+        before = [format_message_line(row) for row in rows[:-1]]
+        return str(latest["chat_label"] or ""), [format_message_line(latest)], before
 
     # ══════════════════════════════════════════════════════════
     #  事件：召回并注入记忆
