@@ -79,8 +79,10 @@ def format_speech(row) -> str:
 def format_message_line(row: sqlite3.Row) -> str:
     """把一条短期消息格式化成带来源与时间标记的一行。
 
-    时间标签采用**绝对时间戳**而非相对时间：相对时间每轮都在变化，
-    同一行在两次请求中的文本不一致，会降低 prompt 缓存命中率。
+    时间标签用于区分消息的新旧程度：没有它，模型只能看到顺序，
+    无法判断消息发生在何时。此处使用**绝对时间戳**而非相对时间：
+    相对时间会让每一行的文本随当前时刻变化，导致请求前缀逐轮改变、
+    破坏 prompt / KV 缓存命中；绝对时间戳写入后不再变化。
 
     图片描述同理：AstrBot 对图片只提供「[图片]」占位，若不补充描述，
     该图片在上下文中即不可见。
@@ -309,6 +311,7 @@ class ShortTermLedger:
     ) -> list[dict]:
         """按**会话配额**取时间线条目，再整体按时间正序返回。
 
+        用于未接管上下文时的跨会话背景块（`timeline.build_timeline_block`）。
         与 `live_entries()` 共用同一份 `_LIVE_SQL` 与 `staged = 0` 过滤条件，
         区别只在于取样：
 
@@ -369,6 +372,25 @@ class ShortTermLedger:
             seen.add(key)
             deduped.append(entry)
         return deduped[-int(limit) :]
+
+    def timeline_entries(self, limit: int) -> list[dict]:
+        """时间线的条目：取**最新**的 limit 个，按时间正序返回。
+
+        用于接管模式的全局时间线（`timeline.build_timeline`）。
+
+        过滤条件使其天然「只保留最近」：
+
+        - `_LIVE_SQL`：归档与被压入摘要的行均不返回。归档发生在深睡整理中，
+          醒来后时间线从该时刻重新累积；被压缩的段落由摘要代表。
+        - `staged = 0`：睡眠期暂存消息不进入时间线（该时段尚未处理）。被叫醒或
+          起床时 `release_staged()` 清除该标记，这些消息才以「睡觉时收到」的
+          形式出现在时间线开头。
+        """
+        if limit <= 0:
+            return []
+        entries = self._entry_rows(order="DESC", limit=int(limit))
+        entries.sort(key=_entry_sort_key)
+        return entries[-int(limit) :]
 
     def oldest_entries(self, limit: int) -> list[dict]:
         """取**最旧**的 limit 个条目，按时间正序（短期压缩的取材范围）。"""
@@ -546,8 +568,9 @@ class ShortTermLedger:
     ) -> str:
         """将其他会话的近期消息拼成带来源标记的文本，受 token 预算约束。
 
-        仅用于**决断层**（判断某个群是否接话时，需要了解其他会话的近期情况）。
-        主脑上下文使用全局时间线，不经过此处。
+        用于**决断层**（判断某个群是否接话时需要了解其他会话近况），以及
+        未接管上下文时主脑的跨会话连续性块。接管模式下主脑使用全局时间线，
+        不经过此处。
 
         按**会话配额**读取，而非全局取最近 N 条：全局取会导致高频会话挤占
         其他会话的展示配额。每个会话保留代表消息，以维持跨会话连续性。

@@ -1,9 +1,4 @@
 {
-  "enabled": {
-    "description": "是否启用插件",
-    "type": "bool",
-    "default": true
-  },
   "memory": {
     "description": "记忆系统",
     "type": "object",
@@ -56,12 +51,12 @@
         "default": 2
       },
       "short_term_context_per_chat": {
-        "description": "跨会话语境中每个会话取的消息上限（条），同时用于决断层、巡检与跨会话背景",
+        "description": "跨会话语境（决断层、巡检与未接管上下文时的主脑连续性块）中每个会话取的消息上限（条）",
         "type": "int",
         "default": 6
       },
       "short_term_context_chats": {
-        "description": "跨会话语境纳入的会话上限（个），同时用于决断层、巡检与跨会话背景",
+        "description": "跨会话语境纳入的会话上限（个）",
         "type": "int",
         "default": 6
       },
@@ -80,13 +75,18 @@
         "type": "int",
         "default": 100
       },
+      "context_takeover": {
+        "description": "是否接管主脑上下文（关闭时沿用 AstrBot 原生按会话历史，仅追加临时记忆块；开启后用全局时间线替换 req.contexts，会破坏原生前缀缓存，默认关闭）",
+        "type": "bool",
+        "default": false
+      },
       "timeline_max_messages": {
-        "description": "跨会话背景单次最多包含的条目数（条）",
+        "description": "跨会话背景与接管时间线单次最多包含的条目数（条）",
         "type": "int",
         "default": 400
       },
       "timeline_token_budget": {
-        "description": "跨会话背景的 token 上限，超出时从最旧条目开始丢弃",
+        "description": "跨会话背景与接管时间线的 token 上限，超出时从最旧条目开始丢弃",
         "type": "int",
         "default": 8000
       },

@@ -71,16 +71,16 @@ pages/memory/   记忆页面
 - 作息事件提示共用一条通道：`wake_notice_pending=1` 或 `awakened_at > wake_notice_fired_at` 才算待注入，注入后把 `wake_notice_fired_at` 抬到当下完成去重。**起床优先于叫醒**；`wake_notice_fired_at` 是唯一水位线，别再引入第二个「已注入」标记。
 - 起床提示统计「本轮睡眠期消息」时，起点必须用 `last_sleep_start()`——起床那一刻 `plan_window()` 已经翻到下一轮。
 - 暂存消息（`staged=1`）**不算短期记忆**：`live_entries()` / `live_entry_count()` / 时间线条目查询一律只取 `staged=0`。判断「现在是不是睡眠期」要排除清醒宽限（刚被叫醒的 10 分钟她是醒着的）。
-- `format_message_line()` 给 `source='sleep'` 补「（睡觉时收到）」。这是**行格式**，绝不能写进 `content`（巡检判据与时间线都靠 `content` 表达原话）。
+- `format_message_line()` 给 `source='sleep'` 补「（睡觉时收到）」。这是**行格式**，绝不能写进 `content`（时间线剔除当前消息靠 content 精确匹配）。
 - 周期 tick 负责跨天重置与阶段转换收口；不要在事件处理器里做重活。
 
 ### 3.4 记忆链路
 
-`ledger`（账本）→ `extractor`（`condense` 压缩、`merge` 合并）→ `store`（位置榜 / 召回 / 晋升）→ `maintenance`（收口 / 降级 / 遗忘 / 晋升 / 合并）。主脑上下文以 AstrBot 原生会话历史为主体，`timeline` 只补充跨会话背景，注入拼装走 `injector`，图片经 `vision` 转述，坏图摘除在 `history`。
+`ledger`（账本）→ `extractor`（`condense` 压缩、`merge` 合并）→ `store`（位置榜 / 召回 / 晋升）→ `maintenance`（收口 / 降级 / 遗忘 / 晋升 / 合并）。主脑上下文默认沿用 AstrBot 原生按会话历史，注入拼装走 `injector`，时间线仅在接管模式下由 `timeline` 从账本重建，图片经 `vision` 转述，坏图摘除在 `history`。
 
-**原生历史不动，跨会话背景只追加。** `timeline.build_timeline_block()` 生成一段 `<cross_session_timeline>` 文本，由 `main._inject_memory_blocks()` 通过 `req.extra_user_content_parts` 追加（`TextPart(...).mark_as_temp()`，不写入持久历史）。理由是原生历史既是按会话的对话，也是 prompt 缓存的稳定前缀：整体替换 `req.contexts` 会丢弃前者、破坏后者，并触发插件市场的「严重修改模型 Context」禁令。
+**主脑上下文默认不接管**：`memory.context_takeover=False`（默认）时 `on_llm_request` **不修改 `req.contexts`**，记忆块、跨会话背景（`<cross_session_timeline>`）与作息提示经 `req.extra_user_content_parts` 以 `TextPart(...).mark_as_temp()` 追加，仅本轮可见、不写持久历史，也不会破坏原生前缀缓存。跨会话背景由 `ledger.timeline_entries_balanced()` 取样：每个会话保留最近 `short_term_context_per_chat` 条、纳入最近 `short_term_context_chats` 个会话，**当前会话始终入选且其 `gated=1` 消息全量保留**（这些消息没进官方历史），活摘要也一并保留；原生历史为空时 `include_current=True` 兜底。开启接管后才由 `timeline.build_timeline()` 把账本（`archived_at = 0 AND condensed_at = 0 AND staged = 0`）加活着的摘要渲染成 `req.contexts`——她说过的话是 `assistant`（只放原话），别人的话是 `user`（带 `[会话标签] 发言人 (绝对时间戳):`），摘要用 `<earlier_summary>` 包裹，末尾标明「你现在在跟谁说话」。此时 AstrBot 的原生按会话历史被整体丢弃（`_rebuild_timeline()`）。数据源只覆盖**今天**，超预算从**最旧的**开始丢。
 
-背景块只放原生历史看不到的东西：其它会话的消息与摘要、当前会话中**被拦下未进入原生历史**的消息（`gated = 1`）、以及原生历史为空时当前会话的全部条目（`_has_native_history()` 为假时的兜底）。取样走 `ledger.timeline_entries_balanced()`：**按会话配额**（每会话 `short_term_context_per_chat` 条、最多 `short_term_context_chats` 个会话）而不是全局最新 N 条——否则一个刷屏的群聊会把别的会话挤出背景，切过去就断片。当前会话始终入选，其 `gated` 消息全量保留。消息行带 `[会话标签] 发言人 (绝对时间):`，摘要用 `<earlier_summary>` 包裹。超预算从**最旧的**开始丢。
+**消息行必须用绝对时间戳**：`ledger.format_message_line()` 用 `format_clock()`，不要改回 `format_age()`。相对时间会让同一行的文本随当前时刻变化，导致请求前缀逐轮改变、prompt / KV 缓存全部失效。
 
 **短期记忆只有一个出口：压缩。** 逐批提炼已退役。一次压缩同时产出「1 条摘要 + N 条长期记忆」，两者是同源**兄弟**。
 
@@ -120,11 +120,11 @@ pages/memory/   记忆页面
 | `core/gate/engine.py` | 决断层 | `_WINDOW_PROMPT` 是判定质量的直接来源；人格/记忆注入别删 |
 | `core/gate/patrol.py` | 巡检窗口 | 扣押 / 替换 / 冷却 / 噪声四件事都在这里 |
 | `core/focus/manager.py` | 焦点读写 | 只约束主动发言，别在被动接话路径上读它 |
-| `core/memory/ledger.py` | 账本读写、行格式化、条目查询、压缩落库、清空 | `_LIVE_SQL` 是「她此刻应该记得的」唯一表达，**新增查询必须带上它**；`format_message_line` 供判定与跨会话背景，`format_speech` 供压缩记录 |
+| `core/memory/ledger.py` | 账本读写、行格式化、条目查询、压缩落库、清空 | `_LIVE_SQL` 是「她此刻应该记得的」唯一表达，**新增查询必须带上它**；`format_message_line` 供判定，`format_speech` 供时间线 |
 | `core/memory/store.py` | 位置榜、召回打分、等级推导、遗忘请求 | 榜序 `_BOARD_ORDER` 与分档常量在顶部；等级一律用 `curation_level(rank, total)` 推导，不要新增「等级」列 |
 | `core/memory/maintenance.py` | 压缩 / 树状收口 / 降级 / 遗忘 / 晋升 / 合并 | `run()` 不含收口与清空，那两步在 main；摘要长度常量在文件顶部 |
 | `core/memory/injector.py` | 注入块拼装 + 作息事件提示 | 只负责「长什么样」，「放哪里」在 main |
-| `core/memory/timeline.py` | 账本条目 → 跨会话背景文本块 | 只生成文本，不改 `req.contexts`；摘要包 `<earlier_summary>`；行内时间是绝对时间戳 |
+| `core/memory/timeline.py` | 账本条目 → `req.contexts`（仅接管模式） | 默认不参与；摘要包 `<earlier_summary>`；每条都要 `_no_save` |
 | `core/memory/history.py` | 坏图摘除 | 只做「确定读不到的图片引用」，别恢复官方历史回填 |
 | `core/memory/vision.py` | 图片转文字 | 引用必须当场取出，临时文件会失效 |
 | `core/schedule/state.py` | 作息推导与状态读写 | 推导保持纯函数；状态只经 `SleepStateStore` 落库 |
@@ -141,8 +141,9 @@ pages/memory/   记忆页面
 
 **记忆**
 
-- 调整注入顺序 → `main.inject_memory_context()`：永久记忆 → 长期记忆 → 记忆索引 → 跨会话背景 → 作息事件提示，全部追加到 `req.extra_user_content_parts`。当前消息正文由 `req.prompt` 承载，位置在这些内容之前。
-- 调整跨会话背景 → `memory/timeline.py` 与 `ledger.timeline_entries_balanced()`；会话配额是 `memory.short_term_context_per_chat` / `short_term_context_chats`，预算是 `memory.timeline_token_budget` / `timeline_max_messages`。**不要改回整体替换 `req.contexts`**，那会破坏原生历史与缓存命中率。
+- 调整注入顺序 → `main.inject_memory_context()`：永久记忆 → 长期记忆 →（跨会话近况）→（原生历史 / 时间线）→ 作息事件提示。默认走 `_append_temp_parts()` 追加临时块；`context_takeover=True` 时才整体替换 `req.contexts`。
+- 调整跨会话连续性 → `main._cross_session_block()` + `ledger.timeline_entries_balanced()` + `timeline.build_timeline_block()`；配额是 `memory.short_term_context_*`，预算沿用 `timeline_token_budget` / `timeline_max_messages`。
+- 调整时间线（仅接管模式）→ `memory/timeline.py` 的 `build_timeline()` 与 `ledger.timeline_entries()`；预算是 `memory.timeline_token_budget` / `timeline_max_messages`。
 - 改账本结构 → `common/db.py` 三处一起改；老库靠 `_COLUMN_MIGRATIONS` 补列。
 - 调整压缩质量 → `extractor.py` 的 `_CONDENSE_PROMPT` / `_EXTRACT_RULES`；阈值与批大小是 `memory.condense_threshold` / `condense_batch`。
 - 调整压缩时机 → `main._schedule_condense_if_due()`（调用点在记账与发送后）；动手门槛在 `maintenance.condense_short_term()`。
@@ -169,11 +170,11 @@ pages/memory/   记忆页面
 
 - 决断 90 是「霸道」取值：被拦下的消息其它插件（含天使之心）也看不到。与其他插件冲突时调低，只要仍高于默认 LLM 阶段。
 - 作息 95 **必须早于决断 90**，否则睡眠期消息仍会进判定。
-- 上下文注入取负值，只为排在其它 `on_llm_request` 处理器之后；本插件不改 `req.contexts`，只往 `extra_user_content_parts` 追加，因此不再依赖别人是否重写 contexts。
+- `on_llm_request` 默认**不覆盖** `req.contexts`，只追加临时内容块；开启 `memory.context_takeover` 后会整体替换，此时必须晚于同样覆盖 `req.contexts` 的插件（天使之心 50），否则注入块会被抹掉。
 
 **记账必须快**：记账是事件链第一环，任何耗时操作（模型调用、下载）都要 `self._spawn()` 丢后台。
 
-**`content` 是唯一事实源，`gated` 只是展示用**：`gated=1` 只用于记忆页面、排障与跨会话背景（这些消息没进原生历史，只能靠它补回来），**不要在判定与巡检路径上读它**。但**永远不要改写已入账的 `content`**——巡检判据靠它精确匹配，跨会话背景排除当前消息也按 `message_id` 而不是文本比对。
+**`content` 是唯一事实源，`gated` 只是展示用**：`gated=1` 只用于记忆页面与排障，**不要在上下文组装路径上读它**。但**永远不要改写已入账的 `content`**——巡检判据与时间线剔除当前消息都靠它精确匹配。
 
 **图片描述不在 `content` 里**：账本里图片永远是 `[图片]` 占位，描述存 `image_caption`，由 `format_message_line()` 拼成 `[图片]（图片内容：…）`。
 
@@ -187,7 +188,7 @@ pages/memory/   记忆页面
 
 **名次的唯一事实源是查询填的 `rank` / `rank_total`**：等级由 `curation_level()` 推导、不入库。页面、降级、遗忘都必须走 `store.board()` / `ranked()` / `list_page()`，它们才会填名次。
 
-**不碰 `req.contexts`，也不碰 `req.system_prompt`**：人格说明仍由 AstrBot 写进 `system_prompt`，人格预设对话由它用 `req.contexts[:0] = ...` 插在最前（每条带 `_no_save`）。插件只往 `req.extra_user_content_parts` 追加临时内容（`TextPart(...).mark_as_temp()`），追加内容会被拼进最后一条 user 消息，且不进入持久历史。**不要改回整体替换 contexts**：那既丢原生历史，也让每轮请求前缀变化、破坏缓存命中率，属于市场规则明确禁止的做法。
+**人格说明在 `system_prompt`，人格预设对话在 `contexts` 最前**：本插件从不写 `req.system_prompt`；但 AstrBot 会把 `begin_dialogs` 用 `req.contexts[:0] = ...` 插到最前（每条带 `_no_save`），随后才轮到我们整体替换 `req.contexts`。所以必须先用 `_persona_dialogs()` 留下头部连续的 `_no_save` 段，否则人格示例会被静默抹掉。
 
 **插件页面必须显式引入 bridge**：`pages/*/index.html` 的 `<head>` 要写 `<script src="/api/plugin/page/bridge-sdk.js"></script>`。若依赖宿主注入，它会晚于页面内联脚本执行，而插件页 iframe 是 sandbox 的 opaque origin，直连必然 401。
 

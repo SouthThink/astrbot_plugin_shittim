@@ -53,7 +53,8 @@ class MemoryConfig:
 
     # ── 短期层 ────────────────────────────────────────────
     # 跨会话语境：按会话配额读取，而非全局取最近 N 条，避免高频会话
-    # 挤占其它会话的展示额度。决断层、巡检与跨会话背景块共用这组配额。
+    # 挤占其它会话的展示配额。用于决断层、巡检，以及未接管上下文时的
+    # 主脑跨会话连续性块。
     short_term_context_per_chat: int = 6  # 每个会话的消息条数
     short_term_context_chats: int = 6     # 最多纳入的会话数
     short_term_context_tokens: int = 2000 # 该部分的 token 预算
@@ -61,12 +62,18 @@ class MemoryConfig:
     # 单次整理仅执行一轮压缩，避免消息高峰期一次性压缩全部条目。
     condense_threshold: int = 300         # 触发压缩的条目总数阈值
     condense_batch: int = 100             # 单次压缩的条目数
-    # ── 跨会话背景 ────────────────────────────────────────
-    # 追加在最后一条 user 消息之后（extra_user_content_parts），不修改原生历史。
-    # 只补充原生历史看不到的内容：其它会话的近况与当前会话被拦下的消息。
-    # 见 memory/timeline.py；超出预算后从最旧条目开始丢弃，优先保留最近对话。
-    timeline_max_messages: int = 400      # 单次返回的条目数上限（硬上限）
-    timeline_token_budget: int = 8000     # 整段背景的 token 上限
+    # ── 主脑上下文 ────────────────────────────────────────
+    # 是否接管主脑上下文：开启后用本插件的全局时间线整体替换 req.contexts；
+    # 关闭（默认）时沿用 AstrBot 原生按会话历史，记忆与跨会话背景通过
+    # req.extra_user_content_parts 的临时内容块注入，不修改 req.contexts。
+    context_takeover: bool = False
+    # ── 跨会话背景 / 全局时间线 ───────────────────────────
+    # 默认模式生成跨会话背景块：每个会话保留最近 short_term_context_per_chat 条，
+    # 当前会话始终入选并补齐被拦下的消息。开启接管后改为渲染完整全局时间线。
+    # 两者的取样上限与预算共用以下两项；超出后从最旧条目开始丢弃，
+    # 优先保留最近发生的对话。见 memory/timeline.py。
+    timeline_max_messages: int = 400      # 单次返回的条目数上限（SQL 层硬上限）
+    timeline_token_budget: int = 8000     # 背景块 / 整条时间线的 token 上限
     # 请求发出前移除无法读取的图片引用：单张坏图会导致上游以 400 拒绝整条请求，
     # AstrBot 随后会将本轮切换到备用模型（人格与工具均会变化）
     strip_invalid_images: bool = True
@@ -122,6 +129,7 @@ class MemoryConfig:
             ),
             condense_threshold=_get_int(cfg, "memory.condense_threshold", 300),
             condense_batch=_get_int(cfg, "memory.condense_batch", 100),
+            context_takeover=bool(_get(cfg, "memory.context_takeover", False)),
             timeline_max_messages=_get_int(
                 cfg, "memory.timeline_max_messages", 400
             ),
