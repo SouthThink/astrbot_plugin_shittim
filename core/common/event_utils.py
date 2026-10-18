@@ -9,12 +9,7 @@ from __future__ import annotations
 
 import re
 
-try:
-    from astrbot.api import logger
-except ImportError:  # pragma: no cover
-    import logging
-
-    logger = logging.getLogger(__name__)
+from astrbot.api import logger
 
 try:  # 上游指令识别依赖 AstrBot 内部类型，路径随版本变化，取不到就整体降级
     from astrbot.core.star.filter.command import CommandFilter

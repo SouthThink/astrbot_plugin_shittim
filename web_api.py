@@ -15,12 +15,7 @@ from __future__ import annotations
 import json
 from typing import Any
 
-try:
-    from astrbot.api import logger
-except ImportError:  # pragma: no cover
-    import logging
-
-    logger = logging.getLogger(__name__)
+from astrbot.api import logger
 
 try:  # AstrBot 4.27+ 的新版插件 Web API
     from astrbot.api.web import error_response, json_response, request

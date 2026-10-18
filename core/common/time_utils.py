@@ -27,8 +27,8 @@ def format_age(seconds: float) -> str:
 def format_clock(ts: float) -> str:
     """将时间戳格式化为绝对时间，如「2026-10-16 07:00」。
 
-    仅在需要时间锚点时使用（例如刚被叫醒、刚起床），
-    日常消息行仍使用 format_age 的相对时间。
+    仅在需要时间锚点时使用（例如刚被叫醒、刚起床、消息行时间标签），
+    相对时间用于工具结果的「多久之前」描述。
     """
     if not ts:
         return ""

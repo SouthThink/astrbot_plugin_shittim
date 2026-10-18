@@ -13,12 +13,7 @@
 
 from __future__ import annotations
 
-try:
-    from astrbot.api import logger
-except ImportError:  # pragma: no cover
-    import logging
-
-    logger = logging.getLogger(__name__)
+from astrbot.api import logger
 
 from ..common.model_json import parse_model_json
 from ..common.tokenizer import extract_keywords

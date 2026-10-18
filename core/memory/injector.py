@@ -5,7 +5,8 @@
 记忆注入最常见的失败模式是模型开始复述记忆、将记忆作为回复主题，
 表现为「只会谈论记忆相关内容」。因此：
 - 注入块包含显式反指令，明确记忆仅作背景，不得成为回复主题
-- 注入到 req.contexts 的独立消息中，并标记 _no_save，**不写入 system_prompt**
+- 由 main 追加到 `req.extra_user_content_parts`（`mark_as_temp()` 不写入持久历史），
+  **不修改 req.contexts、不写入 system_prompt**
   （system_prompt 属于强指令区，置于其中会放大记忆权重）
 - 同时受 token 预算与条数上限约束
 
@@ -22,12 +23,12 @@
 却能提示「还存在这些记忆」，从而触发主动回想。
 
 作息事件提示（被叫醒 / 刚起床）由同一文件的另一入口生成：它属于**时效性事件
-通知**，与记忆背景块方向相反——记忆块插在时间线之前，它追加在末尾。
+通知**，与记忆背景块方向相反——记忆块是长期背景，它描述刚刚发生的事，
+因此前者先追加、后者最后追加。
 """
 
 from __future__ import annotations
 
-import time
 from collections.abc import Sequence
 
 from ..common.time_utils import format_clock
@@ -126,21 +127,6 @@ def _render_block(header: str, lines: list[str], budget: int) -> tuple[str, int]
     if not kept:
         return "", 0
     return "\n".join([header, *kept, _BLOCK_CLOSE]), used
-
-
-def build_injected_entry(block: str) -> dict:
-    """构造一条注入条目。
-
-    单独暴露构造、而不是直接追加到 req.contexts，是因为注入顺序就是模型的
-    读取顺序：我们需要把背景块**放在原生历史之前**，而不是一律追加到末尾。
-    """
-    return {
-        "role": "user",
-        "content": block,
-        "_no_save": True,
-        # 供排障：注入时刻，便于对照日志确认是否命中
-        "_shittim_injected_at": time.time(),
-    }
 
 
 # ── 作息事件提示 ──────────────────────────────────────────

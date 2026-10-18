@@ -53,7 +53,7 @@ class MemoryConfig:
 
     # ── 短期层 ────────────────────────────────────────────
     # 跨会话语境：按会话配额读取，而非全局取最近 N 条，避免高频会话
-    # 挤占其它会话的展示配额。仅供决断层与巡检使用（提示词无法容纳完整时间线）
+    # 挤占其它会话的展示额度。决断层、巡检与跨会话背景块共用这组配额。
     short_term_context_per_chat: int = 6  # 每个会话的消息条数
     short_term_context_chats: int = 6     # 最多纳入的会话数
     short_term_context_tokens: int = 2000 # 该部分的 token 预算
@@ -61,12 +61,12 @@ class MemoryConfig:
     # 单次整理仅执行一轮压缩，避免消息高峰期一次性压缩全部条目。
     condense_threshold: int = 300         # 触发压缩的条目总数阈值
     condense_batch: int = 100             # 单次压缩的条目数
-    # ── 全局时间线（主脑唯一的上下文）────────────────────
-    # 所有会话按时间排列为同一条时间线，切换会话不切换上下文。见 memory/timeline.py。
-    # 时间线覆盖当天全部消息，预算应结合模型窗口设置；超出后从最旧条目开始丢弃，
-    # 优先保留最近发生的对话。
-    timeline_max_messages: int = 400      # 单次返回的条目数上限（SQL 层硬上限）
-    timeline_token_budget: int = 8000     # 整条时间线的 token 上限
+    # ── 跨会话背景 ────────────────────────────────────────
+    # 追加在最后一条 user 消息之后（extra_user_content_parts），不修改原生历史。
+    # 只补充原生历史看不到的内容：其它会话的近况与当前会话被拦下的消息。
+    # 见 memory/timeline.py；超出预算后从最旧条目开始丢弃，优先保留最近对话。
+    timeline_max_messages: int = 400      # 单次返回的条目数上限（硬上限）
+    timeline_token_budget: int = 8000     # 整段背景的 token 上限
     # 请求发出前移除无法读取的图片引用：单张坏图会导致上游以 400 拒绝整条请求，
     # AstrBot 随后会将本轮切换到备用模型（人格与工具均会变化）
     strip_invalid_images: bool = True

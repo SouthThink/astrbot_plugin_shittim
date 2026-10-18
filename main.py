@@ -43,6 +43,7 @@ from astrbot.api import logger
 from astrbot.api.event import AstrMessageEvent, MessageChain, filter
 from astrbot.api.message_components import Plain
 from astrbot.api.star import Context, Star, register
+from astrbot.core.agent.message import TextPart
 from astrbot.core.star.star_tools import StarTools
 
 from .core.common.config import (
@@ -81,7 +82,6 @@ from .core.memory.history import (
 from .core.memory.injector import (
     NOTICE_AWAKENED,
     NOTICE_WAKE,
-    build_injected_entry,
     build_memory_blocks,
     build_schedule_notice,
 )
@@ -93,7 +93,7 @@ from .core.memory.ledger import (
 )
 from .core.memory.maintenance import MemoryMaintainer
 from .core.memory.store import MemoryStore
-from .core.memory.timeline import build_timeline
+from .core.memory.timeline import build_timeline_block
 from .core.memory.vision import ImageCaptioner
 from .core.schedule.state import (
     AWAKE,
@@ -123,14 +123,13 @@ _PRIORITY_GATE = 90
 _PRIORITY_SLEEP = 95
 # 工具清理与上下文注入
 _PRIORITY_TOOLS = 60
-# 上下文注入必须**晚于**所有会重写 req.contexts 的插件。
+# 上下文注入晚于其它上下文插件，确保追加的内容排在它们之后。
 # AstrBot 的 on_llm_request 按 priority 从大到小执行（数值越大越早），
-# 而天使之心（50）会用自己重建的历史整体覆盖 req.contexts——若我们排在
-# 它前面，注入块和它看不见的回合会被直接抹掉。天使记忆（40）走 append、
-# tool_use_cleaner（0）会重建 contexts，所以取负值排到它们之后，
-# 做上下文成型前的最后一手。
+# 天使之心（50）会用自己重建的历史覆盖 req.contexts，tool_use_cleaner（0）
+# 会重建 contexts；本插件只向 extra_user_content_parts 追加临时内容，
+# 不修改 req.contexts，因此取负值排在它们之后即可。
 _PRIORITY_INJECT = -10
-# 坏图清理：与记忆开关无关，且要看得到所有插件处理后的最终上下文，
+# 坏图清理：与记忆开关无关，且要看到所有插件处理后的最终上下文，
 # 因此排在注入之后，作为发往模型前的最后一道保险。
 _PRIORITY_IMAGE_GUARD = -20
 # 结果装饰：置于最后执行，待其它插件完成后由本插件决定是否发送
@@ -155,29 +154,6 @@ _SLEEP_TICK_SECONDS = 60.0
 
 # 阶段的中文说法：日志、工具返回、记忆页面共用同一套，避免三处各写一份
 _PHASE_LABELS = {AWAKE: "清醒", SLEEP_LIGHT: "浅睡", DEEP: "深睡"}
-
-
-def _persona_dialogs(contexts) -> list[dict]:
-    """取出 AstrBot 插入在上下文最前的人格**预设对话**。
-
-    AstrBot 在 `_ensure_persona_and_skills()` 中将人格的 `begin_dialogs` 通过
-    `req.contexts[:0] = ...` 插入最前，且每条都带 `_no_save`；随后才执行
-    本插件的 `on_llm_request`。整体替换上下文时必须原样保留这些条目，
-    否则人格预设对话会被静默移除。
-
-    **人格说明本身不在 contexts 中**——它位于 `req.system_prompt`
-    （`# Persona Instructions`），本插件不改写该字段。
-
-    仅取**头部连续**的 `_no_save` 段：AstrBot 插入的是连续一段，而插件在
-    其他位置追加的系统条目（如文件解析结果）不带该标记，不会被误判。
-    """
-    kept: list[dict] = []
-    for item in contexts or []:
-        if isinstance(item, dict) and item.get("_no_save"):
-            kept.append(item)
-            continue
-        break
-    return kept
 
 
 def _plugin_version() -> str:
@@ -720,8 +696,8 @@ class ShittimPlugin(Star):
 
         私聊无需模型判定是否回复，但需要等待：用户常将一句话拆成多条发送，
         立即回复会造成打断。窗口复用巡检器的静默模式：窗口内旧事件以 KILL
-        结束，仅最后一条持有窗口；被 KILL 的消息仍记录在账本中，主脑通过
-        全局时间线读取完整对话，只是等到该段结束后统一回复。
+        结束，仅最后一条持有窗口；被 KILL 的消息仍记录在账本中（`gated=1`），
+        由跨会话背景补齐，只是等到该段结束后统一回复。
         """
         seconds = self._private_debounce_seconds()
         chat_id = event.unified_msg_origin or ""
@@ -881,24 +857,24 @@ class ShittimPlugin(Star):
 
     @filter.on_llm_request(priority=_PRIORITY_INJECT)
     async def inject_memory_context(self, event: AstrMessageEvent, req):
-        """在请求发送给主模型前，将上下文替换为全局时间线，并注入记忆。
+        """在请求发往主模型前，向 user 消息追加临时背景内容。
 
-        必须晚于会重写 `req.contexts` 的插件（天使之心，50）：该插件会用
-        自行重建的历史覆盖 contexts，本插件后执行才能将上下文替换为时间线，
-        避免被覆盖。优先级语义见 `_PRIORITY_INJECT`。
+        不修改 `req.contexts`：原生历史既是按会话隔离的对话，也是 prompt 缓存的
+        稳定前缀，整体替换会丢弃前者并破坏后者。这里只把追加内容写进
+        `req.extra_user_content_parts`，并以 `mark_as_temp()` 保证它们不进入
+        持久历史。
 
-        结果顺序即模型读取顺序：
+        追加顺序即模型读取顺序（都跟在当前消息之后）：
 
-            ① 永久记忆 → ② 长期记忆 →（全局时间线）→ 当前消息 → ③ 作息事件提示
+            ① 永久记忆 → ② 长期记忆 → ③ 记忆索引 → ④ 跨会话背景 → ⑤ 作息事件提示
 
-        ①② 为**长期背景**，插入时间线之前；③ 为**时效事件**（刚被叫醒、刚起床），
-        追加在最新处。顺序反转会将近期事件描述为较早发生的事件。
+        ①②③ 为长期背景，④ 补充原生历史看不到的会话语境，⑤ 是刚发生的时效事件，
+        因此排在最后。当前消息正文由 `req.prompt` 承载，位置在这些内容之前。
         """
         if not self._memory_active() and not self._schedule_active():
             return
         try:
-            contexts = getattr(req, "contexts", None)
-            if not isinstance(contexts, list):
+            if not isinstance(getattr(req, "contexts", None), list):
                 return
 
             if self._memory_active():
@@ -914,61 +890,102 @@ class ShittimPlugin(Star):
     def _inject_memory_blocks(
         self, event: AstrMessageEvent, req, chat_id: str
     ) -> None:
-        """使用全局时间线重建上下文，并将记忆块插入最前。"""
-        # 1) 时间线：丢弃 AstrBot 的按会话历史，替换为统一的记忆流。
-        #    必须在插入记忆块之前执行，否则下次请求会将注入块视为历史消息。
-        self._rebuild_timeline(req, chat_id)
+        """把记忆块与跨会话背景追加为临时内容。"""
+        blocks: list[str] = []
 
-        prefix: list[dict] = []
-
-        # 2) 记忆块：① 永久记忆全量 → ② 榜前 auto_top 条正文 → ③ 其后 auto_index
-        #    条关键词索引。**自动插入不计入「被想起」**：仅主动 recall 才计入，
-        #    否则榜前条目会相互提升排名，导致榜单停止更新。
+        # ① 永久记忆全量 → ② 榜前 auto_top 条正文 → ③ 其后 auto_index 条关键词索引。
+        # **自动插入不计入「被想起」**：仅主动 recall 才计入，否则榜前条目会
+        # 相互提升排名，导致榜单停止更新。
         permanent = self.memory_store.permanents()
         bodies, index = self.memory_store.auto_injection()
-        for block in build_memory_blocks(
-            permanent=permanent,
-            bodies=bodies,
-            index=index,
-            token_budget=self.memory_config.recall_token_budget,
-        ):
-            prefix.append(build_injected_entry(block))
+        blocks.extend(
+            build_memory_blocks(
+                permanent=permanent,
+                bodies=bodies,
+                index=index,
+                token_budget=self.memory_config.recall_token_budget,
+            )
+        )
 
-        if prefix:
-            req.contexts = prefix + req.contexts
+        blocks.append(self._cross_session_block(event, req, chat_id))
+        self._append_temp_parts(req, blocks)
 
-    def _rebuild_timeline(self, req, chat_id: str) -> None:
-        """将整条时间线写回 `req.contexts`。
+    def _cross_session_block(
+        self, event: AstrMessageEvent, req, chat_id: str
+    ) -> str:
+        """生成跨会话背景文本块。
 
-        AstrBot 的历史按会话隔离，而本插件采用统一人格：切换会话不应切换记忆。
-        因此不做叠加，而是整体替换——主脑始终读取连续的经历，仅最后一条消息
-        来自不同会话。
+        统一人格要求她记得别处发生的事，但原生历史只覆盖当前会话，因此这里补上
+        其它会话的消息、摘要，以及当前会话中被拦下（未进入原生历史）的消息。
 
-        人格预设对话需要保留（见 `_persona_dialogs`）：它们属于稳定人格，
-        而非经历，排在时间线之前。
-
-        发生异常时保留 AstrBot 原生历史（不清空 contexts），优先保证上下文可用。
+        取样按**会话配额**而非全局最新：一个刷屏的群聊不该把别的会话从背景里
+        挤掉，否则切回那些会话时记忆就断了。
         """
-        # 必须在替换前读取：这些条目随后会被整体替换
-        persona = _persona_dialogs(getattr(req, "contexts", None))
         try:
-            entries = self.short_term.timeline_entries(
-                self.memory_config.timeline_max_messages
-            )
-            rendered = build_timeline(
-                entries,
-                current_prompt=str(getattr(req, "prompt", "") or ""),
-                token_budget=self.memory_config.timeline_token_budget,
-            )
-            req.contexts = persona + rendered
-            logger.debug(
-                "[什亭之枢] 时间线重建 | %s | %d 条（人格预设 %d 条）",
-                chat_id,
-                len(rendered),
-                len(persona),
+            entries = self.short_term.timeline_entries_balanced(
+                per_chat=self.memory_config.short_term_context_per_chat,
+                max_chats=self.memory_config.short_term_context_chats,
+                limit=self.memory_config.timeline_max_messages,
+                current_chat_id=chat_id,
             )
         except Exception as error:
-            logger.error("[什亭之枢] 时间线重建失败，保留原生上下文: %s", error)
+            logger.error("[什亭之枢] 跨会话背景读取失败: %s", error)
+            return ""
+        if not entries:
+            return ""
+
+        # 当前消息由 req.prompt 承载，若同时出现在背景块里会重复一次。
+        current_id = int(get_extra(event, EXTRA_MESSAGE_ID, 0) or 0)
+        if current_id:
+            entries = [
+                entry
+                for entry in entries
+                if entry.get("kind") != "message"
+                or int(entry["row"]["id"] or 0) != current_id
+            ]
+
+        try:
+            chat_label = describe_chat(event)[1]
+        except Exception:
+            chat_label = ""
+        return build_timeline_block(
+            entries,
+            current_chat_id=chat_id,
+            chat_label=chat_label,
+            include_current=not self._has_native_history(req),
+            token_budget=self.memory_config.timeline_token_budget,
+        )
+
+    @staticmethod
+    def _has_native_history(req) -> bool:
+        """原生历史里是否已有真实对话。
+
+        人格预设对话由 AstrBot 以 `_no_save` 插在 contexts 最前，它们属于人格，
+        不算经历。历史为空（新会话或被重置）时需要把当前会话的条目也补进背景块，
+        否则主脑会完全失忆。
+        """
+        contexts = getattr(req, "contexts", None)
+        if not isinstance(contexts, list):
+            return False
+        for item in contexts:
+            if isinstance(item, dict) and not item.get("_no_save"):
+                return True
+        return False
+
+    @staticmethod
+    def _append_temp_parts(req, blocks: list[str]) -> None:
+        """把文本块追加到 `extra_user_content_parts`，不进入持久历史。"""
+        parts = getattr(req, "extra_user_content_parts", None)
+        if not isinstance(parts, list):
+            logger.warning(
+                "[什亭之枢] 当前 AstrBot 版本缺少 req.extra_user_content_parts，"
+                "记忆与作息提示无法注入"
+            )
+            return
+        for block in blocks:
+            if not block:
+                continue
+            parts.append(TextPart(text=block).mark_as_temp())
 
     def _notice_kind(self, state: dict) -> str:
         """待注入的作息事件类型；没有则返回空串。
@@ -988,9 +1005,9 @@ class ShittimPlugin(Star):
         return ""
 
     def _inject_schedule_notice(self, req) -> None:
-        """将作息事件提示追加到上下文末尾，并消费待注入标记。
+        """将作息事件提示追加到当前请求，并消费待注入标记。
 
-        必须持久化「是否已注入」：注入块每轮请求都会重建，若不记录标记，
+        必须持久化「是否已注入」：提示每轮请求都会重建，若不记录标记，
         该提示会在醒来后的每一轮对话中重复出现。
         """
         if not self._schedule_active():
@@ -999,9 +1016,6 @@ class ShittimPlugin(Star):
             state = self.sleep_state.load()
             kind = self._notice_kind(state)
             if not kind:
-                return
-            contexts = getattr(req, "contexts", None)
-            if not isinstance(contexts, list):
                 return
 
             now = time.time()
@@ -1025,7 +1039,7 @@ class ShittimPlugin(Star):
                 total=total,
                 digest=digest,
             )
-            contexts.append(build_injected_entry(notice))
+            self._append_temp_parts(req, [notice])
             self.sleep_state.save(wake_notice_pending=0, wake_notice_fired_at=now)
             logger.info(
                 "[什亭之枢] 注入作息提示 | %s | 睡眠期消息 %d 条",

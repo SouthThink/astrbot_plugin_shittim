@@ -12,12 +12,7 @@ from __future__ import annotations
 
 import time
 
-try:
-    from astrbot.api import logger
-except ImportError:  # pragma: no cover
-    import logging
-
-    logger = logging.getLogger(__name__)
+from astrbot.api import logger
 
 from .store import (
     LEVEL_FULL,

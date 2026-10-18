@@ -15,15 +15,10 @@
 
 from __future__ import annotations
 
-try:
-    from astrbot.api import logger
-except ImportError:  # pragma: no cover
-    import logging
-
-    logger = logging.getLogger(__name__)
-
 import time
 from dataclasses import dataclass
+
+from astrbot.api import logger
 
 from ..common.event_utils import (
     get_message_text,

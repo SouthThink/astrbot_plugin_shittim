@@ -32,12 +32,7 @@ import os
 import time
 from urllib.parse import unquote, urlparse
 
-try:
-    from astrbot.api import logger
-except ImportError:  # pragma: no cover
-    import logging
-
-    logger = logging.getLogger(__name__)
+from astrbot.api import logger
 
 # 单张图片大小上限：超出则不转述，避免大图占用请求体积
 _MAX_IMAGE_BYTES = 10 * 1024 * 1024

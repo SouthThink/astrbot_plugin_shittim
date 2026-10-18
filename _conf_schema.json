@@ -56,12 +56,12 @@
         "default": 2
       },
       "short_term_context_per_chat": {
-        "description": "跨会话语境（仅供决断层与巡检参考）中每个会话取的消息上限（条）",
+        "description": "跨会话语境中每个会话取的消息上限（条），同时用于决断层、巡检与跨会话背景",
         "type": "int",
         "default": 6
       },
       "short_term_context_chats": {
-        "description": "跨会话语境纳入的会话上限（个）",
+        "description": "跨会话语境纳入的会话上限（个），同时用于决断层、巡检与跨会话背景",
         "type": "int",
         "default": 6
       },
@@ -81,12 +81,12 @@
         "default": 100
       },
       "timeline_max_messages": {
-        "description": "全局时间线单次最多包含的条目数（条）",
+        "description": "跨会话背景单次最多包含的条目数（条）",
         "type": "int",
         "default": 400
       },
       "timeline_token_budget": {
-        "description": "全局时间线的 token 上限（主脑唯一上下文），超出时从最旧条目开始丢弃",
+        "description": "跨会话背景的 token 上限，超出时从最旧条目开始丢弃",
         "type": "int",
         "default": 8000
       },

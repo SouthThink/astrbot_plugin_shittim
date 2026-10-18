@@ -14,7 +14,7 @@ import time
 
 from ..common.db import MemoryDB
 from ..common.event_utils import build_chat_label
-from ..common.time_utils import format_age
+from ..common.time_utils import format_clock
 from ..common.tokenizer import estimate_tokens
 
 _ROLE_LABEL_ASSISTANT = "你"
@@ -79,8 +79,8 @@ def format_speech(row) -> str:
 def format_message_line(row: sqlite3.Row) -> str:
     """把一条短期消息格式化成带来源与时间标记的一行。
 
-    时间标签用于区分消息的新旧程度：没有它，模型只能看到顺序，
-    无法判断消息发生在多久之前。采用相对时间而非绝对时间，判断新旧无需额外锚点。
+    时间标签采用**绝对时间戳**而非相对时间：相对时间每轮都在变化，
+    同一行在两次请求中的文本不一致，会降低 prompt 缓存命中率。
 
     图片描述同理：AstrBot 对图片只提供「[图片]」占位，若不补充描述，
     该图片在上下文中即不可见。
@@ -103,7 +103,7 @@ def format_message_line(row: sqlite3.Row) -> str:
     except (KeyError, IndexError, TypeError, ValueError):
         created_at = 0.0
     if created_at > 0:
-        time_tag = f" ({format_age(time.time() - created_at)})"
+        time_tag = f" ({format_clock(created_at)})"
     return f"[{row['chat_label']}] {speaker}{time_tag}: {content}"
 
 
@@ -299,22 +299,76 @@ class ShortTermLedger:
     # 两者共同构成时间线，也共同参与下一次压缩的取材——旧摘要只是一个占名额的
     # 普通条目，这正是「二次合并无需特殊处理」的实现方式。
 
-    def timeline_entries(self, limit: int) -> list[dict]:
-        """时间线的条目：取**最新**的 limit 个，按时间正序返回。
+    def timeline_entries_balanced(
+        self,
+        *,
+        per_chat: int,
+        max_chats: int,
+        limit: int,
+        current_chat_id: str = "",
+    ) -> list[dict]:
+        """按**会话配额**取时间线条目，再整体按时间正序返回。
 
-        过滤条件使其天然「只保留最近」：
+        与 `live_entries()` 共用同一份 `_LIVE_SQL` 与 `staged = 0` 过滤条件，
+        区别只在于取样：
 
-        - `_LIVE_SQL`：归档与被压入摘要的行均不返回。归档发生在深睡整理中，
-          醒来后时间线从该时刻重新累积；被压缩的段落由摘要代表。
-        - `staged = 0`：睡眠期暂存消息不进入时间线（该时段尚未处理）。被叫醒或
-          起床时 `release_staged()` 清除该标记，这些消息才以「睡觉时收到」的
-          形式出现在时间线开头。
+        - 直接取「全局最新 limit 条」时，一个刷屏的群聊会占满窗口，其它会话
+          被挤出去——切回那些会话时就显得「断片」。这里先给每个会话留出最近
+          `per_chat` 条，再合并排序，保证每个会话的连续性都不被邻居挤掉。
+        - 只纳入最近活跃的 `max_chats` 个会话；**当前会话始终入选**，且它被
+          拦下（`gated = 1`）的消息全量保留——这些消息没进官方历史，丢掉就
+          等于主脑没看见那几句话。
+        - 全部活摘要一并保留：它们是压缩后的概要，没有 `chat_id`，
+          无法按会话归属。
+
+        `limit` 仍作为最终条数上限，超出时从最旧条目开始丢弃。
         """
         if limit <= 0:
             return []
-        entries = self._entry_rows(order="DESC", limit=int(limit))
-        entries.sort(key=_entry_sort_key)
-        return entries[-int(limit) :]
+        per_chat = max(int(per_chat), 1)
+        max_chats = max(int(max_chats), 1)
+
+        summaries: list[dict] = []
+        grouped: dict[str, list[dict]] = {}
+        for entry in self.live_entries():
+            if entry.get("kind") == "summary":
+                summaries.append(entry)
+                continue
+            row = entry["row"]
+            grouped.setdefault(str(row["chat_id"] or ""), []).append(entry)
+
+        # 会话按最近活跃排序；当前会话必须入选，否则切回来时那几句话就丢了
+        order = sorted(
+            grouped, key=lambda chat: grouped[chat][-1]["at"], reverse=True
+        )
+        picked = set(order[:max_chats])
+        if current_chat_id in grouped:
+            picked.add(current_chat_id)
+
+        kept: list[dict] = []
+        for chat in picked:
+            rows = grouped[chat]
+            kept.extend(rows[-per_chat:])
+            if chat == current_chat_id:
+                # 被拦下的消息通常就在最近几条里，这里仍单独补一次，
+                # 避免一次防抖窗口内连发多条时被配额截掉
+                kept.extend(
+                    entry
+                    for entry in rows
+                    if int(entry["row"]["gated"] or 0) == 1
+                )
+
+        merged = summaries + kept
+        merged.sort(key=_entry_sort_key)
+        deduped: list[dict] = []
+        seen: set[tuple[str, int]] = set()
+        for entry in merged:
+            key = (str(entry.get("kind")), int(entry["row"]["id"] or 0))
+            if key in seen:
+                continue
+            seen.add(key)
+            deduped.append(entry)
+        return deduped[-int(limit) :]
 
     def oldest_entries(self, limit: int) -> list[dict]:
         """取**最旧**的 limit 个条目，按时间正序（短期压缩的取材范围）。"""
