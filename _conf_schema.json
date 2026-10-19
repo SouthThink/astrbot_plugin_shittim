@@ -20,12 +20,12 @@
         "default": 12
       },
       "extract_include_events": {
-        "description": "压缩时纳入当天事件及其结论，而非仅保留稳定事实（关闭后更精简，但可能无法回忆前一天的对话）",
+        "description": "压缩时纳入当天事件与结论（关闭后更精简，但可能回忆不起前一天的对话）",
         "type": "bool",
         "default": true
       },
       "extract_min_strength": {
-        "description": "压缩结果的最低强度，低于此值丢弃（强度值）",
+        "description": "压缩产出的记忆强度低于该值时丢弃（1~10；默认 1 表示不过滤）",
         "type": "float",
         "default": 1.0
       },
@@ -51,17 +51,17 @@
         "default": 2
       },
       "short_term_context_per_chat": {
-        "description": "跨会话语境（决断层、巡检与未接管上下文时的主脑连续性块）中每个会话取的消息上限（条）",
+        "description": "跨会话取样：每个会话最多取多少条消息（判定与主脑背景共用）",
         "type": "int",
         "default": 6
       },
       "short_term_context_chats": {
-        "description": "跨会话语境纳入的会话上限（个）",
+        "description": "跨会话取样：最多纳入多少个会话（判定与主脑背景共用）",
         "type": "int",
         "default": 6
       },
       "short_term_context_tokens": {
-        "description": "跨会话语境的 token 预算（token）",
+        "description": "判定用跨会话语境的 token 预算（决断层与巡检；主脑背景用 timeline_token_budget）",
         "type": "int",
         "default": 2000
       },
@@ -76,17 +76,17 @@
         "default": 100
       },
       "context_takeover": {
-        "description": "是否接管主脑上下文（关闭时沿用 AstrBot 原生按会话历史，仅追加临时记忆块；开启后用全局时间线替换 req.contexts，会破坏原生前缀缓存，默认关闭）",
+        "description": "接管主脑上下文：开启后用全局时间线替换原生上下文（会破坏前缀缓存）；关闭时只追加临时记忆块",
         "type": "bool",
         "default": false
       },
       "timeline_max_messages": {
-        "description": "跨会话背景与接管时间线单次最多包含的条目数（条）",
+        "description": "主脑跨会话背景 / 接管时间线的条目上限（条）",
         "type": "int",
         "default": 400
       },
       "timeline_token_budget": {
-        "description": "跨会话背景与接管时间线的 token 上限，超出时从最旧条目开始丢弃",
+        "description": "主脑跨会话背景 / 接管时间线的 token 上限，超出时从最旧条目开始丢弃",
         "type": "int",
         "default": 8000
       },
@@ -101,7 +101,7 @@
         "default": 10
       },
       "auto_index": {
-        "description": "榜前正文之后以关键词索引呈现的记忆条数，用于提示仍存在未展开的记忆（条）",
+        "description": "榜前正文之后仅以关键词索引呈现的记忆条数（条）",
         "type": "int",
         "default": 30
       },
@@ -126,7 +126,7 @@
         "default": 1600
       },
       "maintenance_enabled": {
-        "description": "是否启用记忆维护（降级 / 遗忘 / 晋升 / 合并）",
+        "description": "记忆维护（降级 / 遗忘 / 晋升 / 合并）开关；不影响短期压缩与深睡收口",
         "type": "bool",
         "default": true
       },
@@ -177,7 +177,7 @@
     "type": "object",
     "items": {
       "enabled": {
-        "description": "是否接管对话",
+        "description": "启用拦放判定；关闭后所有消息交由 AstrBot 原生流程处理",
         "type": "bool",
         "default": true
       },
@@ -188,17 +188,22 @@
         "_special": "select_provider"
       },
       "always_reply_private": {
-        "description": "私聊消息直接回复，不经决策模型",
+        "description": "私聊一定回复（仍经过静默防抖），不调用决策模型",
         "type": "bool",
         "default": true
       },
       "private_debounce_seconds": {
-        "description": "私聊防抖：发出后静默这么久没有下一条消息才回复（秒），设为 0 立即回复",
+        "description": "静默防抖：私聊与群内 @ 在最后一条消息之后静默这么久才回复（秒），设为 0 立即回复",
         "type": "float",
         "default": 10.0
       },
+      "private_debounce_max_seconds": {
+        "description": "静默防抖的最长等待：持续有人说话也会到点回复，设为 0 表示不封顶（秒）",
+        "type": "float",
+        "default": 60.0
+      },
       "always_reply_when_mentioned": {
-        "description": "被 @ 或叫到名字时直接回复，不经决策模型",
+        "description": "被 @ 时一定回复（仍要防抖）；文本里只是提到名字时交给判定模型确认是否在叫她",
         "type": "bool",
         "default": true
       },
@@ -208,38 +213,38 @@
         "default": true
       },
       "aliases": {
-        "description": "智能体名称与唤醒词，文本命中时视为被点名",
+        "description": "智能体名称与唤醒词；文本中出现时视为提到名字，是否在叫她由判定模型确认",
         "type": "list",
         "items": { "type": "string" },
         "default": []
       },
       "disable_builtin_send_tool": {
-        "description": "摘除 AstrBot 内置的 send_message_to_user（参数写错时会发到当前会话）",
+        "description": "摘除内置 send_message_to_user：参数错误时会静默发到当前会话，并绕过焦点与白名单校验",
         "type": "bool",
         "default": true
       },
       "context_messages": {
-        "description": "判定上下文中每个会话的近期消息条数上限；当前会话的窗口前文按同一上限补充（条）",
+        "description": "判定上下文：其它会话的近期消息条数上限，也用于补窗口前文（条）",
         "type": "int",
         "default": 6
       },
       "patrol_enabled": {
-        "description": "群聊巡检：聚合一段时间内的消息后统一判定，不逐条调用模型",
+        "description": "群聊聚合判定：等对话安静后统一判定；关闭后改为逐条立即判定（@ 仍走静默防抖）",
         "type": "bool",
         "default": true
       },
       "patrol_window_seconds": {
-        "description": "巡检窗口：会话安静多久后判定一次（秒）",
+        "description": "巡检窗口：最后一条群消息之后安静多久才判定，期间有新消息会重新计时（秒）",
         "type": "float",
-        "default": 5.0
-      },
-      "patrol_max_wait_seconds": {
-        "description": "巡检封顶：一直有人说话时的最长等待（秒）",
-        "type": "float",
-        "default": 20.0
+        "default": 10.0
       },
       "patrol_cooldown_seconds": {
-        "description": "判为不回后该会话的冷却时长（秒）",
+        "description": "判为不回后该会话的冷却时长：期间不调用模型、不处理积压，@ 仍可穿透（秒）",
+        "type": "float",
+        "default": 60.0
+      },
+      "patrol_reply_cooldown_seconds": {
+        "description": "开口后该会话的最小回复间隔，避免活跃群连续接话；@ 与私聊不受限制，设为 0 关闭（秒）",
         "type": "float",
         "default": 60.0
       },
@@ -271,7 +276,7 @@
     "type": "object",
     "items": {
       "enabled": {
-        "description": "启用作息状态机（关闭后不限制在线时段）",
+        "description": "启用作息状态机；关闭后不限制在线时段，也不会自动整理记忆",
         "type": "bool",
         "default": true
       },
@@ -301,7 +306,7 @@
         "default": 120
       },
       "wake_signal_window_minutes": {
-        "description": "叫醒信号的有效窗口（分钟）",
+        "description": "同一会话的 @ / 私聊信号在该时间窗口内累计（分钟）",
         "type": "int",
         "default": 5
       },
@@ -316,12 +321,12 @@
         "default": 10
       },
       "curation_enabled": {
-        "description": "深睡期是否执行记忆整理（短期收口 / 降级 / 遗忘 / 晋升 / 合并 / 清空账本）",
+        "description": "深睡期记忆整理总开关：含维护、短期收口与清空；关闭后不会自动整理",
         "type": "bool",
         "default": true
       },
       "curation_force_after_hours": {
-        "description": "兜底策略：距上次整理超过该时长仍未整理（例如未进入深睡）时强制执行一次维护，但不清理账本（小时）",
+        "description": "兜底整理：距上次整理超过该时长时强制执行一次维护，但不收口、不清空账本（小时）",
         "type": "int",
         "default": 48
       },
@@ -336,7 +341,7 @@
         "default": 20
       },
       "daily_reset_enabled": {
-        "description": "整理后把当天账本移入归档（从上下文与常规查询中排除，数据仍保留）",
+        "description": "整理后清空当天短期账本；数据转为归档保留，仍可回查",
         "type": "bool",
         "default": true
       },
@@ -364,6 +369,7 @@
       "allowed_targets": {
         "description": "主动发送的目标白名单，格式 private:QQ号 或 group:群号，留空表示不限制",
         "type": "list",
+        "items": { "type": "string" },
         "default": []
       },
       "rate_limit_per_minute": {

@@ -26,6 +26,8 @@ _FALLBACK_COMMAND_PREFIXES = ("/",)
 EXTRA_MESSAGE_ID = "shittim_message_id"
 # 本轮已通过 say 切换到其它会话（值为目标 umo）。据此抑制原会话的收尾发言。
 EXTRA_LEFT_TO = "shittim_left_to"
+# 主脑主动决定本轮不发言：结果装饰时丢弃整条消息链。
+EXTRA_SILENT = "shittim_silent"
 
 
 def call_str(event, method_name: str, default: str = "") -> str:

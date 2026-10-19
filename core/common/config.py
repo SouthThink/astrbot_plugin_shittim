@@ -1,4 +1,4 @@
-"""记忆系统配置。
+"""各域配置的数据类定义。
 
 配置来源是 AstrBot 注入的插件配置 dict（由 _conf_schema.json 定义），
 所有取值都带默认值回退，配置缺失不会导致初始化失败。
@@ -43,7 +43,7 @@ class MemoryConfig:
     # ── 压缩 ──────────────────────────────────────────────
     extract_provider_id: str = ""
     extract_max_items: int = 12           # 单次压缩同时产出的长期记忆条数上限
-    extract_min_strength: float = 1.0     # 低于该强度的压缩结果直接丢弃（仅作质量闸门，不再入库）
+    extract_min_strength: float = 1.0     # 压缩产出的记忆强度低于该值丢弃（1~10；默认不过滤）
     # 压缩时是否纳入当天事件及其结论，而非仅保留稳定事实。关闭后长期记忆更精简，
     # 代价是无法回忆前一天的对话（见计划 §9.4）
     extract_include_events: bool = True
@@ -52,12 +52,12 @@ class MemoryConfig:
     forget_stale_days: int = 7            # 连续未召回天数
 
     # ── 短期层 ────────────────────────────────────────────
-    # 跨会话语境：按会话配额读取，而非全局取最近 N 条，避免高频会话
-    # 挤占其它会话的展示配额。用于决断层、巡检，以及未接管上下文时的
-    # 主脑跨会话连续性块。
+    # 跨会话取样：按会话配额读取，而非全局取最近 N 条，避免高频会话
+    # 挤占其它会话的展示配额。per_chat / chats 同时供决断层、巡检与
+    # 主脑跨会话背景使用；tokens 只用于判定侧的 `build_recent_block`。
     short_term_context_per_chat: int = 6  # 每个会话的消息条数
     short_term_context_chats: int = 6     # 最多纳入的会话数
-    short_term_context_tokens: int = 2000 # 该部分的 token 预算
+    short_term_context_tokens: int = 2000 # 判定侧跨会话语境的 token 预算
     # 短期压缩（§4.2）：条目总数超过阈值时，将最旧的一批压缩为一条摘要。
     # 单次整理仅执行一轮压缩，避免消息高峰期一次性压缩全部条目。
     condense_threshold: int = 300         # 触发压缩的条目总数阈值
@@ -99,6 +99,8 @@ class MemoryConfig:
     recall_min_score: float = 0.18        # 低于该分数的记忆不返回
 
     # ── 维护 ──────────────────────────────────────────────
+    # 只控制维护步骤（降级 / 遗忘 / 晋升 / 合并）；深睡是否整理由
+    # schedule.curation_enabled 决定。
     maintenance_enabled: bool = True
     decay_half_life_days: float = 30.0    # 召回打分里的时间近因半衰期（天）
     promote_min_recall: int = 8           # 晋升永久记忆所需召回次数
@@ -171,10 +173,14 @@ class DecisionConfig:
     provider_id: str = ""
     # 私聊直接放行（不调用决策模型）
     always_reply_private: bool = True
-    # 私聊防抖：最后一条消息之后静默该时长才唤醒主脑（秒），0 表示立即回复。
-    # 用于避免用户连续发送多条消息时被中途打断：连续多条视为同一轮，聚合后再回复。
+    # 静默防抖：私聊与群内 @ 在最后一条消息之后静默该时长才唤醒主脑（秒），
+    # 0 表示立即回复。用于避免对方连续发送多条消息时被中途打断：连续多条
+    # 视为同一轮，聚合后再回复。文本提到名字走巡检窗口，不受此项控制。
     private_debounce_seconds: float = 10.0
-    # 被 @ 或命中名称时直接放行
+    # 静默窗口的最长等待：持续有人说话时也到点放行，避免回复被无限推迟。
+    # 0 表示不封顶。
+    private_debounce_max_seconds: float = 60.0
+    # 被 @ 时直接判定要回（仍走静默防抖）；文本出现名称时交给判定模型确认
     always_reply_when_mentioned: bool = True
     # 上游指令（/命令、skill）优先放行，否则指令将无法执行
     allow_upstream_commands: bool = True
@@ -183,12 +189,15 @@ class DecisionConfig:
     # 判定上下文中每个会话的近期消息条数上限
     context_messages: int = 6
     # ── 群聊巡检 ──────────────────────────────────────────
-    # 不逐条判定，而是聚合一段时间内的消息后统一判定：既降低 token 消耗，
+    # 不逐条判定，而是等对话安静下来后统一判定：既降低 token 消耗，
     # 也避免单条判定缺少对话上下文。
     patrol_enabled: bool = True
-    patrol_window_seconds: float = 5.0     # 会话静默达到该时长后判定一次
-    patrol_max_wait_seconds: float = 20.0  # 持续发言时的最长等待时间，超过后立即判定
+    # 最后一条群消息之后安静该时长才判定；期间出现新消息会重新计时。
+    # 持续发言时不封顶判定——只在真正无人说话时才询问模型。
+    patrol_window_seconds: float = 10.0
     patrol_cooldown_seconds: float = 60.0  # 判定为不回复后的会话冷却时长
+    # 开口后的最小回复间隔：活跃群里避免连续接话。@ / 私聊不受此项限制。
+    patrol_reply_cooldown_seconds: float = 60.0
     patrol_noise_filter: bool = True       # 整段仅含图片/重复内容/连续短句时跳过模型调用
     # 移除 AstrBot 内置的 send_message_to_user。
     # 该工具参数错误时会静默发送到当前会话（实测已造成误发），且绕过会话解析
@@ -214,6 +223,9 @@ class DecisionConfig:
             private_debounce_seconds=_get_float(
                 cfg, "decision.private_debounce_seconds", 10.0
             ),
+            private_debounce_max_seconds=_get_float(
+                cfg, "decision.private_debounce_max_seconds", 60.0
+            ),
             always_reply_when_mentioned=bool(
                 _get(cfg, "decision.always_reply_when_mentioned", True)
             ),
@@ -224,13 +236,13 @@ class DecisionConfig:
             context_messages=_get_int(cfg, "decision.context_messages", 6),
             patrol_enabled=bool(_get(cfg, "decision.patrol_enabled", True)),
             patrol_window_seconds=_get_float(
-                cfg, "decision.patrol_window_seconds", 5.0
-            ),
-            patrol_max_wait_seconds=_get_float(
-                cfg, "decision.patrol_max_wait_seconds", 20.0
+                cfg, "decision.patrol_window_seconds", 10.0
             ),
             patrol_cooldown_seconds=_get_float(
                 cfg, "decision.patrol_cooldown_seconds", 60.0
+            ),
+            patrol_reply_cooldown_seconds=_get_float(
+                cfg, "decision.patrol_reply_cooldown_seconds", 60.0
             ),
             patrol_noise_filter=bool(
                 _get(cfg, "decision.patrol_noise_filter", True)
@@ -289,6 +301,7 @@ class ScheduleConfig:
     wake_grace_minutes: int = 10
 
     # ── 深睡期记忆整理（§9）────────────────────────────────
+    # 总开关：关闭后维护、短期收口与清空都不会自动执行。
     curation_enabled: bool = True
     # 主触发条件与本轮深睡窗口绑定，每次进入 DEEP 后整理一次。
     # 该参数为兜底策略：距上次整理超过该时长仍未整理（例如深睡窗口未出现），

@@ -42,7 +42,9 @@ pages/memory/   记忆页面
 - **规则层** `engine.rule_decide()`：同步、零 token。上游指令 / 无文本 / 私聊 / 被点名在这里当场定夺，返回 `None` 表示「交给巡检」。
 - **巡检层** `patrol.PatrolManager`：群聊普通消息**扣押进窗口**，攒一小段再整体判一次。
 
-私聊是中间态：规则层只定「要回」，`Decision.debounce=True` 交给 `main._gate_private_debounce()`，用**静默窗口**等满 `decision.private_debounce_seconds`（默认 10）才唤醒主脑。静默窗口不问模型、不进冷却、不设封顶，计时基准跟着最新那条消息走。
+私聊是中间态：规则层判定「要回」并置 `Decision.debounce=True`，交给 `main._gate_silent_debounce()`，用**静默窗口**等满 `decision.private_debounce_seconds`（默认 10）才唤醒主脑。静默窗口不问模型、不进冷却，计时基准跟着最新那条消息走，并受 `private_debounce_max_seconds`（默认 60，0 = 不封顶）约束。
+
+群内 @ 不必判定是否在叫她：规则层返回 `Decision(debounce=True)`，与私聊一样进入静默窗口，等安静后直接回复。@ 的判定按消息组件里的 `At.qq == self_id` 精确识别，**排除 @全体 / 引用回复 / 唤醒前缀**。静默窗口期间涌入的普通消息只顺延计时，不会顶掉持有窗口的 @ 事件。文本里**只是出现名字**时返回 `Decision(mention=True)`，交给巡检窗口；判定会带上 `mention=True`，要求模型先区分「在叫她」与「只是在讨论智能体、顺口提到名字」，后者判为不回复。
 
 `engine.judge_window()` 是面向「一段对话」的模型判定，只由巡检器调用：
 
@@ -101,7 +103,7 @@ pages/memory/   记忆页面
 
 ### 3.5 行动链路
 
-`main.py` 的 LLM 工具：`list_sessions` / `peek_session` / `say` / `leave_session` / `rest` / `remember` / `recall` / `forget` / `search_history` / `delay_sleep`。
+`main.py` 的 LLM 工具：`list_sessions` / `peek_session` / `say` / `leave_session` / `rest` / `stay_silent` / `remember` / `recall` / `forget` / `search_history` / `delay_sleep`。
 
 两个易混工具的边界：
 
@@ -135,8 +137,10 @@ pages/memory/   记忆页面
 
 **拦放与判定**
 
-- 调整群聊参与时机 → `gate/engine.rule_decide()` + `gate/patrol.py`；窗口 / 封顶 / 冷却 / 噪声都在 `DecisionConfig.patrol_*`。
-- 调整私聊节奏 → `DecisionConfig.private_debounce_seconds`（0 = 立即回）。实现是 `patrol.hold(..., silent=True)`。
+- 调整群聊参与时机 → `gate/engine.rule_decide()` + `gate/patrol.py`；静默窗口 / 冷却 / 噪声都在 `DecisionConfig.patrol_*`。群聊是纯静默防抖：每条新消息重置 `patrol_window_seconds`（默认 10），无人说话才判定，**没有封顶**；冷却结束后不补判，等新消息重新开窗。@ 走 `_gate_silent_debounce()`（必回但防抖）；文本提到名字走巡检并附带「是否真的在叫她」的确认。
+- 调整私聊与 @ 节奏 → `DecisionConfig.private_debounce_seconds`（0 = 立即回）与 `private_debounce_max_seconds`（最长等待，0 = 不封顶）。实现是 `patrol.hold(..., silent=True)`。
+- 调整开口频率 → `DecisionConfig.patrol_reply_cooldown_seconds`：开口后该会话的最小回复间隔；@ 与私聊不受限制，0 = 关闭。
+- 区分技术失败 → `Decision.technical=True`（超时 / 异常 / 解析失败）不进入冷却，只丢弃本次窗口。
 - 调整判定质量 → `gate/engine.py` 的 `_WINDOW_PROMPT`。它带**人格**与**永久记忆**，倾向参与而非沉默，别把「宁可不开口」写回去；前文由 `patrol._history_before()` 用 `context_messages` 补。
 
 **记忆**
@@ -178,7 +182,7 @@ pages/memory/   记忆页面
 
 **图片描述不在 `content` 里**：账本里图片永远是 `[图片]` 占位，描述存 `image_caption`，由 `format_message_line()` 拼成 `[图片]（图片内容：…）`。
 
-**巡检是扣押，不是轮询**：`patrol.hold()` 返回 Future（`PROCESS` / `KILL`）或 `None`（冷却中，应立即拦下）。同一会话判定必须串行（`_judging`），窗口起点用 `_last_judged_at` 保证冷却期间的对话不丢。
+**巡检是扣押，不是轮询**：`patrol.hold()` 返回 Future（`PROCESS` / `KILL`）或 `None`（冷却中，应立即拦下）。同一会话判定必须串行（`_judging`）；窗口到点时若该会话仍在判定，直接作废本次窗口，不排队重试。判定取样只看**本次窗口开启之后**的消息（`opened_at`），冷却期或缺席期间的消息不补判——错过就错过，只有新消息才重新开窗。冷却的语义是「完全关掉」：期间不调用模型、不处理积压；**@ 可以穿透冷却**（静默窗口必回），但仍不调用模型。单次判定最多等 `engine._JUDGE_TIMEOUT_SECONDS`（30 秒），超时按沉默处理；技术性失败（超时 / 异常 / 解析失败）**不进入冷却**。开口后会设置 `patrol_reply_cooldown_seconds` 的最小回复间隔。未调用模型就跳过（噪声 / 空窗口）的日志只记 DEBUG。
 
 **`_LIVE_SQL` 漏加 = 「她已经忘了」静默失效**：`archived_at = 0 AND condensed_at = 0` 少一个条件，已清空或已压进摘要的行就会重新出现在上下文、巡检、压缩与页面里，而且不报错。新增查询时先问：「这条她现在还该记得吗？」
 
@@ -235,3 +239,38 @@ docker exec astrbot sh -lc 'cd /AstrBot && PYTHONPATH=/tmp:/AstrBot python /tmp/
 - `README.md` 面向使用者：只写能力、用法、配置与安装，**不重复目录树、数据表等仓库里一眼可见的实现细节**。
 - `AGENTS.md`（本文件）面向开发者：架构边界、坑、测试与发布规则。
 - AstrBot 的开发资料在 `docs/`；涉及事件注入、提示词注入、主动消息、请求体组建时先查那里。
+
+## 10. 配置页描述规范
+
+`_conf_schema.json` 的 `description` 是**面向使用者的唯一说明**，必须能脱离源码独立读懂。新增或修改配置项时逐条检查：
+
+**内容**
+
+- 一句话讲清「打开会发生什么 / 关闭会发生什么」，不要只把键名翻译一遍。
+- 写全**单位与取值范围**：秒 / 分钟 / 小时 / 天 / 条 / token / 1~10 / 0~1，单位放在括号里。
+- 写清**特殊值语义**：`0` 表示关闭、不封顶还是立即返回；留空表示复用全局配置还是禁用功能。
+- 写清**作用域与消费者**：同一概念出现在多处时，必须点明是「判定上下文」「主脑背景」「接管时间线」中的哪一个，避免读者以为它们共用一份预算。
+- 层级开关要说明关系：总开关关闭后哪些子功能一并失效，子开关只影响哪一步。
+- **副作用必须写明**：例如关闭作息不仅是不限制在线时段，也不会自动整理记忆。
+- 固定格式的配置（白名单、别名）给出示例，如 `private:QQ号` / `group:群号`。
+
+**措辞**
+
+- 使用陈述句，不写「搞一下」「弄成」「可能会」这类口语或模糊表达。
+- 不用「强度值」「一些」「若干」这类没有刻度的词；能给出区间就给出区间。
+- 不写内部实现细节（函数名、表名、SQL、变量名），只写使用者能观察到的结果。
+- 全仓库统一术语：跨会话背景、判定上下文、静默防抖、接管上下文、位置榜。
+- 描述控制在 1~2 句；较长解释放 README，不堆进配置项。
+
+**维护**
+
+- 新增或修改配置项时，同步 `_conf_schema.json`、`core/common/config.py` 的数据类与 `from_dict()`，三处默认值必须一致。
+- 已发布的键名不因描述修正而改名；键名与语义不符时（如 `private_debounce_seconds` 现在也管 @），保留键名并在描述中写清实际范围。
+- 改完执行 `python -c "import json; json.load(open('_conf_schema.json', encoding='utf-8'))"` 校验。
+
+**示例**
+
+- ✗「是否启用记忆维护」：读者不知道维护包含什么，也不知道它和深睡整理的关系。
+- ✓「记忆维护（降级 / 遗忘 / 晋升 / 合并）开关；不影响短期压缩与深睡收口」
+- ✗「跨会话语境的 token 预算」：三处跨会话内容都在用，读者无法判断改它影响谁。
+- ✓「判定用跨会话语境的 token 预算（决断层与巡检；主脑背景用 timeline_token_budget）」

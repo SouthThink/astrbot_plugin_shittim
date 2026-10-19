@@ -15,12 +15,14 @@
 
 from __future__ import annotations
 
+import asyncio
 import time
 from dataclasses import dataclass
 
 from astrbot.api import logger
 
 from ..common.event_utils import (
+    call_str,
     get_message_text,
     is_private_chat,
     is_upstream_command_event,
@@ -42,6 +44,11 @@ _PERSONA_MAX_CHARS = 1200
 # 人格极少变化，取一次并缓存一段时间即可，避免每个窗口都重新读取配置
 _PERSONA_CACHE_SECONDS = 300.0
 
+# 单次判定的最长等待时间。上游超时重试可能持续数分钟，若不设上限，
+# 窗口内的事件会一直被扣押，待模型最终返回后放行的是一条已经过时的消息，
+# 表现为「隔了很久突然接话」。超时按不回复处理，宁可错过也不迟到。
+_JUDGE_TIMEOUT_SECONDS = 30.0
+
 _WINDOW_PROMPT = """你是「{alias}」，正在「{chat_label}」。
 
 【你是什么样的人】
@@ -59,6 +66,7 @@ _WINDOW_PROMPT = """你是「{alias}」，正在「{chat_label}」。
 【这段对话】（按发生顺序）
 {content}
 
+{mention_note}
 【判断标准】
 你是一个有自己性格、记忆和情绪的人，正在这个群里生活。你要判断的不是
 「有没有人叫我」，而是「这段话里有没有我想接的东西」。
@@ -83,6 +91,14 @@ _WINDOW_PROMPT = """你是「{alias}」，正在「{chat_label}」。
 {{"should_reply": true, "reason": "一句话理由"}}
 """
 
+# 窗口里出现名字时追加的判定要求：区分「在叫她」与「只是在讨论她」。
+_MENTION_NOTE = """【关于名字】
+这段对话里提到了你的名字。先判断这是否是在叫你、并且在等你回应：
+- 是在叫你：直接提问、要求你回应、让你做事、对你说话 → 可以回复。
+- 只是在讨论：聊到智能体、AI，或把名字当作例子、话题的一部分，并没有让你接话 → 不回复。
+不要因为看到自己的名字就认为必须开口；如果拿不准，按「不需要回复」处理。
+"""
+
 
 @dataclass
 class Decision:
@@ -97,8 +113,13 @@ class Decision:
     reason: str
     source: str  # rule | model | fallback
     passthrough: bool = False
-    # 需要回复，但不立即回复：交由上层聚合一段静默时间（私聊防抖），避免打断用户连续发言
+    # 需要回复，但不立即回复：交由上层聚合一段静默时间（私聊防抖），
+    # 避免打断用户连续发言
     debounce: bool = False
+    # 群内文本提到名字：不直接回复，交由巡检窗口在安静后由模型确认是否在叫她
+    mention: bool = False
+    # 技术性失败（超时 / 调用异常 / 输出无法解析）：不应据此让会话进入冷却
+    technical: bool = False
 
 
 class DecisionEngine:
@@ -129,9 +150,10 @@ class DecisionEngine:
     def rule_decide(self, event) -> Decision | None:
         """可由规则判定的在此直接判定；返回 None 表示「交由巡检窗口继续判断」。
 
-        规则层同步执行、不消耗 token：上游指令、空文本、私聊、被点名均在此
-        直接判定。剩余的群聊普通消息交由巡检处理——累积一小段后整体判定一次，
-        而非每条消息都调用一次模型。
+        规则层同步执行、不消耗 token：上游指令、空文本、私聊在此直接判定；
+        被 @ 时判定「要回」但标记 `debounce=True`（等安静后直接放行）；
+        文本里只是出现名字时标记 `mention=True`，交给巡检窗口由模型确认
+        是否真的在叫她；其余群聊消息同样交由巡检处理。
         """
         chat_id = getattr(event, "unified_msg_origin", "") or ""
         text = get_message_text(event)
@@ -148,15 +170,41 @@ class DecisionEngine:
             # 等待其安静下来后再一次性回应，避免在中间打断。
             return Decision(True, "私聊", SOURCE_RULE, debounce=True)
 
-        if self._is_mentioned(event, text) and self._config.always_reply_when_mentioned:
-            return Decision(True, "被点名", SOURCE_RULE)
+        if self._config.always_reply_when_mentioned and self._is_at(event):
+            # @ 是明确的定向呼喊：不需要模型确认是在叫谁，但同样要等对方
+            # 把话说完，交由上层静默窗口聚合后再唤醒主脑。
+            return Decision(True, "被@", SOURCE_RULE, debounce=True)
+
+        if self._config.always_reply_when_mentioned and self._is_named(text):
+            # 名字只是出现在文本里：可能是在闲聊中顺口提到，交给巡检窗口
+            # 在安静后由模型确认是否真的在叫她。
+            return Decision(True, "提到名字", SOURCE_RULE, mention=True)
 
         return None
 
-    def _is_mentioned(self, event, text: str) -> bool:
-        """被 @ / 命中 AstrBot 唤醒 / 文本中出现别名。"""
-        if bool(getattr(event, "is_at_or_wake_command", False)):
-            return True
+    def _is_at(self, event) -> bool:
+        """是否直接 @ 了自己，排除 @全体。
+
+        `is_at_or_wake_command` 同时覆盖 @自己、@全体、引用回复与唤醒前缀，
+        不能直接当作「在叫自己」。有消息组件时按 `At.qq` 精确判断；取不到
+        组件时才退回唤醒标记（其他平台可能没有 At 组件）。
+        """
+        try:
+            messages = event.get_messages() or []
+        except Exception:
+            messages = []
+        self_id = call_str(event, "get_self_id")
+        if messages:
+            return any(
+                type(message).__name__ == "At"
+                and self_id
+                and str(getattr(message, "qq", "")) == self_id
+                for message in messages
+            )
+        return bool(getattr(event, "is_at_or_wake_command", False))
+
+    def _is_named(self, text: str) -> bool:
+        """文本里是否出现了智能体名称 / 唤醒词。"""
         return any(alias and alias in text for alias in self._config.aliases)
 
     # ── 模型层 ────────────────────────────────────────────
@@ -167,6 +215,7 @@ class DecisionEngine:
         chat_label: str,
         lines: list[str],
         before: list[str] | None = None,
+        mention: bool = False,
     ) -> Decision:
         """判定一段时间内的对话是否需要接话。
 
@@ -177,21 +226,29 @@ class DecisionEngine:
         `before` 是窗口开始前该会话的若干条消息。判定对象仍为窗口内的增量，
         但「不懂」「那他呢」一类语句需要紧邻前文才能判断指代对象；
         缺少前文时，模型只能以「无明确上下文」为由判定为不回复。
+
+        `mention=True` 表示窗口里有消息只是提到了名字。此时额外要求模型区分
+        「在叫她」与「只是在讨论她 / 智能体」，后者不应回复。被 @ 的消息不走
+        这条判定，由规则层直接进入静默防抖。
         """
         provider = self._resolve_provider()
         if provider is None:
             # 未配置决策模型时的兜底：群聊里的普通消息不介入
             return Decision(
-                False, "未配置决策模型，按规则不介入群聊普通消息", SOURCE_FALLBACK
+                False,
+                "未配置决策模型，按规则不介入群聊普通消息",
+                SOURCE_FALLBACK,
+                technical=True,
             )
 
         body = "\n".join(line for line in lines if line).strip()
         if not body:
-            return Decision(False, "没有可判断的内容", SOURCE_FALLBACK)
+            return Decision(False, "没有可判断的内容", SOURCE_FALLBACK, technical=True)
 
         history = "\n".join(line for line in (before or []) if line).strip()
         persona = await self._persona_block(chat_id)
 
+        mention_note = _MENTION_NOTE if mention else ""
         prompt = _WINDOW_PROMPT.format(
             alias=self._alias_label(),
             persona=persona or "（没有额外的人格设定）",
@@ -205,19 +262,36 @@ class DecisionEngine:
             chat_label=chat_label or "群聊",
             history=history or "（这段对话就是开头）",
             content=body,
+            mention_note=mention_note,
         )
 
         try:
-            token = await provider.text_chat(prompt=prompt)
+            token = await asyncio.wait_for(
+                provider.text_chat(prompt=prompt),
+                timeout=_JUDGE_TIMEOUT_SECONDS,
+            )
             raw = (getattr(token, "completion_text", "") or "").strip()
+        except asyncio.TimeoutError:
+            logger.warning(
+                "[什亭之枢] 决策模型超时（%.0fs），本次不接话 | %s",
+                _JUDGE_TIMEOUT_SECONDS,
+                chat_id,
+            )
+            return Decision(
+                False, "决策模型超时", SOURCE_FALLBACK, technical=True
+            )
         except Exception as error:
             logger.error("[什亭之枢] 决策模型调用失败: %s", error)
-            return Decision(False, "决策模型调用失败", SOURCE_FALLBACK)
+            return Decision(
+                False, "决策模型调用失败", SOURCE_FALLBACK, technical=True
+            )
 
         payload = parse_model_json(raw)
         if not isinstance(payload, dict) or "should_reply" not in payload:
             logger.warning("[什亭之枢] 决策模型输出无法解析，按不回复处理: %s", raw[:120])
-            return Decision(False, "决策模型输出无法解析", SOURCE_FALLBACK)
+            return Decision(
+                False, "决策模型输出无法解析", SOURCE_FALLBACK, technical=True
+            )
 
         should_reply = self._coerce_bool(payload.get("should_reply"))
         reason = str(payload.get("reason") or "").strip()[:80]

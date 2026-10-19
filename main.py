@@ -60,6 +60,7 @@ from .core.common.db import MemoryDB
 from .core.common.event_utils import (
     EXTRA_LEFT_TO,
     EXTRA_MESSAGE_ID,
+    EXTRA_SILENT,
     call_str,
     describe_chat,
     describe_non_text,
@@ -688,12 +689,12 @@ class ShittimPlugin(Star):
     async def gate_official_llm(self, event: AstrMessageEvent):
         """在 AstrBot 官方 LLM 触发之前执行拦放判定。
 
-        **规则层**可确定的（上游指令、私聊、被点名、空文本）在此直接处理；
-        其余群聊普通消息交由**巡检器**：扣押事件，等待一段对话结束后统一判定
-        是否需要接话，而非逐条调用模型。
+        **规则层**可确定的（上游指令、私聊、空文本）在此直接处理；
+        其余群聊消息（含点名 / @）交由**巡检器**：扣押事件，等待一段对话
+        结束后统一判定是否需要接话，而非逐条调用模型。
 
-        私聊为中间态：规则层仅判定需要回复，但回复前同样进入静默窗口
-        （`_gate_private_debounce`），避免打断用户连续发言。
+        私聊为中间态：规则层仅判定需要回复，但回复前进入静默窗口
+        （`_gate_silent_debounce`），避免打断用户连续发言。
 
         需要回复 → 设置 `is_at_or_wake_command` 以唤醒主脑生成回复；
         不回复 → `stop_event()`，官方 LLM 不触发。
@@ -710,22 +711,26 @@ class ShittimPlugin(Star):
 
         if ruled is not None:
             if ruled.debounce:
-                await self._gate_private_debounce(event, ruled)
+                await self._gate_silent_debounce(event, ruled)
+                return
+            if ruled.mention:
+                # 点名 / @ 不直接回复：交给巡检窗口，由模型确认是否真的在叫她
+                await self._gate_by_patrol(event, mention=True)
                 return
             self._apply_decision(event, ruled)
             return
 
         await self._gate_by_patrol(event)
 
-    async def _gate_private_debounce(self, event: AstrMessageEvent, ruled) -> None:
-        """私聊防抖：静默满 `private_debounce_seconds` 秒且无新消息后唤醒主脑。
+    async def _gate_silent_debounce(self, event: AstrMessageEvent, ruled) -> None:
+        """静默防抖：静默满 `private_debounce_seconds` 秒且无新消息后唤醒主脑。
 
-        私聊无需模型判定是否回复，但需要等待：用户常将一句话拆成多条发送，
-        立即回复会造成打断。窗口复用巡检器的静默模式：窗口内旧事件以 KILL
-        结束，仅最后一条持有窗口；被 KILL 的消息仍记录在账本中，主脑通过
-        全局时间线读取完整对话，只是等到该段结束后统一回复。
+        私聊与群内 @ 无需模型判定是否回复，但需要等待：对方常将一句话拆成
+        多条发送，立即回复会造成打断。窗口复用巡检器的静默模式：窗口内
+        旧事件以 KILL 结束，仅最后一条持有窗口；被 KILL 的消息仍记录在账本中，
+        主脑通过原生历史与跨会话背景读取完整对话，只是等到该段结束后统一回复。
         """
-        seconds = self._private_debounce_seconds()
+        seconds = self._silent_debounce_seconds()
         chat_id = event.unified_msg_origin or ""
         if seconds <= 0 or not chat_id:
             # 未配置防抖或取不到会话标识：立即放行
@@ -739,40 +744,42 @@ class ShittimPlugin(Star):
 
         verdict = await future
         if self._is_terminating:
-            logger.debug("[什亭之枢] 插件已卸载，放弃本次私聊防抖结果")
+            logger.debug("[什亭之枢] 插件已卸载，放弃本次静默防抖结果")
             return
         if verdict == PATROL_PROCESS:
             self._release(event)
             logger.info(
-                "[什亭之枢] 放行主脑 [私聊防抖] 静默 %.1fs 无新消息", seconds
+                "[什亭之枢] 放行主脑 [静默防抖] 静默 %.1fs 无新消息", seconds
             )
         else:
             self._block(event)
-            logger.info("[什亭之枢] 拦截官方 LLM [私聊防抖] 被更新的消息取代")
+            logger.info("[什亭之枢] 拦截官方 LLM [静默防抖] 被更新的消息取代")
 
-    def _private_debounce_seconds(self) -> float:
-        """私聊防抖时长；配置不可用时按「不防抖」处理，优先立即回复而非静默延迟。"""
+    def _silent_debounce_seconds(self) -> float:
+        """静默防抖时长；配置不可用时按「不防抖」处理，优先立即回复而非静默延迟。"""
         try:
             return max(float(self.decision_config.private_debounce_seconds), 0.0)
         except (TypeError, ValueError):
             return 0.0
 
-    async def _gate_by_patrol(self, event: AstrMessageEvent) -> None:
-        """群聊普通消息：扣押进窗口，聚合一段后判定。"""
+    async def _gate_by_patrol(
+        self, event: AstrMessageEvent, mention: bool = False
+    ) -> None:
+        """群聊消息：扣押进窗口，安静后判定；mention 表示窗口里出现过点名。"""
         chat_id = event.unified_msg_origin or ""
 
         if not self.decision_config.patrol_enabled:
             # 巡检关闭：退化为逐条判定，以账本中最新消息作为判据
             chat_label, lines, before = self._latest_window(chat_id)
             decision = await self.decider.judge_window(
-                chat_id, chat_label, lines, before=before
+                chat_id, chat_label, lines, before=before, mention=mention
             )
             if self._is_terminating:
                 return
             self._apply_decision(event, decision)
             return
 
-        future = await self.patrol.hold(chat_id, event)
+        future = await self.patrol.hold(chat_id, event, mention=mention)
         if future is None:
             # 处于冷却期：直接拦下，不开启窗口
             if not self._is_terminating:
@@ -790,7 +797,8 @@ class ShittimPlugin(Star):
             logger.info("[什亭之枢] 放行主脑 [patrol] 窗口判定：开口")
         else:
             self._block(event)
-            logger.info("[什亭之枢] 拦截官方 LLM [patrol] 窗口判定：沉默")
+            # 沉默的具体理由由巡检器记录；这里若也打 INFO，噪声跳过会刷屏
+            logger.debug("[什亭之枢] 拦截官方 LLM [patrol] 窗口判定：沉默")
 
     def _apply_decision(self, event: AstrMessageEvent, decision) -> None:
         """按判定结果放行或拦下这条事件。"""
@@ -1177,6 +1185,16 @@ class ShittimPlugin(Star):
 
         该处理器使用最低优先级，待其它插件的结果装饰完成后，再决定是否发送。
         """
+        # 主脑调用 stay_silent：丢弃本轮全部发言，不发送任何消息。
+        if get_extra(event, EXTRA_SILENT):
+            try:
+                result = event.get_result() if hasattr(event, "get_result") else None
+                if result is not None and getattr(result, "chain", None):
+                    result.chain = []
+                    logger.info("[什亭之枢] 主脑决定本轮不发言，已丢弃发言")
+            except Exception as error:
+                logger.error("[什亭之枢] 丢弃本轮发言失败: %s", error)
+            return
         if not self._proactive_config().get("silence_origin_after_say", True):
             return
         if not get_extra(event, EXTRA_LEFT_TO):
@@ -1560,6 +1578,19 @@ class ShittimPlugin(Star):
             return f"休息失败：{error}"
         logger.info("[什亭之枢] 主动进入休息，离开 %d 个会话", count)
         return f"你去休息了，暂时离开了 {count} 个会话。有人再找你时你会醒过来。"
+
+    @filter.llm_tool(name="stay_silent")
+    async def stay_silent(self, event: AstrMessageEvent) -> str:
+        """
+        决定这一轮不发言。当你判断不该由你回应时调用：例如只是被提到名字、
+        对方在讨论智能体或与你无关的话题、接话会打断别人、或你已经无话可说。
+        调用后本轮不会发送任何消息；之后有新消息仍会正常参与判定。
+        """
+        if self._is_terminating:
+            return "插件正在重载，请稍后再试。"
+        set_extra(event, EXTRA_SILENT, True)
+        logger.info("[什亭之枢] 主脑决定本轮不发言 | %s", event.unified_msg_origin)
+        return "已决定本轮保持沉默，不会发送任何消息。"
 
     # ══════════════════════════════════════════════════════════
     #  LLM 工具：主动记忆
