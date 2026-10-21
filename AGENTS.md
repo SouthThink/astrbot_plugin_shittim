@@ -19,7 +19,7 @@ core/
 ├── gate/       拦放链路：决断层 engine.py + 群聊巡检 patrol.py
 ├── focus/      焦点链路：manager.py
 ├── memory/     记忆链路：ledger / extractor / store / maintenance
-│               / timeline / injector / history / vision
+│               / timeline / injector / history / vision / forward
 └── schedule/   作息链路：state.py
 
 main.py         事件处理器、LLM 工具、生命周期
@@ -78,7 +78,7 @@ pages/memory/   记忆页面
 
 ### 3.4 记忆链路
 
-`ledger`（账本）→ `extractor`（`condense` 压缩、`merge` 合并）→ `store`（位置榜 / 召回 / 晋升）→ `maintenance`（收口 / 降级 / 遗忘 / 晋升 / 合并）。主脑上下文默认沿用 AstrBot 原生按会话历史，注入拼装走 `injector`，时间线仅在接管模式下由 `timeline` 从账本重建，图片经 `vision` 转述，坏图摘除在 `history`。
+`ledger`（账本）→ `extractor`（`condense` 压缩、`merge` 合并）→ `store`（位置榜 / 召回 / 晋升）→ `maintenance`（收口 / 降级 / 遗忘 / 晋升 / 合并）。主脑上下文默认沿用 AstrBot 原生按会话历史，注入拼装走 `injector`，时间线仅在接管模式下由 `timeline` 从账本重建，图片经 `vision` 转述、合并转发经 `forward` 取回，坏图摘除在 `history`。
 
 **主脑上下文默认不接管**：`memory.context_takeover=False`（默认）时 `on_llm_request` **不修改 `req.contexts`**，记忆块、跨会话背景（`<cross_session_timeline>`）与作息提示经 `req.extra_user_content_parts` 以 `TextPart(...).mark_as_temp()` 追加，仅本轮可见、不写持久历史，也不会破坏原生前缀缓存。跨会话背景由 `ledger.timeline_entries_balanced()` 取样：每个会话保留最近 `short_term_context_per_chat` 条、纳入最近 `short_term_context_chats` 个会话，**当前会话始终入选且其 `gated=1` 消息全量保留**（这些消息没进官方历史），活摘要也一并保留；原生历史为空时 `include_current=True` 兜底。开启接管后才由 `timeline.build_timeline()` 把账本（`archived_at = 0 AND condensed_at = 0 AND staged = 0`）加活着的摘要渲染成 `req.contexts`——她说过的话是 `assistant`（只放原话），别人的话是 `user`（带 `[会话标签] 发言人 (绝对时间戳):`），摘要用 `<earlier_summary>` 包裹，末尾标明「你现在在跟谁说话」。此时 AstrBot 的原生按会话历史被整体丢弃（`_rebuild_timeline()`）。数据源只覆盖**今天**，超预算从**最旧的**开始丢。
 
@@ -129,6 +129,7 @@ pages/memory/   记忆页面
 | `core/memory/timeline.py` | 账本条目 → `req.contexts`（仅接管模式） | 默认不参与；摘要包 `<earlier_summary>`；每条都要 `_no_save` |
 | `core/memory/history.py` | 坏图摘除 | 只做「确定读不到的图片引用」，别恢复官方历史回填 |
 | `core/memory/vision.py` | 图片转文字 | 引用必须当场取出，临时文件会失效 |
+| `core/memory/forward.py` | 合并转发转文字 | 只认 `Forward.id`；接口参数名跨适配器不一致（`message_id` / `id`）；内容写 `forward_content`，不要改写 `content` |
 | `core/schedule/state.py` | 作息推导与状态读写 | 推导保持纯函数；状态只经 `SleepStateStore` 落库 |
 | `web_api.py` | 记忆页面只读接口 | 路由注册在 `main.__init__` |
 | `pages/memory/` | 记忆页面 | 单文件 HTML，标题靠 i18n 覆盖 |
@@ -154,6 +155,7 @@ pages/memory/   记忆页面
 - 调整位置榜分档或遗忘 → `store.py` 顶部常量 + `curation_level()` / `is_tail()`；`maintenance._demote()` / `_forget()`；门槛是 `memory.forget_min_curations` / `forget_stale_days`。
 - 调整历史回查 → `main.search_history`（参数夹紧、默认当前会话）+ `ledger.search_history()`。它**绕过 `_LIVE_SQL`**，改动前先想清楚哪些行不该被翻出来。
 - 调整图片转述 → `memory/vision.py`（取图、data URL、缓存、模型能力检查）。
+- 调整合并转发 → `memory/forward.py`（取 id、调 `get_forward_msg`、渲染与截断）；条数 / 字数是 `memory.forward_max_items` / `forward_max_chars`。
 
 **作息**
 
@@ -181,6 +183,8 @@ pages/memory/   记忆页面
 **`content` 是唯一事实源，`gated` 只是展示用**：`gated=1` 只用于记忆页面与排障，**不要在上下文组装路径上读它**。但**永远不要改写已入账的 `content`**——巡检判据与时间线剔除当前消息都靠它精确匹配。
 
 **图片描述不在 `content` 里**：账本里图片永远是 `[图片]` 占位，描述存 `image_caption`，由 `format_message_line()` 拼成 `[图片]（图片内容：…）`。
+
+**转发内容也不在 `content` 里**：合并转发在账本里只有 `[转发消息]` 占位，内容存 `forward_content`，由 `format_message_line()` 拼成 `[转发消息]（转发内容：…）`；巡检的噪声预过滤必须把它算进可判定文本，否则「转发了一段聊天」会被当成纯占位。
 
 **巡检是扣押，不是轮询**：`patrol.hold()` 返回 Future（`PROCESS` / `KILL`）或 `None`（冷却中，应立即拦下）。同一会话判定必须串行（`_judging`）；窗口到点时若该会话仍在判定，直接作废本次窗口，不排队重试。判定取样只看**本次窗口开启之后**的消息（`opened_at`），冷却期或缺席期间的消息不补判——错过就错过，只有新消息才重新开窗。冷却的语义是「完全关掉」：期间不调用模型、不处理积压；**@ 可以穿透冷却**（静默窗口必回），但仍不调用模型。单次判定最多等 `engine._JUDGE_TIMEOUT_SECONDS`（30 秒），超时按沉默处理；技术性失败（超时 / 异常 / 解析失败）**不进入冷却**。开口后会设置 `patrol_reply_cooldown_seconds` 的最小回复间隔。未调用模型就跳过（噪声 / 空窗口）的日志只记 DEBUG。
 

@@ -12,7 +12,7 @@ import sqlite3
 import threading
 from pathlib import Path
 
-SCHEMA_VERSION = 9
+SCHEMA_VERSION = 10
 
 # 增量列迁移：用于给已存在的库补列，避免升级插件时丢数据
 _COLUMN_MIGRATIONS = (
@@ -26,6 +26,9 @@ _COLUMN_MIGRATIONS = (
     # 图片消息的转述文本。AstrBot 只会把图片转成「[图片]」占位，
     # 因此账本需额外记录一句描述，否则该图片在上下文中不可见。
     ("short_term_messages", "image_caption", "TEXT NOT NULL DEFAULT ''"),
+    # 合并转发的聊天记录。AstrBot 只会把合并转发转成「[转发消息]」占位，
+    # 内层内容需另调接口取回后单独记录。
+    ("short_term_messages", "forward_content", "TEXT NOT NULL DEFAULT ''"),
     # staged=1 表示该消息仍处于「睡眠期暂存区」：不参与整理、不参与归档。
     # 起床时统一置 0，纳入正常流程。与 source 分开是因为 source 记录的是永久事实
     # （「睡觉时收到」始终成立），而「是否参与整理」仅在睡眠期间成立。
@@ -92,6 +95,7 @@ CREATE TABLE IF NOT EXISTS short_term_messages (
     gated       INTEGER NOT NULL DEFAULT 0,
     source      TEXT    NOT NULL DEFAULT 'live',
     image_caption TEXT  NOT NULL DEFAULT '',
+    forward_content TEXT NOT NULL DEFAULT '',
     staged      INTEGER NOT NULL DEFAULT 0,
     archived_at REAL    NOT NULL DEFAULT 0
 );

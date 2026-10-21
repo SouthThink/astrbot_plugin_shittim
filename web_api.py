@@ -87,6 +87,10 @@ def _short_term_item(row) -> dict:
     except (KeyError, IndexError, TypeError):
         caption = ""
     try:
+        forward_content = str(row["forward_content"] or "")
+    except (KeyError, IndexError, TypeError):
+        forward_content = ""
+    try:
         staged = bool(row["staged"])
     except (KeyError, IndexError, TypeError):
         staged = False
@@ -101,6 +105,8 @@ def _short_term_item(row) -> dict:
         "content": str(row["content"] or ""),
         # 图片转述文本：页面据此把「[图片]」替换为可读内容
         "image_caption": caption,
+        # 合并转发的聊天记录：页面据此展开「[转发消息]」
+        "forward_content": forward_content,
         "created_at": float(row["created_at"] or 0.0),
         "gated": bool(row["gated"]),
         "source": str(row["source"] or "live"),

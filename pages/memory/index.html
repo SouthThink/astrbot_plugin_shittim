@@ -431,6 +431,12 @@
             caption.textContent = `图片内容：${item.image_caption}`;
             box.appendChild(caption);
           }
+          if (item.forward_content) {
+            const forwarded = document.createElement("div");
+            forwarded.className = "caption";
+            forwarded.textContent = `转发内容：${item.forward_content}`;
+            box.appendChild(forwarded);
+          }
           el.list.appendChild(box);
         });
       }

@@ -80,6 +80,7 @@ from .core.gate.patrol import (
     PatrolManager,
 )
 from .core.memory.extractor import MemoryExtractor
+from .core.memory.forward import ForwardReader, collect_ids as collect_forward_ids
 from .core.memory.history import (
     strip_invalid_image_urls,
     strip_invalid_images,
@@ -143,6 +144,10 @@ _PRIORITY_IMAGE_GUARD = -20
 _PRIORITY_DECORATE = -100
 # 发送后收口
 _PRIORITY_AFTER_SENT = 100
+# 合并转发取回的等待上限（秒）。纯转发消息的 message_str 为空，AstrBot 会直接
+# 跳过主脑请求，因此必须在事件链上短暂等待取回结果；超时则让任务在后台继续，
+# 内容仍会写进账本，只影响本轮 prompt。
+_FORWARD_WAIT_SECONDS = 2.0
 
 # AstrBot 内置的消息发送工具。参数错误时会静默发送到当前会话，
 # 因此由本插件逐请求移除；跨会话发言统一使用 say。
@@ -239,6 +244,8 @@ class ShittimPlugin(Star):
         self.memory_store = MemoryStore(self.db, self.memory_config)
         # 图片转文字：AstrBot 只给「[图片]」占位，账本里的描述得自己补
         self.captioner = ImageCaptioner(self.db, self.memory_config, self.context)
+        # 合并转发：同样只有「[转发消息]」占位，内容得单独取回
+        self.forward_reader = ForwardReader(self.memory_config, self.context)
         self.extractor = MemoryExtractor(self.context, self.memory_config)
         self.maintainer = MemoryMaintainer(
             self.memory_store,
@@ -462,6 +469,19 @@ class ShittimPlugin(Star):
                 set_extra(event, EXTRA_MESSAGE_ID, message_id)
                 # 图片内容需要单独调用视觉模型：AstrBot 仅提供「[图片]」占位
                 self._schedule_image_caption(event, message_id)
+                # 合并转发同理：账本里只有「[转发消息]」占位
+                task = self._schedule_forward_content(event, message_id, content)
+                if task is not None:
+                    # 纯转发消息的 message_str 为空，AstrBot 会直接跳过主脑请求；
+                    # 必须在后续阶段之前把取回结果写进 prompt，因此这里做有界等待。
+                    try:
+                        await asyncio.wait_for(
+                            asyncio.shield(task), _FORWARD_WAIT_SECONDS
+                        )
+                    except asyncio.TimeoutError:
+                        pass
+                    except Exception as error:
+                        logger.debug("[什亭之枢] 合并转发等待失败: %s", error)
             self.memory_store.upsert_user(
                 platform_of(event) or "unknown",
                 sender_id,
@@ -1744,6 +1764,74 @@ class ShittimPlugin(Star):
         logger.debug("[什亭之枢] 图片转述完成 | %s", caption[:60])
 
     # ══════════════════════════════════════════════════════════
+    #  合并转发
+    # ══════════════════════════════════════════════════════════
+
+    def _schedule_forward_content(
+        self, event: AstrMessageEvent, message_id: int, message_content: str
+    ) -> asyncio.Task | None:
+        """将合并转发的读取任务放入后台，返回任务供调用方有界等待。
+
+        转发 id 必须当场取出（组件随后可能失效），真正的接口调用不能长时间
+        阻塞记账——记账位于事件链首环。
+        """
+        if not self.memory_config.forward_enabled or not message_id:
+            return None
+        ids = collect_forward_ids(event, 1)
+        if not ids:
+            return None
+        return self._spawn(
+            self._read_forward(message_id, event, ids[0], message_content)
+        )
+
+    async def _read_forward(
+        self,
+        message_id: int,
+        event: AstrMessageEvent,
+        forward_id: str,
+        message_content: str,
+    ) -> None:
+        """读回转发内容后回填账本与本轮 prompt。"""
+        try:
+            content = await self.forward_reader.read(event, forward_id)
+        except Exception as error:
+            logger.error("[什亭之枢] 读取合并转发异常: %s", error)
+            return
+        if not content:
+            return
+        self.short_term.set_forward_content(message_id, content)
+        self._apply_forward_text(event, message_content, content)
+        logger.debug("[什亭之枢] 合并转发读取完成 | %s", content[:60])
+
+    @staticmethod
+    def _apply_forward_text(
+        event: AstrMessageEvent, message_content: str, content: str
+    ) -> None:
+        """把转发内容补进本轮 prompt。
+
+        AstrBot 只用纯文本段拼 `message_str`，纯转发消息因此为空，后续阶段
+        会判定「没有可请求的内容」并跳过主脑。这里用与账本相同的占位正文
+        拼出文本，保证 prompt 与 `format_speech()` 逐字一致（接管模式据此
+        剔除当前消息，避免在时间线里再出现一次）。
+        """
+        base = str(message_content or "").strip()
+        text = (
+            f"{base}（转发内容：{content}）"
+            if base
+            else f"[转发消息]（转发内容：{content}）"
+        )
+        try:
+            event.message_str = text
+        except Exception:
+            return
+        message_obj = getattr(event, "message_obj", None)
+        if message_obj is not None:
+            try:
+                message_obj.message_str = text
+            except Exception:
+                pass
+
+    # ══════════════════════════════════════════════════════════
     #  记忆维护
     # ══════════════════════════════════════════════════════════
 
@@ -1921,6 +2009,7 @@ class ShittimPlugin(Star):
         self.maintainer.update_config(self.memory_config)
         self.decider.update_config(self.decision_config, self.memory_config)
         self.captioner.update_config(self.memory_config)
+        self.forward_reader.update_config(self.memory_config)
         self.patrol.update_config(self.decision_config)
         self.focus.update_config(self.focus_config)
         self._allowed_targets = self._load_allowed_targets()
@@ -2114,13 +2203,14 @@ class ShittimPlugin(Star):
             return False
         return True
 
-    def _spawn(self, coro) -> None:
+    def _spawn(self, coro):
         """登记后台任务：统一追踪，便于 terminate 时取消并等待。"""
         if self._is_terminating:
-            return
+            return None
         task = asyncio.create_task(coro)
         self._background_tasks.add(task)
         task.add_done_callback(self._on_background_task_done)
+        return task
 
     def _on_background_task_done(self, task: asyncio.Task) -> None:
         self._background_tasks.discard(task)

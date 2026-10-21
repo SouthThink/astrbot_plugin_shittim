@@ -175,9 +175,13 @@ def build_timeline(
             if entry.get("kind") != "message":
                 continue
             row = entry["row"]
+            if str(row["role"]) != "user":
+                continue
+            # 纯转发消息的 prompt 由「[转发消息]（转发内容：…）」构成，
+            # 与账本里的占位正文不同，必须按渲染后的发言比对才能剔除。
             if (
-                str(row["role"]) == "user"
-                and str(row["content"] or "").strip() == prompt_text
+                str(row["content"] or "").strip() == prompt_text
+                or format_speech(row).strip() == prompt_text
             ):
                 skip_index = index
                 break

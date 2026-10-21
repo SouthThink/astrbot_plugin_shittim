@@ -50,6 +50,21 @@
         "type": "int",
         "default": 2
       },
+      "forward_enabled": {
+        "description": "合并转发转文字：把转发消息里的聊天记录写入账本（AstrBot 仅提供「[转发消息]」占位）",
+        "type": "bool",
+        "default": true
+      },
+      "forward_max_items": {
+        "description": "单条合并转发最多读取的聊天记录条数（条）",
+        "type": "int",
+        "default": 20
+      },
+      "forward_max_chars": {
+        "description": "单条合并转发写入账本的最大字数，超出部分截断（字）",
+        "type": "int",
+        "default": 1200
+      },
       "short_term_context_per_chat": {
         "description": "跨会话取样：每个会话最多取多少条消息（判定与主脑背景共用）",
         "type": "int",

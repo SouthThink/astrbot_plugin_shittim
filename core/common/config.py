@@ -86,6 +86,13 @@ class MemoryConfig:
     vision_prompt: str = ""               # 留空则使用内置中文提示词
     vision_max_images: int = 2            # 单条消息最多转述的图片数
 
+    # ── 合并转发 ──────────────────────────────────────────
+    # AstrBot 仅提供「[转发消息]」占位，内层聊天记录需单独调用接口取回，
+    # 否则判定与主脑都看不到转发内容。
+    forward_enabled: bool = True
+    forward_max_items: int = 20           # 单条转发最多读取的聊天记录条数
+    forward_max_chars: int = 1200         # 单条转发写入账本的最大字符数
+
     # ── 记忆块（自动插入）────────────────────────────────
     # 榜前 N 条提供完整正文；其后 M 条仅提供关键词索引（用于提示仍存在
     # 未展开的记忆）。更靠后的条目不进入上下文。
@@ -145,6 +152,9 @@ class MemoryConfig:
             vision_provider_id=str(_get(cfg, "memory.vision_provider_id", "") or ""),
             vision_prompt=str(_get(cfg, "memory.vision_prompt", "") or ""),
             vision_max_images=_get_int(cfg, "memory.vision_max_images", 2),
+            forward_enabled=bool(_get(cfg, "memory.forward_enabled", True)),
+            forward_max_items=_get_int(cfg, "memory.forward_max_items", 20),
+            forward_max_chars=_get_int(cfg, "memory.forward_max_chars", 1200),
             auto_top=_get_int(cfg, "memory.auto_top", 10),
             auto_index=_get_int(cfg, "memory.auto_index", 30),
             recall_top_k=_get_int(cfg, "memory.recall_top_k", 5),

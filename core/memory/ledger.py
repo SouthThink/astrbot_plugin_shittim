@@ -49,6 +49,14 @@ def _caption_of(row) -> str:
         return ""
 
 
+def _forward_of(row) -> str:
+    """取这一行的合并转发内容；老库的行没有该列，取不到就当没有。"""
+    try:
+        return str(row["forward_content"] or "").strip()
+    except (KeyError, IndexError, TypeError):
+        return ""
+
+
 def _source_of(row) -> str:
     """取这一行的来源；老库的行没有该列，取不到按实时消息算。"""
     try:
@@ -68,6 +76,14 @@ def format_speech(row) -> str:
     if caption:
         content = (
             f"{content}（图片内容：{caption}）" if content else f"[图片]（图片内容：{caption}）"
+        )
+    forwarded = _forward_of(row)
+    if forwarded:
+        # 合并转发在账本里只有占位，真正的内容由 forward.py 取回后补在这里
+        content = (
+            f"{content}（转发内容：{forwarded}）"
+            if content
+            else f"[转发消息]（转发内容：{forwarded}）"
         )
     if _source_of(row) == SOURCE_SLEEP:
         # 睡眠期消息需明确标注来源，使主模型读取时能区分其产生时间，
@@ -255,6 +271,19 @@ class ShortTermLedger:
         self._db.execute(
             "UPDATE short_term_messages SET image_caption = ? WHERE id = ?",
             (caption, int(message_id)),
+        )
+
+    def set_forward_content(self, message_id: int, content: str) -> None:
+        """为已入库的消息补充合并转发的聊天记录。
+
+        读取转发内容需要调用适配器接口，不能在记账路径上等待，因此与图片
+        转述一样在后台完成后再回填该行。
+        """
+        if not message_id or not content:
+            return
+        self._db.execute(
+            "UPDATE short_term_messages SET forward_content = ? WHERE id = ?",
+            (content, int(message_id)),
         )
 
     def mark_gated(self, ids: list[int]) -> None:
@@ -722,7 +751,7 @@ class ShortTermLedger:
         （`archived_at`）与已压入摘要（`condensed_at`）的行正是查询目标。
         唯一排除睡眠期暂存（`staged = 1`），这些消息在起床前不应对模型可见。
 
-        关键词同时匹配正文、发言人名称与图片描述，使图片内容也可通过描述检索。
+        关键词同时匹配正文、发言人名称、图片描述与转发内容，使这些内容也可检索。
         """
         limit = max(int(limit), 1)
         clauses = ["staged = 0", "created_at >= ?"]
@@ -734,9 +763,10 @@ class ShortTermLedger:
         if text:
             like = f"%{text}%"
             clauses.append(
-                "(content LIKE ? OR sender_name LIKE ? OR image_caption LIKE ?)"
+                "(content LIKE ? OR sender_name LIKE ?"
+                " OR image_caption LIKE ? OR forward_content LIKE ?)"
             )
-            params.extend([like, like, like])
+            params.extend([like, like, like, like])
         params.append(limit)
         rows = self._db.query(
             f"""

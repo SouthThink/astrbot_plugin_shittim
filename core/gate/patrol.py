@@ -88,13 +88,27 @@ class PatrolRecord:
     mention: bool = False
 
 
+def _row_text(row) -> str:
+    """取一行的可判定文本：正文 + 合并转发内容。
+
+    合并转发在账本里只是「[转发消息]」占位，真正的内容记录在
+    `forward_content`；只看正文会把「转发了一段聊天」误判成纯噪声。
+    """
+    text = str(row["content"] or "").strip()
+    try:
+        forwarded = str(row["forward_content"] or "").strip()
+    except (KeyError, IndexError, TypeError):
+        forwarded = ""
+    return f"{text} {forwarded}".strip()
+
+
 def noise_reason(rows: list) -> str:
     """判断这段消息是否属于无需调用模型的噪声。
 
     仅匹配三类高置信度噪声，优先避免误判正常对话：
     整段仅含图片/表情、整段内容重复、同一发送者连续发送极短句。
     """
-    texts = [str(row["content"] or "").strip() for row in rows]
+    texts = [_row_text(row) for row in rows]
     texts = [text for text in texts if text]
     if not texts:
         return "整段没有内容"
