@@ -23,6 +23,10 @@
   只在真正无人说话时才询问模型。
 - 判定为不回复 → 该会话进入 `patrol_cooldown_seconds` 冷却期，冷却期内不开启窗口。
 - 判定为回复 → 放行最后一条事件。被 KILL 的消息仍记录在账本中，主脑通过全局时间线读取完整对话。
+- 开口后**不设冷却**：下一条消息立刻重新开窗，连续对话不会在她第一次开口后断掉。
+  冷却只有一种，就是「判为不回复」之后的静默期。
+- 窗口正文包含**她紧邻的上一句话**：判定看到的是「她说 → 对方回」的完整来回，
+  按发生顺序排列，顺序本身说明关系，不额外加提示词。
 
 ## 噪声不进入模型
 
@@ -142,6 +146,8 @@ class PatrolManager:
         self._records: dict[str, PatrolRecord] = {}
         # 正在判定中的会话：跨 await 的判定必须串行，避免两轮判定并发读写同一段账本
         self._judging: set[str] = set()
+        # 判为不回复后的冷却：完全关掉该会话的判定。开口不设冷却，
+        # 她说完一句之后下一句话立刻就能重新开窗（见 `hold`）。
         self._cooldown_until: dict[str, float] = {}
         self._version_seq = 0
         self._closed = False
@@ -190,13 +196,14 @@ class PatrolManager:
                 return blocked
 
             # 冷却期内不开普通巡检窗口；静默窗口（@ / 私聊）不受冷却限制。
-            if (
-                not silent
-                and existing is None
-                and self._cooldown_until.get(chat_id, 0.0) > now
-            ):
-                logger.debug("[什亭之枢] 巡检冷却中，拦下 | %s", chat_id)
-                return None
+            # 冷却只有一种：**上一轮判为不回复**。她开口过不构成冷却，
+            # 下一句照样立刻开窗——否则一问一答会在她第一次开口后断掉。
+            if not silent and existing is None:
+                if self._cooldown_until.get(chat_id, 0.0) > now:
+                    logger.debug("[什亭之枢] 巡检冷却中，拦下 | %s", chat_id)
+                    return None
+                # 过期的记录顺手清掉，避免计时字典随会话数无限增长
+                self._cooldown_until.pop(chat_id, None)
 
             if existing is not None:
                 # 旧事件 KILL，只留最后一条持有窗口
@@ -362,12 +369,8 @@ class PatrolManager:
             if should_reply and superseded:
                 should_reply = False
                 reason = f"{reason}（判定期间已出现新消息，交由下一窗口处理）"
-            # 开口后给该会话一个最小回复间隔，避免活跃群里连续刷屏。
-            if should_reply:
-                gap = self._reply_cooldown_seconds()
-                if gap > 0:
-                    async with self._lock:
-                        self._cooldown_until[record.chat_id] = time.time() + gap
+            # 开口不设冷却：她说完这一句，下一句话立刻就能重新开窗判定。
+            # 只有「判为不回复」才写 `_cooldown_until`（上面的分支）。
             # 未调用模型就跳过（噪声预过滤 / 窗口没有新消息）只记 DEBUG，
             # 避免刷屏；真正由模型判定的沉默才记 INFO。
             log = logger.info if enter_cooldown else logger.debug
@@ -393,21 +396,40 @@ class PatrolManager:
         if record.future and not record.future.done():
             record.future.set_result(verdict)
 
+    def _previous_line(self, chat_id: str, first_row) -> str:
+        """窗口第一条之前紧邻的那一行，若她说的则返回格式化后的文本。
+
+        把这段对话看作一个窗口：她刚说过的话也在里面。补上这一行，判定
+        看到的就是「她说 → 对方回」的完整来回，顺序本身已经说明了关系，
+        不需要在提示词里额外解释「你刚刚开口了」。
+
+        只在紧邻的一行是 `assistant` 时补，中间夹了别人的话就不补——那时
+        顺序已经由前文的其他人发言交代清楚，硬塞一句反而会让人误以为
+        这条回应是接在她的那句话后面。
+        """
+        try:
+            rows = self._short_term.messages_before(
+                chat_id,
+                float(first_row["created_at"]),
+                int(first_row["id"]),
+                1,
+            )
+        except Exception as error:
+            logger.debug("[什亭之枢] 读取窗口前一行失败: %s", error)
+            return ""
+        if not rows:
+            return ""
+        try:
+            row = rows[-1]
+            if str(row["role"] or "") != "assistant":
+                return ""
+            return format_message_line(row)
+        except (KeyError, IndexError, TypeError):
+            return ""
+
     def _cooldown_seconds(self) -> float:
         try:
             return max(float(self._config.patrol_cooldown_seconds), 0.0)
-        except (TypeError, ValueError):
-            return 60.0
-
-    def _reply_cooldown_seconds(self) -> float:
-        """开口后的最小回复间隔；0 表示不限制。"""
-        try:
-            return max(
-                float(
-                    getattr(self._config, "patrol_reply_cooldown_seconds", 60.0)
-                ),
-                0.0,
-            )
         except (TypeError, ValueError):
             return 60.0
 
@@ -426,7 +448,13 @@ class PatrolManager:
             if noise:
                 return False, noise, False
 
+        # 她刚说的话也属于这段对话：补进正文最前面，让模型看到的是一段
+        # 按发生顺序排列的完整来回，而不是孤零零的一句回应。判断依据只有
+        # 顺序本身，不再额外加提示词。
+        previous = self._previous_line(record.chat_id, rows[0])
         lines = [format_message_line(row) for row in rows]
+        if previous:
+            lines.insert(0, previous)
         chat_label = str(rows[-1]["chat_label"] or "")
         before = self._history_before(record.chat_id, rows[0])
         decision = await self._decider.judge_window(

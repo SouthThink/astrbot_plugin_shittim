@@ -205,9 +205,7 @@ class DecisionConfig:
     # 最后一条群消息之后安静该时长才判定；期间出现新消息会重新计时。
     # 持续发言时不封顶判定——只在真正无人说话时才询问模型。
     patrol_window_seconds: float = 10.0
-    patrol_cooldown_seconds: float = 60.0  # 判定为不回复后的会话冷却时长
-    # 开口后的最小回复间隔：活跃群里避免连续接话。@ / 私聊不受此项限制。
-    patrol_reply_cooldown_seconds: float = 60.0
+    patrol_cooldown_seconds: float = 60.0  # 判定为不回复后的会话冷却时长（开口不设冷却）
     patrol_noise_filter: bool = True       # 整段仅含图片/重复内容/连续短句时跳过模型调用
     # 移除 AstrBot 内置的 send_message_to_user。
     # 该工具参数错误时会静默发送到当前会话（实测已造成误发），且绕过会话解析
@@ -250,9 +248,6 @@ class DecisionConfig:
             ),
             patrol_cooldown_seconds=_get_float(
                 cfg, "decision.patrol_cooldown_seconds", 60.0
-            ),
-            patrol_reply_cooldown_seconds=_get_float(
-                cfg, "decision.patrol_reply_cooldown_seconds", 60.0
             ),
             patrol_noise_filter=bool(
                 _get(cfg, "decision.patrol_noise_filter", True)

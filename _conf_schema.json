@@ -254,12 +254,7 @@
         "default": 10.0
       },
       "patrol_cooldown_seconds": {
-        "description": "判为不回后该会话的冷却时长：期间不调用模型、不处理积压，@ 仍可穿透（秒）",
-        "type": "float",
-        "default": 60.0
-      },
-      "patrol_reply_cooldown_seconds": {
-        "description": "开口后该会话的最小回复间隔，避免活跃群连续接话；@ 与私聊不受限制，设为 0 关闭（秒）",
+        "description": "判为不回后该会话的冷却时长：期间不调用模型、不处理积压，@ 仍可穿透；开口不设冷却，说完一句后下一句照常判定（秒）",
         "type": "float",
         "default": 60.0
       },
