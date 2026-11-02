@@ -7,17 +7,19 @@
 ## 位置榜取代权重
 
 长期记忆不使用「强度」权重，仅依据**最后一次被想起的时刻**（`promoted_at`）
-排序：每晚整理产出的记忆与每次召回都会上浮到最前，使用较少的记忆自然下沉；
-进入榜尾后逐级模糊，长期未被召回的才会被遗忘。
+排序。新提炼的记忆按它覆盖的对话时间入榜，当天摘要、合并结果与每次主动召回
+落在最前；使用较少的记忆自然下沉，进入榜尾后逐级模糊，长期未被召回的才会被遗忘。
 
 选择该方案的原因：排序结果**确定**，可直接反映记忆强度；
 而基于权重衰减的方案依赖较多参数与半衰期，难以调整与解释。
 
-## 两条召回路径的依据不同
+## 三条召回路径的依据不同
 
 - **自动插入**（拼上下文）：按榜序取前 N 条，与话题无关。
-- **工具召回**（`recall`，表现为「我想想」）：按**关键词相关性**排序。
-  若此处也按榜序，会召回「榜上靠前但与当前话题无关」的记忆。
+- **主脑自动相关召回**：按当前消息做关键词匹配，只补榜前没覆盖的部分；
+  不计数、不改变榜序。
+- **工具召回**（`recall`，表现为「我想想」）：按**关键词相关性**排序，
+  且会更新召回次数与榜序。若也按榜序，会召回「榜上靠前但与当前话题无关」的记忆。
 
 注入时另有反过拟合指令约束（见 core/memory/injector.py）。
 """
@@ -237,14 +239,21 @@ class MemoryStore:
         manual: bool = False,
         merged_from: list[int] | None = None,
         created_at: float | None = None,
+        promoted_at: float | None = None,
     ) -> int:
         """写入一条记忆，返回自增 id。
 
         manual=True 表示「用户或插件明确要求记住」，直接写入永久层，不经过阈值晋升。
-        新记忆一律**上浮到榜首**（promoted_at = now）：刚写入即为最新。
-        传入旧 `created_at` 的记录（如导入历史）按其原有时间排序，不会上浮。
+
+        `created_at` 是这条记忆**产生的时间**（导入历史时保留原时间）；
+        `promoted_at` 是**入榜位置**，默认等于 `created_at`——新写入即最新。
+        整理时提炼出的记忆会把入榜位置设为「这段发言覆盖的末尾时间」，
+        这样每晚整理不会把所有新条目一起压到榜首、把旧榜整版刷下去。
+        只有当天摘要与合并结果才显式落在当下。
         """
-        now = float(created_at if created_at is not None else time.time())
+        now = time.time()
+        created = float(created_at if created_at is not None else now)
+        promoted = float(promoted_at if promoted_at is not None else created)
         keyword_list = [k for k in (keywords or extract_keywords(content)) if k]
         if manual:
             tier = TIER_PERMANENT
@@ -268,10 +277,10 @@ class MemoryStore:
                 user_id,
                 user_name,
                 1 if manual else 0,
-                now,
-                now,
+                created,
+                created,
                 json.dumps(merged_from or [], ensure_ascii=False),
-                now,
+                promoted,
             ),
         )
         memory_id = int(cursor.lastrowid or 0)
@@ -289,11 +298,15 @@ class MemoryStore:
         chat_label: str | None = None,
         user_id: str | None = None,
         user_name: str | None = None,
+        promoted_at: float | None = None,
     ) -> tuple[int, bool]:
         """去重写入。
 
         若已存在高度相似的长期记忆，则**上浮**它（同一件事又被说了一次＝又被
         想起一次），必要时累加跨会话计数；否则新建。返回 (记忆 id, 是否新建)。
+
+        新建时可用 `promoted_at` 指定入榜位置：整理提炼出的记忆按发言覆盖的
+        时间落位，而不是把整批新条目一起压到榜首。
         """
         keyword_list = [k for k in (keywords or extract_keywords(content)) if k]
         duplicate = self._find_duplicate(keyword_list, user_id=user_id)
@@ -308,6 +321,7 @@ class MemoryStore:
                     chat_label=chat_label,
                     user_id=user_id,
                     user_name=user_name,
+                    promoted_at=promoted_at,
                 ),
                 True,
             )

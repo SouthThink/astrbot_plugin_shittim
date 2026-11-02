@@ -112,10 +112,17 @@ class MemoryConfig:
     auto_index: int = 30                  # 仅提供关键词索引的后续条数
     # 自动插入的 token 预算：永久记忆、榜前正文与关键词索引共用
     recall_token_budget: int = 1600
+    # 永久记忆的独立预算：0 = 不单独限制（与 recall_token_budget 共用）。
+    # 永久层会随时间无限增长，不设上限时会把榜前正文与关键词索引挤空。
+    permanent_token_budget: int = 600
     # 工具召回参数：按关键词相关性排序，与榜序无关
     recall_top_k: int = 5                 # 话题相关记忆条数
     recall_user_top_k: int = 3            # 用户相关记忆条数
     recall_min_score: float = 0.18        # 低于该分数的记忆不返回
+    # 主脑自动相关召回：每轮按当前消息做一次关键词召回，取少量相关记忆。
+    # 它不计入「被想起」，也不上浮榜序——只有主动 recall 才影响位置榜。
+    auto_recall_top_k: int = 3
+    auto_recall_token_budget: int = 400
 
     # ── 维护 ──────────────────────────────────────────────
     # 只控制维护步骤（降级 / 遗忘 / 晋升 / 合并）；深睡是否整理由
@@ -182,6 +189,13 @@ class MemoryConfig:
             recall_user_top_k=_get_int(cfg, "memory.recall_user_top_k", 3),
             recall_min_score=_get_float(cfg, "memory.recall_min_score", 0.18),
             recall_token_budget=_get_int(cfg, "memory.recall_token_budget", 1600),
+            permanent_token_budget=_get_int(
+                cfg, "memory.permanent_token_budget", 600
+            ),
+            auto_recall_top_k=_get_int(cfg, "memory.auto_recall_top_k", 3),
+            auto_recall_token_budget=_get_int(
+                cfg, "memory.auto_recall_token_budget", 400
+            ),
             maintenance_enabled=bool(_get(cfg, "memory.maintenance_enabled", True)),
             decay_half_life_days=_get_float(cfg, "memory.decay_half_life_days", 30.0),
             promote_min_recall=_get_int(cfg, "memory.promote_min_recall", 8),

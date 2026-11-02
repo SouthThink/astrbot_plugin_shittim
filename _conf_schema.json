@@ -175,6 +175,21 @@
         "type": "int",
         "default": 1600
       },
+      "permanent_token_budget": {
+        "description": "永久记忆注入块的独立 token 预算（token）；设为 0 表示不单独限制，与 recall_token_budget 共用",
+        "type": "int",
+        "default": 600
+      },
+      "auto_recall_top_k": {
+        "description": "主脑自动相关召回：每轮按当前消息取多少条话题相关的长期记忆（条）；设为 0 关闭，不影响主动 recall",
+        "type": "int",
+        "default": 3
+      },
+      "auto_recall_token_budget": {
+        "description": "主脑自动相关召回块的 token 预算（token）；与榜前记忆各自独立",
+        "type": "int",
+        "default": 400
+      },
       "maintenance_enabled": {
         "description": "记忆维护（降级 / 遗忘 / 晋升 / 合并）开关；不影响短期压缩与深睡收口",
         "type": "bool",

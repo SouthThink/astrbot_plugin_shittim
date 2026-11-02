@@ -80,9 +80,13 @@ pages/memory/   记忆页面
 
 `ledger`（账本）→ `extractor`（`condense` 压缩、`merge` 合并、`build_profile` 画像）→ `store`（位置榜 / 召回 / 晋升）→ `maintenance`（收口 / 降级 / 遗忘 / 晋升 / 合并），`profile` 负责用户画像的存储与整理更新。主脑上下文默认沿用 AstrBot 原生按会话历史，注入拼装走 `injector`，时间线仅在接管模式下由 `timeline` 从账本重建，图片经 `vision` 转述、合并转发经 `forward` 取回，坏图摘除在 `history`。
 
-**主脑上下文默认不接管**：`memory.context_takeover=False`（默认）时 `on_llm_request` **不修改 `req.contexts`**，说话人画像、记忆块、跨会话背景（`<cross_session_timeline>`）与作息提示经 `req.extra_user_content_parts` 以 `TextPart(...).mark_as_temp()` 追加，仅本轮可见、不写持久历史，也不会破坏原生前缀缓存。跨会话背景由 `ledger.timeline_entries_balanced()` 取样：每个会话保留最近 `short_term_context_per_chat` 条、纳入最近 `short_term_context_chats` 个会话，**当前会话始终入选且其 `gated=1` 消息全量保留**（这些消息没进官方历史），活摘要也一并保留；原生历史为空时 `include_current=True` 兜底。开启接管后才由 `timeline.build_timeline()` 把账本（`archived_at = 0 AND condensed_at = 0 AND staged = 0`）加活着的摘要渲染成 `req.contexts`——她说过的话是 `assistant`（只放原话），别人的话是 `user`（带 `[会话标签] 发言人 (绝对时间戳):`），摘要用 `<earlier_summary>` 包裹，末尾标明「你现在在跟谁说话」。此时 AstrBot 的原生按会话历史被整体丢弃（`_rebuild_timeline()`）。数据源只覆盖**今天**，超预算从**最旧的**开始丢。
+**主脑上下文默认不接管**：`memory.context_takeover=False`（默认）时 `on_llm_request` **不修改 `req.contexts`**，说话人画像、话题相关召回、记忆块、跨会话背景（`<cross_session_timeline>`）与作息提示经 `req.extra_user_content_parts` 以 `TextPart(...).mark_as_temp()` 追加，仅本轮可见、不写持久历史，也不会破坏原生前缀缓存。跨会话背景由 `ledger.timeline_entries_balanced()` 取样：每个会话保留最近 `short_term_context_per_chat` 条、纳入最近 `short_term_context_chats` 个会话，**当前会话始终入选且其 `gated=1` 消息全量保留**（这些消息没进官方历史），活摘要也一并保留；原生历史为空时 `include_current=True` 兜底。开启接管后才由 `timeline.build_timeline()` 把账本（`archived_at = 0 AND condensed_at = 0 AND staged = 0`）加活着的摘要渲染成 `req.contexts`——她说过的话是 `assistant`（只放原话），别人的话是 `user`（带 `[会话标签] 发言人 (绝对时间戳):`），摘要用 `<earlier_summary>` 包裹，末尾标明「你现在在跟谁说话」。此时 AstrBot 的原生按会话历史被整体丢弃（`_rebuild_timeline()`）。数据源只覆盖**今天**，超预算从**最旧的**开始丢。
 
 **用户画像以「平台 + QQ 号」为身份**：`profile.py` 的 `ProfileStore` 只负责印象（描述 / 关键词 / 更新节拍），名字由 `user_ledger.user_names` 实时累积——两者分开，改名只更新名字列表，不触发画像重写。`ProfileMaintainer` 在 `MemoryMaintainer.run()` 之后、短期收口**之前**运行：只处理 `profile_window_hours` 内活跃的人，且自 `profiled_at` 之后新增发言达到 `profile_min_messages` 条才调用模型，单次最多 `profile_max_users_per_run` 人。模型输出**完整的新描述 + 新关键词**（整体替换），因此「删除」就是新列表里不再出现它。失败不写 `profiled_at`，下一轮重试，旧画像保持不变。画像块由 `injector.build_profile_block()` 生成，注入时排在最前，只作背景、不得复述。
+
+**主脑每轮还会做一次话题相关召回**：`main._related_memories()` 用当前消息（为空时退回本会话近期文本）调用 `MemoryStore.recall()`，取 `auto_recall_top_k` 条，使用独立预算 `auto_recall_token_budget`，并排除已在永久段 / 榜前正文 / 索引里的条目。它**不调用 `mark_recalled()`**：自动注入若计数，榜前条目会因反复参与而自我强化。只有主动 `recall`、且 message 通道命中分数 ≥ `recall_min_score` 时才计入召回次数并上浮榜序。
+
+**新记忆的入榜位置按对话时间落**：`ledger.condense_context()` 返回 `covered_at`，`maintenance._write_condensed_memories()` 把它作为 `promoted_at`；`created_at` 仍是真实写入时间，用于遗忘的陈旧度判断。只有当天摘要（`_promote_day_summary`）与合并结果（`_apply_merge`）显式落在当下。把普通提炼结果改回 `now` 会让每晚整理把整张榜刷成「最近整理榜」。永久记忆注入另有独立预算 `permanent_token_budget`，否则永久层增长会静默挤空榜前正文与索引。
 
 **消息行必须用绝对时间戳**：`ledger.format_message_line()` 用 `format_clock()`，不要改回 `format_age()`。相对时间会让同一行的文本随当前时刻变化，导致请求前缀逐轮改变、prompt / KV 缓存全部失效。
 
@@ -125,10 +129,10 @@ pages/memory/   记忆页面
 | `core/gate/patrol.py` | 巡检窗口 | 扣押 / 替换 / 冷却 / 噪声 / 最近判定快照都在这里 |
 | `core/focus/manager.py` | 焦点读写 | 只约束主动发言，别在被动接话路径上读它 |
 | `core/memory/ledger.py` | 账本读写、行格式化、条目查询、压缩落库、清空 | `_LIVE_SQL` 是「她此刻应该记得的」唯一表达，**新增查询必须带上它**；`format_message_line` 供判定，`format_speech` 供时间线 |
-| `core/memory/store.py` | 位置榜、召回打分、等级推导、遗忘请求 | 榜序 `_BOARD_ORDER` 与分档常量在顶部；等级一律用 `curation_level(rank, total)` 推导，不要新增「等级」列 |
+| `core/memory/store.py` | 位置榜、召回打分、等级推导、遗忘请求 | 榜序 `_BOARD_ORDER` 与分档常量在顶部；等级一律用 `curation_level(rank, total)` 推导，不要新增「等级」列；`promoted_at` 是入榜位置，`created_at` 是产生时间，两者不可混用 |
 | `core/memory/maintenance.py` | 压缩 / 树状收口 / 降级 / 遗忘 / 晋升 / 合并 | `run()` 不含收口与清空，那两步在 main；摘要长度常量在文件顶部 |
 | `core/memory/profile.py` | 用户画像的存储与整理更新 | 身份是 `(platform, user_id)`；名字在 `user_ledger`，画像只存印象；输出整体替换；更新必须在短期收口之前 |
-| `core/memory/injector.py` | 画像 / 记忆注入块 + 作息事件提示 | 只负责「长什么样」，「放哪里」在 main |
+| `core/memory/injector.py` | 画像 / 相关召回 / 记忆注入块 + 作息事件提示 | 只负责「长什么样」，「放哪里」在 main |
 | `core/memory/timeline.py` | 账本条目 → `req.contexts`（仅接管模式） | 默认不参与；摘要包 `<earlier_summary>`；每条都要 `_no_save` |
 | `core/memory/history.py` | 坏图摘除 | 只做「确定读不到的图片引用」，别恢复官方历史回填 |
 | `core/memory/vision.py` | 图片转文字 | 引用必须当场取出，临时文件会失效 |
@@ -149,13 +153,14 @@ pages/memory/   记忆页面
 
 **记忆**
 
-- 调整注入顺序 → `main.inject_memory_context()`：说话人画像 → 永久记忆 → 长期记忆 →（跨会话近况）→（原生历史 / 时间线）→ 作息事件提示。默认走 `_append_temp_parts()` 追加临时块；`context_takeover=True` 时才整体替换 `req.contexts`。
+- 调整注入顺序 → `main.inject_memory_context()`：说话人画像 → 话题相关召回 → 永久记忆 → 榜前长期记忆 →（跨会话近况）→（原生历史 / 时间线）→ 作息事件提示。默认走 `_append_temp_parts()` 追加临时块；`context_takeover=True` 时才整体替换 `req.contexts`。
+- 调整主脑自动相关召回 → `main._related_memories()`；条数是 `memory.auto_recall_top_k`（0 = 关闭），独立预算是 `auto_recall_token_budget`，阈值复用 `recall_min_score`。它不改变榜序，只有主动 `recall` 才计数。
 - 调整跨会话连续性 → `main._cross_session_block()` + `ledger.timeline_entries_balanced()` + `timeline.build_timeline_block()`；配额是 `memory.short_term_context_*`，预算沿用 `timeline_token_budget` / `timeline_max_messages`。
 - 调整时间线（仅接管模式）→ `memory/timeline.py` 的 `build_timeline()` 与 `ledger.timeline_entries()`；预算是 `memory.timeline_token_budget` / `timeline_max_messages`。
 - 改账本结构 → `common/db.py` 三处一起改；老库靠 `_COLUMN_MIGRATIONS` 补列。
 - 调整压缩质量 → `extractor.py` 的 `_CONDENSE_PROMPT` / `_EXTRACT_RULES`；阈值与批大小是 `memory.condense_threshold` / `condense_batch`。
 - 调整压缩时机 → `main._schedule_condense_if_due()`（调用点在记账与发送后）；动手门槛在 `maintenance.condense_short_term()`。
-- 调整位置榜分档或遗忘 → `store.py` 顶部常量 + `curation_level()` / `is_tail()`；`maintenance._demote()` / `_forget()`；门槛是 `memory.forget_min_curations` / `forget_stale_days`。
+- 调整位置榜分档或遗忘 → `store.py` 顶部常量 + `curation_level()` / `is_tail()`；`maintenance._demote()` / `_forget()`；门槛是 `memory.forget_min_curations` / `forget_stale_days`。入榜位置由 `promoted_at` 决定（普通提炼用 `covered_at`，当天摘要 / 合并用当下）；永久层注入预算是 `permanent_token_budget`。
 - 调整历史回查 → `main.search_history`（参数夹紧、默认当前会话）+ `ledger.search_history()`。它**绕过 `_LIVE_SQL`**，改动前先想清楚哪些行不该被翻出来。
 - 调整用户画像 → `memory/profile.py` 的 `ProfileStore`（身份 / 印象）与 `ProfileMaintainer`（整理时更新，节拍是 `memory.profile_*`）；名字来自 `user_ledger.user_names`，素材来自 `ledger.user_messages_since()`；注入在 `main._speaker_profile()` + `injector.build_profile_block()`；页面走 `web_api.profiles`。
 - 调整图片转述 → `memory/vision.py`（取图、data URL、缓存、模型能力检查）。

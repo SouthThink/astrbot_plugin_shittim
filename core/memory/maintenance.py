@@ -3,9 +3,9 @@
 按设计，该管线在「深睡」阶段执行：睡前统一整理，醒来即为整理后的记忆。
 管线运行于对话路径之外，失败不应影响任何消息处理。
 
-整理产生的记忆**一律上浮到榜前**（`promoted_at = now`）——包括压缩时一并
-产出的记忆，以及合并重写出的记忆。位置榜的语义是「最后一次被想起」，而整理
-即代表「被想起了一次」，因此合并无需单独处理。
+整理产生的记忆不再一律上浮到榜前：当天摘要与合并结果落在当下（`promoted_at = now`），
+而压缩时提炼出的普通记忆按「这段发言覆盖的末尾时间」入榜。否则每晚整理会把
+几十条新条目一起压到旧记忆前面，位置榜会被刷成「最近整理榜」。
 """
 
 from __future__ import annotations
@@ -275,7 +275,12 @@ class MemoryMaintainer:
     def _write_condensed_memories(
         self, memories: list[dict], context: dict
     ) -> tuple[int, int]:
-        """把压缩时顺带产出的长期记忆写进去，返回 (新增, 强化)。"""
+        """把压缩时顺带产出的长期记忆写进去，返回 (新增, 强化)。
+
+        新建条目按这一批发言覆盖的末尾时间入榜（`context["covered_at"]`），
+        而不是统一压到当下：否则一次整理就会把整张榜刷成新内容。被重新提到
+        的旧记忆仍会上浮到榜首——「又被说了一次」确实是新的使用证据。
+        """
         created = 0
         reinforced = 0
         for item in memories:
@@ -295,6 +300,7 @@ class MemoryMaintainer:
                 chat_label=context.get("chat_label"),
                 user_id=context["name_to_id"].get(name),
                 user_name=name or None,
+                promoted_at=context.get("covered_at") or None,
             )
             if is_new:
                 created += 1

@@ -66,6 +66,7 @@ from .core.common.event_utils import (
     describe_non_text,
     extract_reply_text,
     get_extra,
+    get_message_text,
     is_private_chat,
     is_upstream_command_event,
     platform_of,
@@ -91,6 +92,7 @@ from .core.memory.injector import (
     build_injected_entry,
     build_memory_blocks,
     build_profile_block,
+    build_related_block,
     build_schedule_notice,
 )
 from .core.memory.ledger import (
@@ -1016,8 +1018,8 @@ class ShittimPlugin(Star):
 
         结果顺序即模型读取顺序：
 
-            ① 当前说话人的画像 → ② 永久记忆 → ③ 长期记忆 → ④ 跨会话背景
-            →（原生历史/时间线）→ 作息事件提示
+            ① 当前说话人的画像 → ② 话题相关召回 → ③ 永久记忆 → ④ 榜前长期记忆
+            → ⑤ 跨会话背景 →（原生历史/时间线）→ 作息事件提示
         """
         chat_id = event.unified_msg_origin or ""
         try:
@@ -1055,6 +1057,43 @@ class ShittimPlugin(Star):
             logger.debug("[什亭之枢] 读取用户画像失败: %s", error)
             return None
 
+    def _related_memories(
+        self, event: AstrMessageEvent, chat_id: str, *, exclude_ids: set[int]
+    ) -> list:
+        """按当前消息做一次话题相关召回，供主脑直接使用。
+
+        与榜前记忆互补：榜前负责「最近被想起的」，这里负责「恰好对得上这句话
+        的」。命中结果**不调用 `mark_recalled()`**：自动注入若也计数，榜前条目
+        会因反复参与而自我强化，榜单就失去意义。只有主脑主动 `recall` 才更新
+        召回次数与榜序（见 `recall_memory`）。
+        """
+        try:
+            top_k = int(self.memory_config.auto_recall_top_k)
+        except (TypeError, ValueError):
+            top_k = 0
+        if top_k <= 0:
+            return []
+
+        text = get_message_text(event).strip()
+        if not text:
+            # 纯图片 / 纯转发消息的 message_str 可能为空，退回本会话最近的文本
+            text = self._build_query_text(chat_id).strip()
+        if not text:
+            return []
+
+        try:
+            recalled = self.memory_store.recall(
+                query_text=text,
+                top_k=top_k,
+                user_top_k=0,
+                min_score=self.memory_config.recall_min_score,
+                exclude_ids=exclude_ids,
+            )
+        except Exception as error:
+            logger.debug("[什亭之枢] 自动相关召回失败: %s", error)
+            return []
+        return [item.memory for item in recalled]
+
     def _inject_memory_blocks(
         self, event: AstrMessageEvent, req, chat_id: str
     ) -> None:
@@ -1070,16 +1109,33 @@ class ShittimPlugin(Star):
         if profile_block:
             blocks.append(profile_block)
 
-        # ② 永久记忆全量 → ③ 榜前 auto_top 条正文 → ④ 其后 auto_index
-        #    条关键词索引。**自动插入不计入「被想起」**：仅主动 recall 才计入，
-        #    否则榜前条目会相互提升排名，导致榜单停止更新。
+        # ② 与当前消息相关的召回：补上「榜前记忆没覆盖、但这句话正好碰上」的部分。
+        #    **不计入「被想起」**——自动注入若计数，榜前条目会自我强化。
         permanent = self.memory_store.permanents()
         bodies, index = self.memory_store.auto_injection()
+        related = self._related_memories(
+            event,
+            chat_id,
+            # 只排除已经给了完整正文的条目；关键词索引里的条目并不展示内容，
+            # 若与这句话相关，补上正文反而更有用。
+            exclude_ids={m.id for m in (*permanent, *bodies)},
+        )
+        related_block = build_related_block(
+            memories=related,
+            token_budget=self.memory_config.auto_recall_token_budget,
+        )
+        if related_block:
+            blocks.append(related_block)
+
+        # ③ 永久记忆全量 → ④ 榜前 auto_top 条正文 → ⑤ 其后 auto_index
+        #    条关键词索引。自动插入同样不计入「被想起」：仅主动 recall 才计入，
+        #    否则榜前条目会相互提升排名，导致榜单停止更新。
         for block in build_memory_blocks(
             permanent=permanent,
             bodies=bodies,
             index=index,
             token_budget=self.memory_config.recall_token_budget,
+            permanent_budget=self.memory_config.permanent_token_budget,
         ):
             blocks.append(block)
 
@@ -1952,15 +2008,23 @@ class ShittimPlugin(Star):
         if not recalled:
             return "想了半天，没想起来相关的。"
         # 「被想起」是位置榜唯一的加权来源：只有主动 recall 才计数并上浮。
-        # 自动注入（榜前正文 / 关键词索引）与判定层的内部召回都不计入，
-        # 否则榜前条目会互相抬高名次，榜单就停止更新了。
-        try:
-            self.memory_store.mark_recalled(
-                [item.memory.id for item in recalled]
-            )
-        except Exception as error:
-            # 计数失败不影响把内容交给模型：回忆本身已经完成
-            logger.error("[什亭之枢] 更新召回计数失败: %s", error)
+        # 自动注入（榜前正文 / 关键词索引 / 话题相关召回）与判定层的内部召回
+        # 都不计入，否则榜前条目会互相抬高名次，榜单就停止更新了。
+        #
+        # 计数只认**确实命中话题**的结果：user 通道是「这个人相关」的兜底，
+        # 可能零关键词命中；若也计数，会把噪声一步步推成永久记忆。
+        threshold = self.memory_config.recall_min_score
+        remembered = [
+            item.memory.id
+            for item in recalled
+            if item.channel == "message" and item.score >= threshold
+        ]
+        if remembered:
+            try:
+                self.memory_store.mark_recalled(remembered)
+            except Exception as error:
+                # 计数失败不影响把内容交给模型：回忆本身已经完成
+                logger.error("[什亭之枢] 更新召回计数失败: %s", error)
         return "你想起来了一些事：\n" + "\n".join(
             f"- {item.memory.content}" for item in recalled
         )

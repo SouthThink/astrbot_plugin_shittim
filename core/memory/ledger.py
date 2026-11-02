@@ -497,11 +497,18 @@ class ShortTermLedger:
         return "\n".join(line for line in lines if line)
 
     def condense_context(self, entries: list[dict]) -> dict:
-        """待压缩区段的归属信息，供写入长期记忆时带上来源。"""
+        """待压缩区段的归属信息，供写入长期记忆时带上来源。
+
+        同时返回 `covered_at`（区段末尾时间）：长期记忆的入榜位置按它落位，
+        而不是统一压到「现在」。否则每晚整理产出的每一条都会排在旧记忆前面，
+        榜单会被新内容整版刷新。
+        """
         name_to_id: dict[str, str] = {}
         chat_ids: set[str] = set()
         chat_label = ""
+        covered_at = 0.0
         for entry in entries:
+            covered_at = max(covered_at, float(entry.get("at") or 0.0))
             if entry.get("kind") != "message":
                 continue
             row = entry["row"]
@@ -515,6 +522,7 @@ class ShortTermLedger:
             "chat_id": single or None,
             "chat_label": chat_label if single else None,
             "name_to_id": name_to_id,
+            "covered_at": covered_at,
         }
 
     def apply_condensation(

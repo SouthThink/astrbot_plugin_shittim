@@ -59,6 +59,12 @@ _INDEX_HEADER = f"""{_BLOCK_OPEN}
 如果眼前的话题碰到其中任何一条，先调用 recall 想一想，不要凭印象说。
 """
 
+# 与当前话题相关的自动召回：位置榜负责「最近被想起的」，这一段负责
+# 「恰好对上这句话的」。两者都不计召回次数，只有主动 recall 才影响榜序。
+_RELATED_HEADER = f"""{_BLOCK_OPEN}
+下面这些是你此刻想起的、与眼前话题有关的旧事。它们只是恰好对上了现在这句话。
+{_BLOCK_RULES}"""
+
 # 索引行最多并列几个词：它只是「提示有这么件事」，不是内容本身
 _INDEX_TERMS_MAX = 6
 # 取不到标签与关键词时的兜底长度
@@ -85,29 +91,62 @@ def build_memory_blocks(
     bodies: list[Memory],
     index: list[Memory],
     token_budget: int,
+    permanent_budget: int = 0,
 ) -> list[str]:
     """拼出 ① 永久记忆 → ② 榜前正文 → ③ 关键词索引 三段块。
 
     token 预算**依次共用**：永久记忆优先占用，其次为榜前正文，最后为索引。
     相比让索引挤占已确认记忆的预算，减少索引行数是更优的取舍。
+
+    `permanent_budget` 给永久层单独设上限（0 = 不单独限制）。永久记忆只增
+    不减，不设上限时会把榜前正文与索引挤空——那两段才是「当下可能用得上」
+    的内容，不能因为永久层变大而静默消失。
     """
     budget = int(token_budget)
     if budget <= 0:
         return []
     blocks: list[str] = []
-    for header, memories in ((_PERPETUAL_HEADER, permanent), (_BOARD_HEADER, bodies)):
-        lines = [
-            f"- {(m.content or '').strip()}" for m in memories if (m.content or "").strip()
-        ]
-        block, used = _render_block(header, lines, budget)
-        if block:
-            blocks.append(block)
-            budget -= used
+
+    perm_lines = [
+        f"- {(m.content or '').strip()}" for m in permanent if (m.content or "").strip()
+    ]
+    perm_budget = (
+        budget if permanent_budget <= 0 else min(int(permanent_budget), budget)
+    )
+    block, used = _render_block(_PERPETUAL_HEADER, perm_lines, perm_budget)
+    if block:
+        blocks.append(block)
+        budget -= used
+
+    body_lines = [
+        f"- {(m.content or '').strip()}" for m in bodies if (m.content or "").strip()
+    ]
+    block, used = _render_block(_BOARD_HEADER, body_lines, budget)
+    if block:
+        blocks.append(block)
+        budget -= used
+
     index_lines = [line for line in (index_line(m) for m in index) if line]
     block, _ = _render_block(_INDEX_HEADER, index_lines, budget)
     if block:
         blocks.append(block)
     return blocks
+
+
+def build_related_block(*, memories: list[Memory], token_budget: int = 400) -> str:
+    """把「与当前消息相关」的召回结果拼成一块。
+
+    与榜前正文分开的原因：榜前按最近被想起排序，和眼前话题未必相关；
+    这一段才是按当前这句话做关键词命中的结果。它只对当前话题负责，
+    因此有独立预算，不与永久记忆 / 榜前记忆争抢。
+    """
+    lines = [
+        f"- {(m.content or '').strip()}" for m in memories if (m.content or "").strip()
+    ]
+    if not lines:
+        return ""
+    block, _ = _render_block(_RELATED_HEADER, lines, int(token_budget))
+    return block
 
 
 def _render_block(header: str, lines: list[str], budget: int) -> tuple[str, int]:
