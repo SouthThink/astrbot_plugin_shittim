@@ -28,6 +28,9 @@ EXTRA_MESSAGE_ID = "shittim_message_id"
 EXTRA_LEFT_TO = "shittim_left_to"
 # 主脑主动决定本轮不发言：结果装饰时丢弃整条消息链。
 EXTRA_SILENT = "shittim_silent"
+# 巡检判定为「开口」时的理由：注入主脑时当作它自己刚冒出的念头，
+# 避免主脑把它当成另一个人说的话而开始「和巡检聊天」。
+EXTRA_JUDGE_REASON = "shittim_judge_reason"
 
 
 def call_str(event, method_name: str, default: str = "") -> str:

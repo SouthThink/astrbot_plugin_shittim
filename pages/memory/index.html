@@ -608,7 +608,7 @@
             meta.appendChild(tag(`${item.message_count} 条发言`));
           }
           if (item.platform) {
-            meta.appendChild(line(item.platform));
+            meta.appendChild(line(`首次来自 ${item.platform}`));
           }
           if (item.last_seen) {
             meta.appendChild(line(`最近说话 ${fmtAge(item.last_seen)}`));

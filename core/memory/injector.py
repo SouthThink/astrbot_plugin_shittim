@@ -236,6 +236,35 @@ def build_profile_block(
     return "\n".join(lines)
 
 
+# ── 判定理由（当作主脑自己的念头）──────────────────────────
+
+_THOUGHT_OPEN = "<own_thought>"
+_THOUGHT_CLOSE = "</own_thought>"
+
+
+def build_judge_thought_block(reason: str) -> str:
+    """把巡检「为什么值得接」拼成一块，读起来是主脑自己刚冒出的念头。
+
+    措辞刻意使用「你刚才……冒出过一个念头」而非「判定模型认为……」：一旦
+    写成第三方陈述，主脑会把它当成另一条消息去回应，出现「和巡检聊天」。
+    这里也不写任何判定标准——该不该接属于人格提示词，插件只管把这条理由
+    递过去；主脑若觉得这个念头站不住，可以调用 `stay_silent` 收回。
+    """
+    text = " ".join(str(reason or "").split())
+    # 「决定回应」是判定模型没给理由时的兜底值，注进去只会添噪音
+    if not text or text == "决定回应":
+        return ""
+    lines = [
+        _THOUGHT_OPEN,
+        f"你刚才扫过这段对话，心里冒出过一个念头：{text}",
+        "这只是你自己一闪而过的想法，不是别人说的话，也不是新收到的消息——"
+        "不要回应它，也不要提起它。",
+        "如果你认为这个念头站不住、这一轮不接更合适，可以调用 stay_silent 收回发言。",
+        _THOUGHT_CLOSE,
+    ]
+    return "\n".join(lines)
+
+
 # ── 作息事件提示 ──────────────────────────────────────────
 
 NOTICE_WAKE = "wake"

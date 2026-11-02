@@ -175,9 +175,11 @@ CREATE TABLE IF NOT EXISTS user_ledger (
     PRIMARY KEY (platform, user_id)
 );
 
--- 用户画像：以平台 + 用户 ID（QQ 号）识别同一个人，私聊与群聊共用一份。
+-- 用户画像：以用户 ID（QQ 号）识别同一个人，私聊与群聊共用一份。
 -- 名字保存在 user_ledger.user_names（随消息实时累积），画像只负责「印象」：
 -- 描述、关键词与更新节拍。两者分开是为了让改名不触发画像重写。
+-- platform 只是「首次见到他时来自哪个平台实例」的来源标记，不参与身份判定：
+-- 同一个 QQ 在群聊与私聊里可能来自不同实例，按平台分行会长出两份画像。
 CREATE TABLE IF NOT EXISTS user_profiles (
     platform      TEXT    NOT NULL,
     user_id       TEXT    NOT NULL,

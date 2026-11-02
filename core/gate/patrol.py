@@ -57,7 +57,11 @@ from typing import Any
 
 from astrbot.api import logger
 
-from ..common.event_utils import is_placeholder_only
+from ..common.event_utils import (
+    EXTRA_JUDGE_REASON,
+    is_placeholder_only,
+    set_extra,
+)
 from ..memory.ledger import format_message_line
 
 PROCESS = "PROCESS"
@@ -484,6 +488,10 @@ class PatrolManager:
                 reason,
                 judged=enter_cooldown,
             )
+            if should_reply:
+                # 把「为什么值得接」交给主脑，注入时当作它自己刚冒出的念头。
+                # 只传这一条理由，不传任何判定标准——标准属于人格提示词。
+                set_extra(record.event, EXTRA_JUDGE_REASON, reason)
             # 先写日志再唤醒等待方，使调用方的拦截/放行日志排在判定理由之后
             self._finish(record, PROCESS if should_reply else KILL)
         except asyncio.CancelledError:

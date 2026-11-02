@@ -58,6 +58,7 @@ from .core.common.config import (
 )
 from .core.common.db import MemoryDB
 from .core.common.event_utils import (
+    EXTRA_JUDGE_REASON,
     EXTRA_LEFT_TO,
     EXTRA_MESSAGE_ID,
     EXTRA_SILENT,
@@ -90,6 +91,7 @@ from .core.memory.injector import (
     NOTICE_AWAKENED,
     NOTICE_WAKE,
     build_injected_entry,
+    build_judge_thought_block,
     build_memory_blocks,
     build_profile_block,
     build_related_block,
@@ -222,6 +224,8 @@ def _part_label(text: str) -> str:
     """按注入块自带的标签给出页面上的段落名。"""
     if "<user_profile>" in text:
         return "用户画像"
+    if "<own_thought>" in text:
+        return "判定念头"
     if "<memory_reference>" in text:
         return "记忆块"
     if "<cross_session_timeline>" in text:
@@ -1019,12 +1023,15 @@ class ShittimPlugin(Star):
         结果顺序即模型读取顺序：
 
             ① 当前说话人的画像 → ② 话题相关召回 → ③ 永久记忆 → ④ 榜前长期记忆
-            → ⑤ 跨会话背景 →（原生历史/时间线）→ 作息事件提示
+            → ⑤ 跨会话背景 →（原生历史/时间线）→ ⑥ 判定念头 → 作息事件提示
         """
         chat_id = event.unified_msg_origin or ""
         try:
             if self._memory_active():
                 self._inject_memory_blocks(event, req, chat_id)
+
+            # 判定念头独立于记忆系统：它解释的是「这一轮为什么被放行」。
+            self._inject_judge_thought(event, req)
 
             # 作息事件提示独立于记忆系统：睡眠期间发生的事件与记忆是否启用无关，
             # 只要作息功能开启就应注入。
@@ -1037,11 +1044,27 @@ class ShittimPlugin(Star):
             self._capture_context_snapshot(event, req, chat_id)
 
 
+    def _inject_judge_thought(self, event: AstrMessageEvent, req) -> None:
+        """把巡检「为什么值得接」作为念头追加进本轮请求。
+
+        reason 由 `patrol._timer()` 在判定开口时写到事件上。措辞必须是
+        「你自己刚冒出的念头」而非第三方陈述：写成「判定模型认为……」时，
+        主脑会把它当成另一条消息去回应，于是出现「主脑和巡检聊天」。
+        放在所有记忆块与历史之后的末尾，读起来才是刚刚想到的。
+
+        判定标准不在这里：该不该接属于人格提示词，插件只递这一条理由。
+        """
+        reason = str(get_extra(event, EXTRA_JUDGE_REASON, "") or "")
+        block = build_judge_thought_block(reason)
+        if block:
+            self._append_temp_parts(req, [block])
+
     def _speaker_profile(self, event: AstrMessageEvent):
         """当前说话人的画像；没有或未开启注入时返回 None。
 
-        身份以「平台 + QQ 号」为准：同一个人在私聊与群聊里换了昵称，仍然是
-        同一份画像。机器人自己的消息不取（避免把她自己当成对话对象）。
+        身份以 QQ 号（`sender_id`）为准：同一个人在私聊与群聊、乃至不同平台
+        实例下都是同一份画像，换了昵称也还是同一个人。机器人自己的消息不取
+        （避免把她自己当成对话对象）。
         """
         if not self.memory_config.profile_inject:
             return None
@@ -1049,9 +1072,7 @@ class ShittimPlugin(Star):
             sender_id = call_str(event, "get_sender_id")
             if not sender_id or sender_id == call_str(event, "get_self_id"):
                 return None
-            return self.profiles.get(
-                platform_of(event) or "unknown", sender_id
-            )
+            return self.profiles.get(sender_id)
         except Exception as error:
             # 画像只是增强项，取不到不应影响本轮请求
             logger.debug("[什亭之枢] 读取用户画像失败: %s", error)
@@ -1925,6 +1946,7 @@ class ShittimPlugin(Star):
         """
         决定这一轮不发言。当你判断不该由你回应时调用：例如只是被提到名字、
         对方在讨论智能体或与你无关的话题、接话会打断别人、或你已经无话可说。
+        如果你心里那个「这条值得接」的念头其实站不住，也直接调用它收回发言。
         调用后本轮不会发送任何消息；之后有新消息仍会正常参与判定。
         """
         if self._is_terminating:
