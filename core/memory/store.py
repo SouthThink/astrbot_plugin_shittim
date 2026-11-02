@@ -354,6 +354,20 @@ class MemoryStore:
             self._db.execute("DELETE FROM memory_keywords WHERE memory_id = ?", (memory_id,))
             self._db.execute("DELETE FROM memories WHERE id = ?", (memory_id,))
 
+    def update_content(self, memory_id: int, content: str) -> bool:
+        """手工改写一条记忆的正文，并重建它的关键词索引。
+
+        关键词是从正文推导出来的，正文一改就必须重算：否则 `recall` 仍按
+        旧关键词命中，页面上的词也和新内容对不上。标签与来源原样保留——
+        手工编辑针对的是「内容写错了」，不是重新归类。
+        """
+        text = (content or "").strip()
+        if not text:
+            return False
+        keywords = [k for k in extract_keywords(text) if k]
+        self.update(memory_id, content=text, keywords=keywords)
+        return True
+
     def mark_recalled(self, memory_ids: list[int]) -> None:
         """召回计数 +1、刷新最近召回时间，并把它们**上浮到榜首**。
 

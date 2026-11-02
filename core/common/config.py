@@ -78,6 +78,18 @@ class MemoryConfig:
     # AstrBot 随后会将本轮切换到备用模型（人格与工具均会变化）
     strip_invalid_images: bool = True
 
+    # ── 用户画像 ──────────────────────────────────────────
+    # 以「平台 + QQ 号」识别同一个人：私聊与群聊共用一份画像。名字实时累积在
+    # user_ledger，画像（描述 / 关键词）由整理时的轻量模型逐步完善。
+    profile_enabled: bool = True
+    # 是否把当前说话人的画像注入主脑上下文；关闭后画像只在页面可见
+    profile_inject: bool = True
+    profile_token_budget: int = 400       # 单个画像块的 token 预算
+    profile_max_users_per_run: int = 10   # 单次整理最多更新几个人的画像
+    profile_window_hours: int = 72        # 只更新最近这么多小时内说过话的人
+    profile_min_messages: int = 3         # 新增发言达到多少条才值得调用模型
+    profile_max_messages: int = 60        # 单次整理带入的该用户发言条数上限
+
     # ── 图片转文字 ────────────────────────────────────────
     # AstrBot 仅提供「[图片]」占位，账本需要补充图片描述，
     # 否则判定与记忆页面只能看到占位符。
@@ -148,6 +160,15 @@ class MemoryConfig:
             strip_invalid_images=bool(
                 _get(cfg, "memory.strip_invalid_images", True)
             ),
+            profile_enabled=bool(_get(cfg, "memory.profile_enabled", True)),
+            profile_inject=bool(_get(cfg, "memory.profile_inject", True)),
+            profile_token_budget=_get_int(cfg, "memory.profile_token_budget", 400),
+            profile_max_users_per_run=_get_int(
+                cfg, "memory.profile_max_users_per_run", 10
+            ),
+            profile_window_hours=_get_int(cfg, "memory.profile_window_hours", 72),
+            profile_min_messages=_get_int(cfg, "memory.profile_min_messages", 3),
+            profile_max_messages=_get_int(cfg, "memory.profile_max_messages", 60),
             vision_enabled=bool(_get(cfg, "memory.vision_enabled", True)),
             vision_provider_id=str(_get(cfg, "memory.vision_provider_id", "") or ""),
             vision_prompt=str(_get(cfg, "memory.vision_prompt", "") or ""),

@@ -737,6 +737,36 @@ class ShortTermLedger:
         )
         return list(reversed(rows))
 
+    def user_messages_since(
+        self, user_id: str, since: float, limit: int = 60
+    ) -> list[sqlite3.Row]:
+        """取某个人在**所有会话**里的发言（按时间正序）。
+
+        用户画像跨私聊与群聊共用一份，因此不能按 chat_id 取；`sender_id`
+        就是 QQ 号，天然是同一个人的身份。只取 `role='user'`：助手自己的话
+        不该写进「对他的印象」。
+
+        与上下文查询同样走 `_LIVE_SQL`，并排除睡眠期暂存（`staged = 1`）：
+        已归档、已压进摘要或尚未放行的发言不再重复进入画像，画像本身会承接
+        那部分结论。
+        """
+        if not user_id:
+            return []
+        rows = self._db.query(
+            f"""
+            SELECT * FROM (
+                SELECT * FROM short_term_messages
+                 WHERE sender_id = ? AND role = 'user'
+                   AND created_at >= ? AND {_LIVE_SQL} AND staged = 0
+                 ORDER BY created_at DESC, id DESC
+                 LIMIT ?
+            )
+             ORDER BY created_at ASC, id ASC
+            """,
+            (user_id, float(since), int(limit)),
+        )
+        return list(rows)
+
     def search_history(
         self,
         *,

@@ -110,6 +110,41 @@
         "type": "bool",
         "default": true
       },
+      "profile_enabled": {
+        "description": "用户画像：以 QQ 号识别同一个人，跨私聊与群聊积累名字、印象与关键词；整理记忆时由压缩模型逐步完善，未配置压缩模型时只累积名字与发言数。关闭后不再更新，已生成的画像仍可查看",
+        "type": "bool",
+        "default": true
+      },
+      "profile_inject": {
+        "description": "把当前说话人的画像注入主脑上下文；关闭后画像只用于页面查看，不参与对话",
+        "type": "bool",
+        "default": true
+      },
+      "profile_token_budget": {
+        "description": "单个用户画像注入块的 token 预算（token）",
+        "type": "int",
+        "default": 400
+      },
+      "profile_max_users_per_run": {
+        "description": "单次记忆整理最多更新几个人的画像，按最近活跃排序（1~50）",
+        "type": "int",
+        "default": 10
+      },
+      "profile_window_hours": {
+        "description": "只更新最近这么多小时内说过话的人，避免为长期沉默的用户消耗模型调用（小时）",
+        "type": "int",
+        "default": 72
+      },
+      "profile_min_messages": {
+        "description": "某个人自上次画像更新后新增发言达到该条数才调用模型，不足则留到下次整理（条）",
+        "type": "int",
+        "default": 3
+      },
+      "profile_max_messages": {
+        "description": "单次画像更新带入的该用户发言条数上限，取最近的若干条（条）",
+        "type": "int",
+        "default": 60
+      },
       "auto_top": {
         "description": "榜前多少条长期记忆给完整正文（条）",
         "type": "int",

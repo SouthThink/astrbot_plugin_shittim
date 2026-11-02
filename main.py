@@ -90,6 +90,7 @@ from .core.memory.injector import (
     NOTICE_WAKE,
     build_injected_entry,
     build_memory_blocks,
+    build_profile_block,
     build_schedule_notice,
 )
 from .core.memory.ledger import (
@@ -99,6 +100,7 @@ from .core.memory.ledger import (
     format_message_line,
 )
 from .core.memory.maintenance import MemoryMaintainer
+from .core.memory.profile import ProfileMaintainer, ProfileStore
 from .core.memory.store import MemoryStore
 from .core.memory.timeline import build_timeline, build_timeline_block
 from .core.memory.vision import ImageCaptioner
@@ -167,6 +169,65 @@ _SLEEP_TICK_SECONDS = 60.0
 # 阶段的中文说法：日志、工具返回、记忆页面共用同一套，避免三处各写一份
 _PHASE_LABELS = {AWAKE: "清醒", SLEEP_LIGHT: "浅睡", DEEP: "深睡"}
 
+# 主脑上下文快照：仅供页面查看，保留最近若干个会话的最后一次请求。
+# 每个会话只留一份，避免热路径无限累积；单段文本做截断，防止内存占用失控。
+_CONTEXT_SNAPSHOT_SESSIONS = 8
+_CONTEXT_SNAPSHOT_ENTRY_CHARS = 4000
+_CONTEXT_SNAPSHOT_SYSTEM_CHARS = 16000
+# 单份快照的总字数上限：接管模式的时间线可能有三四百条，逐条截断仍会撑爆内存。
+# 超出时从**最旧**的上下文条目开始丢弃（与时间线自身的裁剪方向一致）。
+_CONTEXT_SNAPSHOT_TOTAL_CHARS = 60000
+
+
+def _clip_text(text: str, limit: int) -> str:
+    """按字符数截断，并标明原始长度（页面只做展示，不做还原）。"""
+    value = str(text or "")
+    if limit <= 0 or len(value) <= limit:
+        return value
+    return f"{value[:limit]}\n…（已截断，原长 {len(value)} 字）"
+
+
+def _content_text(value) -> str:
+    """把 contexts 条目的 content 还原成可读文本。
+
+    AstrBot 的历史条目可能是纯字符串，也可能是多模态分段列表；
+    取不到 `text` 时退化为 `str()`，保证页面不会因为结构未知而整块报错。
+    """
+    if value is None:
+        return ""
+    if isinstance(value, str):
+        return value
+    if isinstance(value, (list, tuple)):
+        parts: list[str] = []
+        for item in value:
+            text = getattr(item, "text", None)
+            if text is None and isinstance(item, dict):
+                text = item.get("text")
+            parts.append(str(text if text is not None else item))
+        return "\n".join(part for part in parts if part)
+    return str(value)
+
+
+def _part_text(part) -> str:
+    """临时内容块（TextPart / dict / 字符串）→ 文本。"""
+    text = getattr(part, "text", None)
+    if text is None and isinstance(part, dict):
+        text = part.get("text")
+    return str(text if text is not None else part or "")
+
+
+def _part_label(text: str) -> str:
+    """按注入块自带的标签给出页面上的段落名。"""
+    if "<user_profile>" in text:
+        return "用户画像"
+    if "<memory_reference>" in text:
+        return "记忆块"
+    if "<cross_session_timeline>" in text:
+        return "跨会话背景"
+    if "<schedule_notice>" in text:
+        return "作息提示"
+    return "临时内容块"
+
 
 def _persona_dialogs(contexts) -> list[dict]:
     """取出 AstrBot 插入在上下文最前的人格**预设对话**。
@@ -189,6 +250,18 @@ def _persona_dialogs(contexts) -> list[dict]:
             continue
         break
     return kept
+
+
+def _is_self_message(event) -> bool:
+    """这条事件是否由机器人自己发出。
+
+    部分适配器会把机器人发出的消息也回灌成事件。记账与判定都必须先排除它：
+    记账交给 `after_message_sent`，判定更不能把自己的发言当成「群友说了话」，
+    否则她刚回完一句就会给自己开一个巡检窗口，判为沉默后进入冷却，
+    紧接着的下一句话正好被这段冷却挡掉。
+    """
+    sender_id = call_str(event, "get_sender_id")
+    return bool(sender_id) and sender_id == call_str(event, "get_self_id")
 
 
 def _plugin_version() -> str:
@@ -242,6 +315,8 @@ class ShittimPlugin(Star):
         self.db = MemoryDB(data_dir)
         self.short_term = ShortTermLedger(self.db, self.memory_config)
         self.memory_store = MemoryStore(self.db, self.memory_config)
+        # 用户画像：以「平台 + QQ 号」识别同一个人，私聊与群聊共用一份
+        self.profiles = ProfileStore(self.db, self.memory_config)
         # 图片转文字：AstrBot 只给「[图片]」占位，账本里的描述得自己补
         self.captioner = ImageCaptioner(self.db, self.memory_config, self.context)
         # 合并转发：同样只有「[转发消息]」占位，内容得单独取回
@@ -252,6 +327,13 @@ class ShittimPlugin(Star):
             self.extractor,
             self.memory_config,
             short_term=self.short_term,
+        )
+        # 画像更新复用同一个轻量模型：不额外引入第三套模型配置
+        self.profile_maintainer = ProfileMaintainer(
+            self.profiles,
+            self.extractor,
+            self.short_term,
+            self.memory_config,
         )
         self.decider = DecisionEngine(
             self.context,
@@ -278,6 +360,8 @@ class ShittimPlugin(Star):
         self._last_maintenance_at = 0.0
         self._send_timestamps: deque[float] = deque()
         self._allowed_targets = self._load_allowed_targets()
+        # 主脑上下文快照：每个会话只保留最后一次请求，供页面直接查看
+        self._context_snapshots: dict[str, dict] = {}
         # 摘除内置工具失败只告警一次，避免每条请求刷屏
         self._tool_removal_warned = False
         self._tool_removal_logged = False
@@ -295,7 +379,7 @@ class ShittimPlugin(Star):
         self._last_condense_check = 0.0
 
         tiers = self.memory_store.count_by_tier()
-        # 记忆页面（pages/memory/）的只读接口
+        # 记忆页面（pages/memory/）的读写接口
         register_all_routes(self)
         logger.info(
             "[什亭之枢] 初始化完成 | 接管=%s 决策模型=%s | 记忆=%s 压缩模型=%s | "
@@ -423,10 +507,9 @@ class ShittimPlugin(Star):
             return
         try:
             sender_id = call_str(event, "get_sender_id")
-            # 只有确认 sender_id 非空且等于自己时才跳过，避免老版本缺少
-            # get_self_id 时两边都取到空串而把正常消息全部丢掉
-            if sender_id and sender_id == call_str(event, "get_self_id"):
-                return  # 自己的消息由 after_message_sent 记录，避免重复入账
+            # 自己的消息由 after_message_sent 记录，避免重复入账
+            if _is_self_message(event):
+                return
             content = event.get_message_outline() or ""
             if not content.strip():
                 # 图片 / 表情等无文本消息：以占位描述记账，避免对话流出现空缺。
@@ -482,11 +565,11 @@ class ShittimPlugin(Star):
                         pass
                     except Exception as error:
                         logger.debug("[什亭之枢] 合并转发等待失败: %s", error)
-            self.memory_store.upsert_user(
-                platform_of(event) or "unknown",
-                sender_id,
-                sender_name,
-            )
+            platform = platform_of(event) or "unknown"
+            self.memory_store.upsert_user(platform, sender_id, sender_name)
+            # 用户画像的身份侧：累加发言数、刷新名字与活跃时间。
+            # 画像内容不在这里生成——逐条调用模型成本过高，交给整理阶段。
+            self.profiles.touch(platform, sender_id, sender_name)
             # 账本长度已变化，检查是否需要压缩（节流在函数内部，热路径仅增加一次比较）
             self._schedule_condense_if_due()
         except Exception as error:
@@ -722,6 +805,12 @@ class ShittimPlugin(Star):
         if not self._gate_active():
             return
 
+        # 机器人自己的消息由 `after_message_sent` 记账，不参与判定。
+        # 否则自己的回复会开出一个只含 assistant 行的巡检窗口，
+        # 判为沉默后进入冷却，紧接着的下一句话就被挡在冷却里。
+        if _is_self_message(event):
+            return
+
         try:
             ruled = self.decider.rule_decide(event)
         except Exception as error:
@@ -927,13 +1016,12 @@ class ShittimPlugin(Star):
 
         结果顺序即模型读取顺序：
 
-            ① 永久记忆 → ② 长期记忆 → ③ 跨会话背景 →（原生历史/时间线）→ 作息事件提示
+            ① 当前说话人的画像 → ② 永久记忆 → ③ 长期记忆 → ④ 跨会话背景
+            →（原生历史/时间线）→ 作息事件提示
         """
-        if not self._memory_active() and not self._schedule_active():
-            return
+        chat_id = event.unified_msg_origin or ""
         try:
             if self._memory_active():
-                chat_id = event.unified_msg_origin or ""
                 self._inject_memory_blocks(event, req, chat_id)
 
             # 作息事件提示独立于记忆系统：睡眠期间发生的事件与记忆是否启用无关，
@@ -941,6 +1029,31 @@ class ShittimPlugin(Star):
             self._inject_schedule_notice(req)
         except Exception as error:
             logger.error("[什亭之枢] 记忆注入失败: %s", error)
+        finally:
+            # 快照必须放在最后：页面要看到的是**注入完成后**真正发给模型的内容。
+            # 快照只复制、不修改请求，失败也不影响本轮。
+            self._capture_context_snapshot(event, req, chat_id)
+
+
+    def _speaker_profile(self, event: AstrMessageEvent):
+        """当前说话人的画像；没有或未开启注入时返回 None。
+
+        身份以「平台 + QQ 号」为准：同一个人在私聊与群聊里换了昵称，仍然是
+        同一份画像。机器人自己的消息不取（避免把她自己当成对话对象）。
+        """
+        if not self.memory_config.profile_inject:
+            return None
+        try:
+            sender_id = call_str(event, "get_sender_id")
+            if not sender_id or sender_id == call_str(event, "get_self_id"):
+                return None
+            return self.profiles.get(
+                platform_of(event) or "unknown", sender_id
+            )
+        except Exception as error:
+            # 画像只是增强项，取不到不应影响本轮请求
+            logger.debug("[什亭之枢] 读取用户画像失败: %s", error)
+            return None
 
     def _inject_memory_blocks(
         self, event: AstrMessageEvent, req, chat_id: str
@@ -948,7 +1061,16 @@ class ShittimPlugin(Star):
         """注入记忆块；接管模式下重建时间线，否则追加临时内容块。"""
         blocks: list[str] = []
 
-        # ① 永久记忆全量 → ② 榜前 auto_top 条正文 → ③ 其后 auto_index
+        # ① 当前说话人的画像：让她知道「现在是谁在跟她说话」。
+        #    放在最前，因为它决定其余记忆的解读角度（谁的兴趣、谁的观点）。
+        profile_block = build_profile_block(
+            self._speaker_profile(event),
+            token_budget=self.memory_config.profile_token_budget,
+        )
+        if profile_block:
+            blocks.append(profile_block)
+
+        # ② 永久记忆全量 → ③ 榜前 auto_top 条正文 → ④ 其后 auto_index
         #    条关键词索引。**自动插入不计入「被想起」**：仅主动 recall 才计入，
         #    否则榜前条目会相互提升排名，导致榜单停止更新。
         permanent = self.memory_store.permanents()
@@ -1178,6 +1300,149 @@ class ShittimPlugin(Star):
             )
         except Exception as error:
             logger.error("[什亭之枢] 作息提示注入失败: %s", error)
+
+    # ══════════════════════════════════════════════════════════
+    #  主脑上下文快照（页面查看）
+    # ══════════════════════════════════════════════════════════
+
+    def _capture_context_snapshot(
+        self, event: AstrMessageEvent, req, chat_id: str
+    ) -> None:
+        """复制本轮请求的可见内容，供页面直接查看「她现在看到什么」。
+
+        只读请求对象、不写库：上下文每轮都会重建，落库只会留下一堆过期副本；
+        每个会话保留最后一次即可满足「看看现在是什么样」。
+
+        排障价值：主脑只拿到原生历史、没有任何注入块时，单看日志很难分辨
+        是「记忆没命中」还是「注入没生效」——这份快照一次说清。
+        """
+        if self._is_terminating or not chat_id:
+            return
+        try:
+            chat_label = ""
+            try:
+                chat_label = describe_chat(event)[1]
+            except Exception:
+                pass
+
+            contexts = getattr(req, "contexts", None)
+            entries: list[dict] = []
+            if isinstance(contexts, list):
+                for item in contexts:
+                    if isinstance(item, dict):
+                        role = str(item.get("role") or "")
+                        content = _content_text(item.get("content"))
+                        if item.get("_shittim_timeline"):
+                            kind = "timeline"
+                        elif item.get("_shittim_injected_at"):
+                            kind = "injected"
+                        elif item.get("_no_save"):
+                            kind = "persona"
+                        else:
+                            kind = "history"
+                    else:
+                        role = str(getattr(item, "role", "") or "")
+                        content = _content_text(getattr(item, "content", None))
+                        kind = "history"
+                    entries.append(
+                        {
+                            "role": role,
+                            "kind": kind,
+                            "content": _clip_text(
+                                content, _CONTEXT_SNAPSHOT_ENTRY_CHARS
+                            ),
+                        }
+                    )
+
+            parts = getattr(req, "extra_user_content_parts", None)
+            extra: list[dict] = []
+            if isinstance(parts, list):
+                for part in parts:
+                    text = _part_text(part)
+                    if not text.strip():
+                        continue
+                    extra.append(
+                        {
+                            "label": _part_label(text),
+                            "content": _clip_text(
+                                text, _CONTEXT_SNAPSHOT_ENTRY_CHARS
+                            ),
+                        }
+                    )
+
+            system_prompt = _clip_text(
+                str(getattr(req, "system_prompt", "") or ""),
+                _CONTEXT_SNAPSHOT_SYSTEM_CHARS,
+            )
+            prompt = _clip_text(
+                str(getattr(req, "prompt", "") or ""),
+                _CONTEXT_SNAPSHOT_ENTRY_CHARS,
+            )
+            # 总预算从最新条目往回算：时间线本身的裁剪方向也是「先丢最旧的」，
+            # 页面看到的截断结果与实际请求同向。
+            used = len(system_prompt) + len(prompt) + sum(
+                len(part["content"]) for part in extra
+            )
+            kept: list[dict] = []
+            for entry in reversed(entries):
+                cost = len(entry["content"])
+                if kept and used + cost > _CONTEXT_SNAPSHOT_TOTAL_CHARS:
+                    continue
+                kept.append(entry)
+                used += cost
+            kept.reverse()
+            dropped = len(entries) - len(kept)
+
+            snapshot = {
+                "chat_id": chat_id,
+                "chat_label": chat_label,
+                "captured_at": time.time(),
+                # takeover 表示 req.contexts 是账本重建的时间线；native 表示沿用官方历史
+                "mode": (
+                    "takeover" if self.memory_config.context_takeover else "native"
+                ),
+                "model": str(getattr(req, "model", "") or ""),
+                "memory_enabled": self._memory_active(),
+                "schedule_enabled": self._schedule_active(),
+                "system_prompt": system_prompt,
+                "contexts": kept,
+                "prompt": prompt,
+                "extra_parts": extra,
+                "counts": {
+                    "contexts": len(kept),
+                    "extra_parts": len(extra),
+                    "dropped_contexts": dropped,
+                    "chars": used,
+                },
+            }
+
+            self._context_snapshots.pop(chat_id, None)
+            self._context_snapshots[chat_id] = snapshot
+            while len(self._context_snapshots) > _CONTEXT_SNAPSHOT_SESSIONS:
+                oldest = next(iter(self._context_snapshots))
+                self._context_snapshots.pop(oldest, None)
+        except Exception as error:
+            # 快照纯属排障增强，绝不能因此影响本轮请求
+            logger.debug("[什亭之枢] 上下文快照失败: %s", error)
+
+    def context_sessions(self) -> list[dict]:
+        """已捕获过快照的会话（最新在前），供页面选择。"""
+        items: list[dict] = []
+        for snapshot in reversed(list(self._context_snapshots.values())):
+            items.append(
+                {
+                    "chat_id": snapshot.get("chat_id", ""),
+                    "chat_label": snapshot.get("chat_label", ""),
+                    "captured_at": snapshot.get("captured_at", 0.0),
+                    "mode": snapshot.get("mode", ""),
+                    "counts": snapshot.get("counts", {}),
+                }
+            )
+        return items
+
+    def context_snapshot(self, chat_id: str) -> dict | None:
+        """某个会话最近一次主脑请求的完整快照；没有则返回 None。"""
+        return self._context_snapshots.get(chat_id or "")
 
     @filter.on_llm_request(priority=_PRIORITY_IMAGE_GUARD)
     async def guard_broken_images(self, event: AstrMessageEvent, req):
@@ -1686,6 +1951,16 @@ class ShittimPlugin(Star):
             return f"回忆失败：{error}"
         if not recalled:
             return "想了半天，没想起来相关的。"
+        # 「被想起」是位置榜唯一的加权来源：只有主动 recall 才计数并上浮。
+        # 自动注入（榜前正文 / 关键词索引）与判定层的内部召回都不计入，
+        # 否则榜前条目会互相抬高名次，榜单就停止更新了。
+        try:
+            self.memory_store.mark_recalled(
+                [item.memory.id for item in recalled]
+            )
+        except Exception as error:
+            # 计数失败不影响把内容交给模型：回忆本身已经完成
+            logger.error("[什亭之枢] 更新召回计数失败: %s", error)
         return "你想起来了一些事：\n" + "\n".join(
             f"- {item.memory.content}" for item in recalled
         )
@@ -1852,12 +2127,24 @@ class ShittimPlugin(Star):
         except Exception as error:
             logger.error("[什亭之枢] 记忆维护失败: %s", error)
             stats = {}
+        # 画像复用同一个轻量模型，但独立于记忆维护开关：关闭维护仍希望认知更新
+        stats.update(await self._update_profiles())
         # 同时清理焦点记录，避免表长期膨胀
         try:
             self.focus.prune()
         except Exception as error:
             logger.error("[什亭之枢] 焦点记录清理失败: %s", error)
         return stats
+
+    async def _update_profiles(self) -> dict:
+        """按节拍更新用户画像；失败不影响记忆维护。"""
+        if self._is_terminating or not self.memory_config.profile_enabled:
+            return {}
+        try:
+            return await self.profile_maintainer.run()
+        except Exception as error:
+            logger.error("[什亭之枢] 用户画像更新失败: %s", error)
+            return {}
 
     async def _run_curation(self, *, full_reset: bool) -> dict:
         """执行一次记忆整理（§6，顺序固定）。
@@ -1892,6 +2179,9 @@ class ShittimPlugin(Star):
             stats = await self.maintainer.run(curate_budget=cfg.curate_max_per_run)
             if self._is_terminating:
                 return {}
+            # 画像必须在收口之前更新：收口会把当天的原始发言归档，
+            # 之后 `user_messages_since()` 就没有素材可读了。
+            stats.update(await self._update_profiles())
             if full_reset:
                 collapse = await self.maintainer.collapse_short_term(
                     max_rounds=cfg.collapse_max_rounds
@@ -1926,7 +2216,7 @@ class ShittimPlugin(Star):
             self.sleep_state.save(last_curation_at=time.time())
             logger.info(
                 "[什亭之枢] 记忆整理完成 用时%.0fms | 收口%d条→%d轮 当天摘要%d "
-                "降级%d(重写%d) 遗忘%d 晋升%d 合并%d簇 | 归档%d条 收起摘要%d条%s",
+                "降级%d(重写%d) 遗忘%d 晋升%d 合并%d簇 画像%d | 归档%d条 收起摘要%d条%s",
                 (time.time() - started) * 1000,
                 stats.get("condensed_entries", 0),
                 stats.get("condensed_rounds", 0),
@@ -1936,6 +2226,7 @@ class ShittimPlugin(Star):
                 stats.get("forgotten", 0),
                 stats.get("promoted", 0),
                 stats.get("merge_clusters", 0),
+                stats.get("updated", 0),
                 stats.get("archived_messages", 0),
                 stats.get("retired_summaries", 0),
                 f" | 保留期清理{stats['purged_expired']}条"
@@ -2007,6 +2298,8 @@ class ShittimPlugin(Star):
         self.memory_store.update_config(self.memory_config)
         self.extractor.update_config(self.memory_config)
         self.maintainer.update_config(self.memory_config)
+        self.profiles.update_config(self.memory_config)
+        self.profile_maintainer.update_config(self.memory_config)
         self.decider.update_config(self.decision_config, self.memory_config)
         self.captioner.update_config(self.memory_config)
         self.forward_reader.update_config(self.memory_config)

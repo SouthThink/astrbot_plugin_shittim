@@ -1,4 +1,4 @@
-"""记忆页面的只读接口。
+"""记忆页面的后端接口。
 
 页面放在 `pages/memory/`：AstrBot 会扫描插件下的 `views/` 与 `pages/` 目录，
 把每个含 `index.html` 的子目录认成一个页面（标题默认取目录名，可用
@@ -7,12 +7,15 @@
 前端通过宿主注入的 `window.AstrBotPluginPage` 桥调用接口，该桥传递**相对**路径
 （如 `overview`），宿主自动补成 `/api/plug/astrbot_plugin_shittim/overview`。
 
-本模块只提供读取，不包含任何写入操作：记忆数据归插件所有，页面仅负责展示。
+读接口提供记忆、短期账本、用户画像、巡检运行时状态与主脑上下文快照；写接口
+只开放长期 / 永久记忆的**手工编辑与删除**——短期账本是原始记录，改动它会让
+上下文与判定失去同一份事实来源。
 """
 
 from __future__ import annotations
 
 import json
+import time
 from typing import Any
 
 from astrbot.api import logger
@@ -29,6 +32,9 @@ except ImportError:  # pragma: no cover - 旧版回退 quart
 # 分页上限：单个请求最多返回的条数，避免一次性加载整库数据
 _MAX_LIMIT = 200
 _DEFAULT_LIMIT = 50
+
+# 手工编辑的单条记忆长度上限：长期记忆是短句，超长输入多半是误粘贴
+_MAX_MEMORY_CHARS = 4000
 
 # 记忆页面只认这两层；短期账本走另一个接口
 _VALID_TIERS = ("long", "permanent")
@@ -79,6 +85,31 @@ def _query_int(name: str, default: int) -> int:
 def _paging(limit: int, offset: int) -> tuple[int, int]:
     """收敛分页参数：limit 落在 [1, _MAX_LIMIT]，offset 不为负。"""
     return max(1, min(int(limit), _MAX_LIMIT)), max(0, int(offset))
+
+
+async def _json_body() -> dict:
+    """读取请求体 JSON，兼容新版 astrbot.api.web 与旧版 quart。
+
+    非 JSON、空体或读取失败一律返回空字典，让调用方按「缺参数」处理，
+    而不是把异常抛成 500。
+    """
+    try:
+        if _HAS_WEB_API:
+            data = await request.json(default=None)
+        else:
+            data = await request.json
+    except Exception:
+        data = None
+    return data if isinstance(data, dict) else {}
+
+
+def _body_int(body: dict, name: str) -> int | None:
+    """从请求体取一个正整数 id；非法或缺省返回 None。"""
+    try:
+        value = int(str(body.get(name)).strip())
+    except (TypeError, ValueError):
+        return None
+    return value if value > 0 else None
 
 
 def _short_term_item(row) -> dict:
@@ -157,8 +188,27 @@ def _memory_item(memory) -> dict:
     }
 
 
+def _profile_item(profile) -> dict:
+    """用户画像 → 页面数据。名字列表来自 user_ledger，画像只提供印象。"""
+    return {
+        "platform": profile.platform,
+        "user_id": profile.user_id,
+        "display_name": profile.display_name,
+        # 同一个人在私聊 / 各群里用过的名字
+        "aliases": profile.aliases,
+        "summary": profile.summary,
+        "keywords": profile.keywords,
+        "message_count": profile.message_count,
+        "first_seen": profile.first_seen,
+        "last_seen": profile.last_seen,
+        "profiled_at": profile.profiled_at,
+        "created_at": profile.created_at,
+        "updated_at": profile.updated_at,
+    }
+
+
 class MemoryPageAPI:
-    """记忆页面的四个只读视图。"""
+    """记忆页面的视图与记忆手工维护接口。"""
 
     def __init__(self, plugin) -> None:
         self._plugin = plugin
@@ -184,6 +234,7 @@ class MemoryPageAPI:
                 "chats": len(chats),
                 "long": tiers.get("long", 0),
                 "permanent": tiers.get("permanent", 0),
+                "profiles": self._plugin.profiles.count(),
                 "focused": focused,
                 "sleep": sleep,
             }
@@ -250,6 +301,183 @@ class MemoryPageAPI:
             }
         )
 
+    async def profiles(self) -> Any:
+        """用户画像分页，按最近活跃倒序。
+
+        画像以「平台 + QQ 号」为身份：同一行里同时给出他在不同会话用过的
+        名字，页面据此确认「这是同一个人」。
+        """
+        limit, offset = _paging(
+            _query_int("limit", _DEFAULT_LIMIT), _query_int("offset", 0)
+        )
+        items, total = self._plugin.profiles.list_page(limit, offset)
+        return _ok(
+            {
+                "total": total,
+                "limit": limit,
+                "offset": offset,
+                "items": [_profile_item(profile) for profile in items],
+            }
+        )
+
+    async def runtime(self) -> Any:
+        """巡检参数、当前窗口 / 判定 / 冷却，以及会话焦点状态。
+
+        参数与运行时状态放在同一个视图里：只看配置无法判断「为什么这条消息
+        没被放行」，两者对照才能看清是窗口还没到点、正在判定，还是判为不回复
+        后的冷却期。焦点列表包含已离开与已超时的记录——排障时最需要的恰好
+        是这些「看起来不该在」的会话。
+        """
+        plugin = self._plugin
+        decision = plugin.decision_config
+        focus_cfg = plugin.focus_config
+        labels: dict[str, str] = {}
+
+        def label(chat_id: str) -> str:
+            if chat_id not in labels:
+                try:
+                    labels[chat_id] = plugin.short_term.label_for_chat(chat_id)
+                except Exception:
+                    labels[chat_id] = ""
+            return labels[chat_id]
+
+        try:
+            patrol = plugin.patrol.snapshot()
+        except Exception:
+            patrol = {"windows": [], "judging": [], "cooldowns": []}
+        patrol.setdefault("last_decisions", [])
+        for item in patrol["windows"]:
+            item["chat_label"] = label(str(item.get("chat_id") or ""))
+        for item in patrol["cooldowns"]:
+            item["chat_label"] = label(str(item.get("chat_id") or ""))
+        for item in patrol["last_decisions"]:
+            item["chat_label"] = label(str(item.get("chat_id") or ""))
+        patrol["judging"] = [
+            {"chat_id": chat_id, "chat_label": label(chat_id)}
+            for chat_id in patrol["judging"]
+        ]
+
+        now = time.time()
+        timeout = plugin.focus.timeout_seconds
+        focus_items: list[dict] = []
+        try:
+            rows = plugin.focus.list_all(200)
+        except Exception:
+            rows = []
+        for row in rows:
+            chat_id = str(row["chat_id"] or "")
+            focused_at = float(row["focused_at"] or 0.0)
+            idle = max(now - focused_at, 0.0)
+            if int(row["left"] or 0) == 1:
+                status = "left"
+            elif idle > timeout:
+                status = "expired"
+            else:
+                status = "focused"
+            focus_items.append(
+                {
+                    "chat_id": chat_id,
+                    "chat_label": str(row["chat_label"] or "") or label(chat_id),
+                    "focused_at": focused_at,
+                    "idle_seconds": idle,
+                    "status": status,
+                }
+            )
+
+        def _active(method_name: str) -> bool:
+            try:
+                return bool(getattr(plugin, method_name)())
+            except Exception:
+                return False
+
+        try:
+            sleep = plugin.sleep_snapshot()
+        except Exception:
+            sleep = None
+
+        return _ok(
+            {
+                "gate_active": _active("_gate_active"),
+                "memory_active": _active("_memory_active"),
+                "decision": {
+                    "enabled": bool(decision.enabled),
+                    "patrol_enabled": bool(decision.patrol_enabled),
+                    "patrol_window_seconds": float(decision.patrol_window_seconds),
+                    "patrol_cooldown_seconds": float(
+                        decision.patrol_cooldown_seconds
+                    ),
+                    "patrol_noise_filter": bool(decision.patrol_noise_filter),
+                    "private_debounce_seconds": float(
+                        decision.private_debounce_seconds
+                    ),
+                    "private_debounce_max_seconds": float(
+                        decision.private_debounce_max_seconds
+                    ),
+                    "context_messages": int(decision.context_messages),
+                    "always_reply_private": bool(decision.always_reply_private),
+                    "always_reply_when_mentioned": bool(
+                        decision.always_reply_when_mentioned
+                    ),
+                },
+                "focus_config": {
+                    "timeout_minutes": float(focus_cfg.timeout_minutes),
+                    "timeout_seconds": float(timeout),
+                    "require_focus_for_say": bool(focus_cfg.require_focus_for_say),
+                },
+                "patrol": patrol,
+                "focus_items": focus_items,
+                "sleep": sleep,
+            }
+        )
+
+    async def context(self) -> Any:
+        """主脑上下文：不带 chat_id 时列出可查看的会话，带上则返回完整快照。"""
+        chat_id = (_query_raw("chat_id") or "").strip()
+        if not chat_id:
+            return _ok({"items": self._plugin.context_sessions()})
+        snapshot = self._plugin.context_snapshot(chat_id)
+        if snapshot is None:
+            return _err("该会话还没有捕获到主脑请求，先等它被唤醒一次", 404)
+        return _ok(snapshot)
+
+    async def update_memory(self) -> Any:
+        """手工改写一条长期 / 永久记忆的正文。"""
+        body = await _json_body()
+        memory_id = _body_int(body, "id")
+        if memory_id is None:
+            return _err("缺少有效的记忆 id")
+        content = str(body.get("content") or "").strip()
+        if not content:
+            return _err("记忆内容不能为空")
+        if len(content) > _MAX_MEMORY_CHARS:
+            return _err(f"记忆内容过长（最多 {_MAX_MEMORY_CHARS} 字）")
+
+        store = self._plugin.memory_store
+        if store.get(memory_id) is None:
+            return _err("记忆不存在或已被删除", 404)
+        if not store.update_content(memory_id, content):
+            return _err("记忆更新失败")
+        return _ok({"id": memory_id})
+
+    async def delete_memory(self) -> Any:
+        """删除一条长期 / 永久记忆，并阻止它被下一次压缩重新写回。
+
+        只删除还不够：压缩模型看到同一段对话时会再次产出同一条记忆。
+        因此先写入抑制表（与 `forget` 工具同一机制），再物理删除。
+        """
+        body = await _json_body()
+        memory_id = _body_int(body, "id")
+        if memory_id is None:
+            return _err("缺少有效的记忆 id")
+
+        store = self._plugin.memory_store
+        memory = store.get(memory_id)
+        if memory is None:
+            return _err("记忆不存在或已被删除", 404)
+        store.suppress(memory.content)
+        store.delete(memory_id)
+        return _ok({"id": memory_id})
+
 
 def register_all_routes(plugin) -> None:
     """把页面路由挂到宿主；宿主不支持插件 Web API 时静默跳过。"""
@@ -260,18 +488,23 @@ def register_all_routes(plugin) -> None:
 
     api = MemoryPageAPI(plugin)
     routes = (
-        ("overview", api.overview, "记忆总览"),
-        ("chats", api.chats, "会话列表"),
-        ("short_term", api.short_term, "短期账本"),
-        ("summaries", api.summaries, "短期摘要"),
-        ("memories", api.memories, "长期与永久记忆"),
+        ("overview", api.overview, ["GET"], "记忆总览"),
+        ("chats", api.chats, ["GET"], "会话列表"),
+        ("short_term", api.short_term, ["GET"], "短期账本"),
+        ("summaries", api.summaries, ["GET"], "短期摘要"),
+        ("memories", api.memories, ["GET"], "长期与永久记忆"),
+        ("profiles", api.profiles, ["GET"], "用户画像"),
+        ("memories/update", api.update_memory, ["POST"], "编辑长期或永久记忆"),
+        ("memories/delete", api.delete_memory, ["POST"], "删除长期或永久记忆"),
+        ("runtime", api.runtime, ["GET"], "巡检参数与焦点状态"),
+        ("context", api.context, ["GET"], "主脑当前上下文"),
     )
-    for path, handler, description in routes:
+    for path, handler, methods, description in routes:
         # 重复注册同一路由时宿主会替换，热重载不会累积
         register(
             f"/astrbot_plugin_shittim/{path}",
             handler,
-            ["GET"],
+            methods,
             description,
         )
     logger.info("[什亭之枢] 记忆页面接口已注册（%d 个路由）", len(routes))

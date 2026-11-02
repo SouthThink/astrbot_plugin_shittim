@@ -18,12 +18,12 @@ core/
 ├── common/     通用基础设施：配置、数据库、事件取值、时间与分词、模型 JSON 解析
 ├── gate/       拦放链路：决断层 engine.py + 群聊巡检 patrol.py
 ├── focus/      焦点链路：manager.py
-├── memory/     记忆链路：ledger / extractor / store / maintenance
+├── memory/     记忆链路：ledger / extractor / store / maintenance / profile
 │               / timeline / injector / history / vision / forward
 └── schedule/   作息链路：state.py
 
 main.py         事件处理器、LLM 工具、生命周期
-web_api.py      记忆页面只读接口
+web_api.py      记忆 / 巡检 / 上下文页面接口
 pages/memory/   记忆页面
 ```
 
@@ -78,9 +78,11 @@ pages/memory/   记忆页面
 
 ### 3.4 记忆链路
 
-`ledger`（账本）→ `extractor`（`condense` 压缩、`merge` 合并）→ `store`（位置榜 / 召回 / 晋升）→ `maintenance`（收口 / 降级 / 遗忘 / 晋升 / 合并）。主脑上下文默认沿用 AstrBot 原生按会话历史，注入拼装走 `injector`，时间线仅在接管模式下由 `timeline` 从账本重建，图片经 `vision` 转述、合并转发经 `forward` 取回，坏图摘除在 `history`。
+`ledger`（账本）→ `extractor`（`condense` 压缩、`merge` 合并、`build_profile` 画像）→ `store`（位置榜 / 召回 / 晋升）→ `maintenance`（收口 / 降级 / 遗忘 / 晋升 / 合并），`profile` 负责用户画像的存储与整理更新。主脑上下文默认沿用 AstrBot 原生按会话历史，注入拼装走 `injector`，时间线仅在接管模式下由 `timeline` 从账本重建，图片经 `vision` 转述、合并转发经 `forward` 取回，坏图摘除在 `history`。
 
-**主脑上下文默认不接管**：`memory.context_takeover=False`（默认）时 `on_llm_request` **不修改 `req.contexts`**，记忆块、跨会话背景（`<cross_session_timeline>`）与作息提示经 `req.extra_user_content_parts` 以 `TextPart(...).mark_as_temp()` 追加，仅本轮可见、不写持久历史，也不会破坏原生前缀缓存。跨会话背景由 `ledger.timeline_entries_balanced()` 取样：每个会话保留最近 `short_term_context_per_chat` 条、纳入最近 `short_term_context_chats` 个会话，**当前会话始终入选且其 `gated=1` 消息全量保留**（这些消息没进官方历史），活摘要也一并保留；原生历史为空时 `include_current=True` 兜底。开启接管后才由 `timeline.build_timeline()` 把账本（`archived_at = 0 AND condensed_at = 0 AND staged = 0`）加活着的摘要渲染成 `req.contexts`——她说过的话是 `assistant`（只放原话），别人的话是 `user`（带 `[会话标签] 发言人 (绝对时间戳):`），摘要用 `<earlier_summary>` 包裹，末尾标明「你现在在跟谁说话」。此时 AstrBot 的原生按会话历史被整体丢弃（`_rebuild_timeline()`）。数据源只覆盖**今天**，超预算从**最旧的**开始丢。
+**主脑上下文默认不接管**：`memory.context_takeover=False`（默认）时 `on_llm_request` **不修改 `req.contexts`**，说话人画像、记忆块、跨会话背景（`<cross_session_timeline>`）与作息提示经 `req.extra_user_content_parts` 以 `TextPart(...).mark_as_temp()` 追加，仅本轮可见、不写持久历史，也不会破坏原生前缀缓存。跨会话背景由 `ledger.timeline_entries_balanced()` 取样：每个会话保留最近 `short_term_context_per_chat` 条、纳入最近 `short_term_context_chats` 个会话，**当前会话始终入选且其 `gated=1` 消息全量保留**（这些消息没进官方历史），活摘要也一并保留；原生历史为空时 `include_current=True` 兜底。开启接管后才由 `timeline.build_timeline()` 把账本（`archived_at = 0 AND condensed_at = 0 AND staged = 0`）加活着的摘要渲染成 `req.contexts`——她说过的话是 `assistant`（只放原话），别人的话是 `user`（带 `[会话标签] 发言人 (绝对时间戳):`），摘要用 `<earlier_summary>` 包裹，末尾标明「你现在在跟谁说话」。此时 AstrBot 的原生按会话历史被整体丢弃（`_rebuild_timeline()`）。数据源只覆盖**今天**，超预算从**最旧的**开始丢。
+
+**用户画像以「平台 + QQ 号」为身份**：`profile.py` 的 `ProfileStore` 只负责印象（描述 / 关键词 / 更新节拍），名字由 `user_ledger.user_names` 实时累积——两者分开，改名只更新名字列表，不触发画像重写。`ProfileMaintainer` 在 `MemoryMaintainer.run()` 之后、短期收口**之前**运行：只处理 `profile_window_hours` 内活跃的人，且自 `profiled_at` 之后新增发言达到 `profile_min_messages` 条才调用模型，单次最多 `profile_max_users_per_run` 人。模型输出**完整的新描述 + 新关键词**（整体替换），因此「删除」就是新列表里不再出现它。失败不写 `profiled_at`，下一轮重试，旧画像保持不变。画像块由 `injector.build_profile_block()` 生成，注入时排在最前，只作背景、不得复述。
 
 **消息行必须用绝对时间戳**：`ledger.format_message_line()` 用 `format_clock()`，不要改回 `format_age()`。相对时间会让同一行的文本随当前时刻变化，导致请求前缀逐轮改变、prompt / KV 缓存全部失效。
 
@@ -120,19 +122,20 @@ pages/memory/   记忆页面
 | `core/common/event_utils.py` | 事件取值与会话标签 | 取不到内部类型时一律降级，不要让上层抛错 |
 | `core/common/model_json.py` | 模型输出 JSON 容错解析 | 决断层与压缩共用，改动同时影响两边 |
 | `core/gate/engine.py` | 决断层 | `_WINDOW_PROMPT` 是判定质量的直接来源；人格/记忆注入别删 |
-| `core/gate/patrol.py` | 巡检窗口 | 扣押 / 替换 / 冷却 / 噪声四件事都在这里 |
+| `core/gate/patrol.py` | 巡检窗口 | 扣押 / 替换 / 冷却 / 噪声 / 最近判定快照都在这里 |
 | `core/focus/manager.py` | 焦点读写 | 只约束主动发言，别在被动接话路径上读它 |
 | `core/memory/ledger.py` | 账本读写、行格式化、条目查询、压缩落库、清空 | `_LIVE_SQL` 是「她此刻应该记得的」唯一表达，**新增查询必须带上它**；`format_message_line` 供判定，`format_speech` 供时间线 |
 | `core/memory/store.py` | 位置榜、召回打分、等级推导、遗忘请求 | 榜序 `_BOARD_ORDER` 与分档常量在顶部；等级一律用 `curation_level(rank, total)` 推导，不要新增「等级」列 |
 | `core/memory/maintenance.py` | 压缩 / 树状收口 / 降级 / 遗忘 / 晋升 / 合并 | `run()` 不含收口与清空，那两步在 main；摘要长度常量在文件顶部 |
-| `core/memory/injector.py` | 注入块拼装 + 作息事件提示 | 只负责「长什么样」，「放哪里」在 main |
+| `core/memory/profile.py` | 用户画像的存储与整理更新 | 身份是 `(platform, user_id)`；名字在 `user_ledger`，画像只存印象；输出整体替换；更新必须在短期收口之前 |
+| `core/memory/injector.py` | 画像 / 记忆注入块 + 作息事件提示 | 只负责「长什么样」，「放哪里」在 main |
 | `core/memory/timeline.py` | 账本条目 → `req.contexts`（仅接管模式） | 默认不参与；摘要包 `<earlier_summary>`；每条都要 `_no_save` |
 | `core/memory/history.py` | 坏图摘除 | 只做「确定读不到的图片引用」，别恢复官方历史回填 |
 | `core/memory/vision.py` | 图片转文字 | 引用必须当场取出，临时文件会失效 |
 | `core/memory/forward.py` | 合并转发转文字 | 只认 `Forward.id`；接口参数名跨适配器不一致（`message_id` / `id`）；内容写 `forward_content`，不要改写 `content` |
 | `core/schedule/state.py` | 作息推导与状态读写 | 推导保持纯函数；状态只经 `SleepStateStore` 落库 |
-| `web_api.py` | 记忆页面只读接口 | 路由注册在 `main.__init__` |
-| `pages/memory/` | 记忆页面 | 单文件 HTML，标题靠 i18n 覆盖 |
+| `web_api.py` | 记忆 / 巡检 / 上下文页面接口 | 只开放记忆正文的编辑与删除；删除必须先 `suppress()`，否则下一次压缩会写回；短期账本不提供写接口 |
+| `pages/memory/` | 记忆页面 | 单文件 HTML，标题靠 i18n 覆盖；写操作用 `bridge.apiPost` |
 
 ## 5. 场景导航
 
@@ -146,7 +149,7 @@ pages/memory/   记忆页面
 
 **记忆**
 
-- 调整注入顺序 → `main.inject_memory_context()`：永久记忆 → 长期记忆 →（跨会话近况）→（原生历史 / 时间线）→ 作息事件提示。默认走 `_append_temp_parts()` 追加临时块；`context_takeover=True` 时才整体替换 `req.contexts`。
+- 调整注入顺序 → `main.inject_memory_context()`：说话人画像 → 永久记忆 → 长期记忆 →（跨会话近况）→（原生历史 / 时间线）→ 作息事件提示。默认走 `_append_temp_parts()` 追加临时块；`context_takeover=True` 时才整体替换 `req.contexts`。
 - 调整跨会话连续性 → `main._cross_session_block()` + `ledger.timeline_entries_balanced()` + `timeline.build_timeline_block()`；配额是 `memory.short_term_context_*`，预算沿用 `timeline_token_budget` / `timeline_max_messages`。
 - 调整时间线（仅接管模式）→ `memory/timeline.py` 的 `build_timeline()` 与 `ledger.timeline_entries()`；预算是 `memory.timeline_token_budget` / `timeline_max_messages`。
 - 改账本结构 → `common/db.py` 三处一起改；老库靠 `_COLUMN_MIGRATIONS` 补列。
@@ -154,6 +157,7 @@ pages/memory/   记忆页面
 - 调整压缩时机 → `main._schedule_condense_if_due()`（调用点在记账与发送后）；动手门槛在 `maintenance.condense_short_term()`。
 - 调整位置榜分档或遗忘 → `store.py` 顶部常量 + `curation_level()` / `is_tail()`；`maintenance._demote()` / `_forget()`；门槛是 `memory.forget_min_curations` / `forget_stale_days`。
 - 调整历史回查 → `main.search_history`（参数夹紧、默认当前会话）+ `ledger.search_history()`。它**绕过 `_LIVE_SQL`**，改动前先想清楚哪些行不该被翻出来。
+- 调整用户画像 → `memory/profile.py` 的 `ProfileStore`（身份 / 印象）与 `ProfileMaintainer`（整理时更新，节拍是 `memory.profile_*`）；名字来自 `user_ledger.user_names`，素材来自 `ledger.user_messages_since()`；注入在 `main._speaker_profile()` + `injector.build_profile_block()`；页面走 `web_api.profiles`。
 - 调整图片转述 → `memory/vision.py`（取图、data URL、缓存、模型能力检查）。
 - 调整合并转发 → `memory/forward.py`（取 id、调 `get_forward_msg`、渲染与截断）；条数 / 字数是 `memory.forward_max_items` / `forward_max_chars`。
 
@@ -168,6 +172,9 @@ pages/memory/   记忆页面
 
 - 新增 LLM 工具 → `main.py` 的 `@filter.llm_tool(name=...)`，docstring 就是给模型看的说明书，要写清「什么时候该用」。
 - 调整主动发言风控 → `proactive` 配置组 + `main._check_say_gate()` / `_check_rate_limit()`。
+- 查看主脑上下文 → `main._capture_context_snapshot()` + `web_api.MemoryPageAPI.context()`；快照只存内存（每会话一份、最多 8 个会话），不落库，跟着 `on_llm_request` 更新。
+- 查看巡检与焦点 → `patrol.snapshot()`（窗口 / 判定 / 冷却 / 最近判定）+ `focus.list_all()`（含已离开与已超时）+ `web_api.runtime()`；`_remember()` 只存内存，最多 40 个会话。
+- 手工编辑与删除记忆 → `store.update_content()`（正文与关键词一起改）+ `web_api.update_memory`；删除先 `store.suppress()` 再 `store.delete()`，否则下一次压缩会把同一条写回来。
 - 新增页面 → `pages/<名字>/index.html` + `web_api.py` 注册路由 + i18n 配 `views.<名字>.title`。
 
 ## 6. 关键机制与坑
@@ -179,6 +186,10 @@ pages/memory/   记忆页面
 - `on_llm_request` 默认**不覆盖** `req.contexts`，只追加临时内容块；开启 `memory.context_takeover` 后会整体替换，此时必须晚于同样覆盖 `req.contexts` 的插件（天使之心 50），否则注入块会被抹掉。
 
 **记账必须快**：记账是事件链第一环，任何耗时操作（模型调用、下载）都要 `self._spawn()` 丢后台。
+
+**自己的消息不参与判定**：`record_incoming_message` 与 `gate_official_llm` 都用 `_is_self_message()` 提前返回。部分适配器会把机器人发出的消息也回灌成事件；判定若把它当成群友发言，就会开出一个只含 assistant 行的巡检窗口，判为沉默后进入冷却，紧接着的下一句话正好被这段冷却挡掉（表现为「她刚说完，我立刻回一句，她就不理了」）。`patrol._decide()` 另有兜底：窗口里只有 assistant 行时既不当作沉默理由，也不进冷却。
+
+**画像更新必须在短期收口之前**：`ProfileMaintainer` 的素材来自 `ledger.user_messages_since()`（走 `_LIVE_SQL`）。`_run_curation` 里先维护、再更新画像、最后才 `collapse_short_term()`；把画像放到收口之后就只剩空账本，画像会永远停在旧版本且不报错。画像输出是**整体替换**（描述 + 关键词一起重写），不要改成「与旧关键词取并集」——那样被删除的关键词会被合并回来。模型失败时不写 `profiled_at`，旧画像保持不变，下一轮重试。
 
 **`content` 是唯一事实源，`gated` 只是展示用**：`gated=1` 只用于记忆页面与排障，**不要在上下文组装路径上读它**。但**永远不要改写已入账的 `content`**——巡检判据与时间线剔除当前消息都靠它精确匹配。
 

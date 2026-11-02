@@ -12,7 +12,7 @@ import sqlite3
 import threading
 from pathlib import Path
 
-SCHEMA_VERSION = 10
+SCHEMA_VERSION = 11
 
 # 增量列迁移：用于给已存在的库补列，避免升级插件时丢数据
 _COLUMN_MIGRATIONS = (
@@ -101,6 +101,8 @@ CREATE TABLE IF NOT EXISTS short_term_messages (
 );
 CREATE INDEX IF NOT EXISTS idx_stm_created ON short_term_messages (created_at);
 CREATE INDEX IF NOT EXISTS idx_stm_chat    ON short_term_messages (chat_id, created_at);
+-- 用户画像维护时按发言人取消息（跨会话），没有该索引会扫全表
+CREATE INDEX IF NOT EXISTS idx_stm_sender  ON short_term_messages (sender_id, created_at);
 
 -- 图片转述缓存：同一个引用只问一次视觉模型，省下重复调用的钱和时间
 CREATE TABLE IF NOT EXISTS image_captions (
@@ -172,6 +174,25 @@ CREATE TABLE IF NOT EXISTS user_ledger (
     last_seen  REAL NOT NULL,
     PRIMARY KEY (platform, user_id)
 );
+
+-- 用户画像：以平台 + 用户 ID（QQ 号）识别同一个人，私聊与群聊共用一份。
+-- 名字保存在 user_ledger.user_names（随消息实时累积），画像只负责「印象」：
+-- 描述、关键词与更新节拍。两者分开是为了让改名不触发画像重写。
+CREATE TABLE IF NOT EXISTS user_profiles (
+    platform      TEXT    NOT NULL,
+    user_id       TEXT    NOT NULL,
+    display_name  TEXT    NOT NULL DEFAULT '',
+    summary       TEXT    NOT NULL DEFAULT '',
+    keywords      TEXT    NOT NULL DEFAULT '[]',
+    message_count INTEGER NOT NULL DEFAULT 0,
+    first_seen    REAL    NOT NULL DEFAULT 0,
+    last_seen     REAL    NOT NULL DEFAULT 0,
+    profiled_at   REAL    NOT NULL DEFAULT 0,
+    created_at    REAL    NOT NULL DEFAULT 0,
+    updated_at    REAL    NOT NULL DEFAULT 0,
+    PRIMARY KEY (platform, user_id)
+);
+CREATE INDEX IF NOT EXISTS idx_profiles_recent ON user_profiles (last_seen DESC);
 
 -- 会话焦点：当前处于关注状态的会话（只约束主动发言，不约束被动接话）
 CREATE TABLE IF NOT EXISTS session_focus (

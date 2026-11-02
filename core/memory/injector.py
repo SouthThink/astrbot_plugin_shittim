@@ -32,6 +32,7 @@ from collections.abc import Sequence
 
 from ..common.time_utils import format_clock
 from ..common.tokenizer import estimate_tokens
+from .profile import UserProfile
 from .store import Memory
 
 _BLOCK_OPEN = "<memory_reference>"
@@ -141,6 +142,59 @@ def build_injected_entry(block: str) -> dict:
         # 供排障：注入时刻，便于对照日志确认是否命中
         "_shittim_injected_at": time.time(),
     }
+
+
+# ── 用户画像 ──────────────────────────────────────────────
+
+_PROFILE_OPEN = "<user_profile>"
+_PROFILE_CLOSE = "</user_profile>"
+
+# 画像块的收尾说明：它和记忆块一样只是背景，不能变成回复主题
+_PROFILE_RULES = """这些只是你对他的印象，不要复述，也不要说「我记得你」「你之前说过」。
+像认识的人一样自然交流；印象可能过时，以眼前这句话为准。"""
+
+
+def build_profile_block(
+    profile: UserProfile | None, *, token_budget: int = 400
+) -> str:
+    """把当前说话人的画像拼成注入块。
+
+    没有描述与关键词时仍会在「用过多个名字」的情况下注入：同一个人在私聊和
+    群里换了昵称时，她需要知道这是同一个人，这与画像是否已经生成无关。
+
+    Returns:
+        以 `<user_profile>` 包裹的文本；没有任何可补充的信息时返回空串。
+    """
+    if profile is None:
+        return ""
+    aliases = [a for a in profile.aliases if a and a != profile.display_name]
+    has_content = profile.has_content
+    if not has_content and len(aliases) < 1:
+        return ""
+
+    head = [f"{_PROFILE_OPEN}", f"你现在正在跟「{profile.label()}」说话（账号 {profile.user_id}）。"]
+    if aliases:
+        head.append("他之前还用过这些名字：" + "、".join(aliases[:8]) + "。")
+    keywords_line = ""
+    if profile.keywords:
+        keywords_line = "关于他的关键词：" + " / ".join(profile.keywords[:10]) + "。"
+
+    footer = "\n".join([_PROFILE_RULES, _PROFILE_CLOSE])
+    budget = max(int(token_budget), 80)
+    reserved = (
+        estimate_tokens("\n".join(head))
+        + estimate_tokens(keywords_line)
+        + estimate_tokens(footer)
+    )
+    summary = (profile.summary or "").strip()
+    if summary:
+        allowed = max(budget - reserved, 40)
+        if len(summary) > allowed:
+            summary = summary[:allowed].rstrip() + "…"
+        head.append("你对他的印象：" + summary)
+
+    lines = head + ([keywords_line] if keywords_line else []) + [footer]
+    return "\n".join(lines)
 
 
 # ── 作息事件提示 ──────────────────────────────────────────

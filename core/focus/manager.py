@@ -110,7 +110,7 @@ class FocusManager:
         row = self.get_record(chat_id)
         if row is None or int(row["left"] or 0) == 1:
             return False
-        return self.idle_seconds(chat_id) <= self._timeout_seconds
+        return self.idle_seconds(chat_id) <= self.timeout_seconds
 
     def idle_seconds(self, chat_id: str) -> float:
         """距上次获得焦点已过去多少秒；无记录返回正无穷。"""
@@ -121,7 +121,7 @@ class FocusManager:
 
     def list_focused(self, limit: int = 50) -> list:
         """当前仍在关注中的会话，按最近活跃排序。"""
-        cutoff = time.time() - self._timeout_seconds
+        cutoff = time.time() - self.timeout_seconds
         return self._db.query(
             """
             SELECT * FROM session_focus
@@ -132,12 +132,25 @@ class FocusManager:
             (cutoff, int(limit)),
         )
 
+    def list_all(self, limit: int = 200) -> list:
+        """全部焦点记录（含已离开与已超时），按最近活跃排序。
+
+        供页面展示「谁关注中、谁已离开、谁已超时」：只看 `list_focused()`
+        会把已离开的记录藏起来，恰好是排障时最需要看的那部分。
+        """
+        return self._db.query(
+            "SELECT * FROM session_focus ORDER BY focused_at DESC LIMIT ?",
+            (int(limit),),
+        )
+
     # ── 内部 ──────────────────────────────────────────────
 
     @property
-    def _timeout_seconds(self) -> float:
+    def timeout_seconds(self) -> float:
+        """焦点超时时长（秒）。配置不可用时回退默认值。"""
         try:
             minutes = float(self._config.timeout_minutes)
         except (TypeError, ValueError):
             minutes = DEFAULT_TIMEOUT_MINUTES
         return max(minutes, 0.0) * 60.0
+

@@ -25,6 +25,11 @@ _MAX_QUOTE_CHARS = 200
 _MAX_KEYWORDS = 12
 _MAX_TAGS = 8
 
+# 用户画像的输出上限：描述是「印象」，不是传记；关键词是标签，不是句子
+_MAX_PROFILE_SUMMARY = 240
+_MAX_PROFILE_KEYWORDS = 10
+_MAX_PROFILE_KEYWORD_CHARS = 10
+
 # 扩大覆盖范围的关键条款：除「稳定事实」外，也记录「当天发生的事件」。
 # 旧提示词把此类内容归入「一次性闲聊」，导致次日追问昨日事件时无法回忆。
 # 覆盖扩大后条目数量会增加，因此提供 extract_include_events 开关，
@@ -119,18 +124,46 @@ _CONDENSE_PROMPT = """她正在整理自己的一段旧记忆。下面是这段�
 """
 
 
+_PROFILE_PROMPT = """你在整理一个人的长期画像。这个人会出现在私聊和不同的群里，\
+但都是同一个人（账号 {user_id}）。
+
+【对象】
+- 现在的名字：{display_name}
+- 用过的名字：{aliases}
+
+【已有画像】
+描述：{summary}
+关键词：{keywords}
+
+【最近的发言】（按时间顺序，来自不同会话）
+{records}
+
+【要做的事】
+根据最近发言更新你对这个人的印象：
+1. 保留仍然成立的旧信息，修正与最近发言冲突的内容，删除已经过时或被明确否定的内容。
+2. 只写这个人自己表现出来的东西：身份、兴趣、偏好、习惯、表达过的观点、与人相处的方式。
+3. 不要写助手自己的话，不要推测，不要因为一次玩笑或一句气话就下结论。
+4. 描述用第三人称，1~3 句，不超过 {max_summary} 字；关键词 {max_kw} 个以内，每个不超过 {max_kw_chars} 字。
+5. 信息不足就保持原样；宁可不写，也不要编造。
+
+【输出】
+只输出 JSON，不要解释，不要代码块围栏：
+{{"summary": "对他的印象", "keywords": ["关键词"]}}
+"""
+
+
 def _clamp_str(value, limit: int) -> str:
     if not isinstance(value, str):
         return ""
     return value.strip()[:limit]
 
 
-def _str_list(value, limit: int) -> list[str]:
+def _str_list(value, limit: int, max_chars: int = 40) -> list[str]:
     if not isinstance(value, list):
         return []
     result: list[str] = []
     for item in value:
-        text = _clamp_str(item, 40)
+        text = _clamp_str(item, max_chars)
         if text and text not in result:
             result.append(text)
         if len(result) >= limit:
@@ -253,6 +286,61 @@ class MemoryExtractor:
         if len(merged) >= len(memories):
             return []
         return merged
+
+    async def build_profile(
+        self,
+        *,
+        user_id: str,
+        display_name: str,
+        aliases: list[str],
+        summary: str,
+        keywords: list[str],
+        records: str,
+    ) -> tuple[str, list[str]] | None:
+        """根据「已有画像 + 这个人最近的发言」重写画像。
+
+        输出是**完整替换**：模型看到旧画像与新发言，自行决定保留、改写还是
+        删除。因此关键词被删掉的方式就是「新列表里不再出现它」，不需要额外
+        的删除指令。
+
+        Returns:
+            (描述, 关键词)；模型不可用、输出无法解析时返回 None，调用方
+            保持原画像不变，下一轮整理再试。
+        """
+        text = (records or "").strip()
+        if not text or not self.available:
+            return None
+        prompt = _PROFILE_PROMPT.format(
+            user_id=user_id,
+            display_name=display_name or "（未知）",
+            aliases="、".join(aliases[:8]) or "（暂无）",
+            summary=summary or "（暂无）",
+            keywords=" / ".join(keywords) or "（暂无）",
+            records=text,
+            max_summary=_MAX_PROFILE_SUMMARY,
+            max_kw=_MAX_PROFILE_KEYWORDS,
+            max_kw_chars=_MAX_PROFILE_KEYWORD_CHARS,
+        )
+        raw = await self._text_chat(prompt)
+        payload = parse_model_json(raw)
+        if not isinstance(payload, dict):
+            logger.warning("[什亭之枢] 用户画像输出无法解析，保留原画像")
+            return None
+
+        raw_summary = payload.get("summary")
+        new_summary = (
+            _clamp_str(raw_summary, _MAX_PROFILE_SUMMARY)
+            if isinstance(raw_summary, str)
+            else summary
+        )
+        raw_keywords = payload.get("keywords")
+        if isinstance(raw_keywords, list):
+            new_keywords = _str_list(
+                raw_keywords, _MAX_PROFILE_KEYWORDS, _MAX_PROFILE_KEYWORD_CHARS
+            )
+        else:
+            new_keywords = list(keywords)
+        return new_summary, new_keywords
 
     # ── 内部实现 ──────────────────────────────────────────
 

@@ -72,6 +72,10 @@ _BURST_MAX_CHARS = 6
 # 第一条消息的入库时间略早于窗口开启时刻，无宽限时会遗漏该条消息。
 _WINDOW_GRACE_SECONDS = 1.0
 
+# 最近判定记录的保留条数：每个会话只留最后一条，页面用来回答
+# 「上一次为什么没接话」。只存内存，重启即清空。
+_MAX_LAST_DECISIONS = 40
+
 
 @dataclass
 class PatrolRecord:
@@ -90,6 +94,9 @@ class PatrolRecord:
     silent: bool = False
     # 窗口里只是提到了名字：判定时要求模型先确认是否真的在叫她。
     mention: bool = False
+    # 当前这一轮计时的到期时刻（新消息会顺延）。仅供页面快照展示，
+    # 真正的调度仍由 timer 负责，不依赖该字段。
+    deadline: float = 0.0
 
 
 def _row_text(row) -> str:
@@ -149,11 +156,52 @@ class PatrolManager:
         # 判为不回复后的冷却：完全关掉该会话的判定。开口不设冷却，
         # 她说完一句之后下一句话立刻就能重新开窗（见 `hold`）。
         self._cooldown_until: dict[str, float] = {}
+        # 最近一次判定（每个会话一条），供页面排障
+        self._last_decisions: dict[str, dict] = {}
         self._version_seq = 0
         self._closed = False
 
     def update_config(self, config) -> None:
         self._config = config
+
+    def snapshot(self) -> dict:
+        """当前巡检运行时状态（供页面展示）。
+
+        只读取内存中的记录，不做任何 IO，也不改变调度：页面看到的是
+        「谁在等、等多久、谁在判定、谁在冷却」，与 `hold()` 的判据完全同源。
+        """
+        now = time.time()
+        windows = [
+            {
+                "chat_id": record.chat_id,
+                "silent": bool(record.silent),
+                "mention": bool(record.mention),
+                "opened_at": float(record.opened_at),
+                "delay": float(record.delay),
+                "remaining": max(float(record.deadline or 0.0) - now, 0.0),
+            }
+            for record in self._records.values()
+        ]
+        windows.sort(key=lambda item: item["remaining"])
+        cooldowns = [
+            {
+                "chat_id": chat_id,
+                "until": float(until),
+                "remaining": max(float(until) - now, 0.0),
+            }
+            for chat_id, until in self._cooldown_until.items()
+            if float(until) > now
+        ]
+        cooldowns.sort(key=lambda item: item["remaining"])
+        last_decisions = sorted(
+            self._last_decisions.values(), key=lambda item: item["at"], reverse=True
+        )
+        return {
+            "windows": windows,
+            "judging": sorted(self._judging),
+            "cooldowns": cooldowns,
+            "last_decisions": last_decisions,
+        }
 
     # ── 对外入口 ──────────────────────────────────────────
 
@@ -201,6 +249,12 @@ class PatrolManager:
             if not silent and existing is None:
                 if self._cooldown_until.get(chat_id, 0.0) > now:
                     logger.debug("[什亭之枢] 巡检冷却中，拦下 | %s", chat_id)
+                    self._remember(
+                        chat_id,
+                        "cooldown",
+                        "冷却中，普通消息不判定、直接拦下",
+                        judged=False,
+                    )
                     return None
                 # 过期的记录顺手清掉，避免计时字典随会话数无限增长
                 self._cooldown_until.pop(chat_id, None)
@@ -228,6 +282,7 @@ class PatrolManager:
                 opened_at=opened_at,
                 silent=silent,
                 mention=keep_mention,
+                deadline=now + delay,
             )
             record.timer = asyncio.create_task(self._timer(record))
             self._records[chat_id] = record
@@ -300,6 +355,7 @@ class PatrolManager:
         if record.timer and not record.timer.done():
             record.timer.cancel()
         record.delay = self._silent_delay(record.opened_at, now)
+        record.deadline = now + record.delay
         record.timer = asyncio.create_task(self._timer(record))
         logger.debug(
             "[什亭之枢] 静默窗口顺延 | %s | 等待%.1fs",
@@ -315,6 +371,28 @@ class PatrolManager:
             record.future.set_result(KILL)
         logger.debug("[什亭之枢] 巡检窗口作废 | %s | %s", record.chat_id, reason)
 
+    def _remember(
+        self, chat_id: str, verdict: str, reason: str, *, judged: bool
+    ) -> None:
+        """记下该会话最近一次判定/拦放事实，供页面排障。
+
+        `judged=False` 表示没有真正询问判定模型（冷却拦下、静默放行、
+        窗口作废），这类记录不该被误读成「模型决定不接」。
+        """
+        if not chat_id:
+            return
+        self._last_decisions.pop(chat_id, None)
+        self._last_decisions[chat_id] = {
+            "chat_id": chat_id,
+            "at": time.time(),
+            "verdict": verdict,
+            "reason": reason,
+            "judged": bool(judged),
+        }
+        while len(self._last_decisions) > _MAX_LAST_DECISIONS:
+            oldest = next(iter(self._last_decisions))
+            self._last_decisions.pop(oldest, None)
+
     async def _silent_timer(self, record: PatrolRecord) -> None:
         """静默防抖：静默满时长后直接放行最后一条事件，不调用模型、不进入冷却。"""
         try:
@@ -325,6 +403,12 @@ class PatrolManager:
                     # 已被更新的消息取代，或已被清理
                     return
                 self._records.pop(record.chat_id, None)
+            self._remember(
+                record.chat_id,
+                "release",
+                "静默防抖到期，直接放行",
+                judged=False,
+            )
             self._finish(record, PROCESS)
         except asyncio.CancelledError:
             return
@@ -349,12 +433,19 @@ class PatrolManager:
                     # 上一轮判定尚未结束：本次窗口直接作废，不排队、不补偿。
                     # 冷却或占用结束后也不会补判，只有新消息才重新开窗。
                     self._records.pop(record.chat_id, None)
+                    self._remember(
+                        record.chat_id,
+                        "skipped",
+                        "上一轮判定尚未结束，本次窗口作废",
+                        judged=False,
+                    )
                     self._finish(record, KILL)
                     return
                 self._records.pop(record.chat_id, None)
                 self._judging.add(record.chat_id)
 
             should_reply, reason, enter_cooldown = await self._decide(record)
+            decided_reply = should_reply
 
             async with self._lock:
                 self._judging.discard(record.chat_id)
@@ -369,6 +460,13 @@ class PatrolManager:
             if should_reply and superseded:
                 should_reply = False
                 reason = f"{reason}（判定期间已出现新消息，交由下一窗口处理）"
+                verdict = "superseded"
+            elif decided_reply:
+                verdict = "reply"
+            elif enter_cooldown:
+                verdict = "silent"
+            else:
+                verdict = "skipped"
             # 开口不设冷却：她说完这一句，下一句话立刻就能重新开窗判定。
             # 只有「判为不回复」才写 `_cooldown_until`（上面的分支）。
             # 未调用模型就跳过（噪声预过滤 / 窗口没有新消息）只记 DEBUG，
@@ -379,6 +477,12 @@ class PatrolManager:
                 record.chat_id,
                 "开口" if should_reply else "沉默",
                 reason,
+            )
+            self._remember(
+                record.chat_id,
+                verdict,
+                reason,
+                judged=enter_cooldown,
             )
             # 先写日志再唤醒等待方，使调用方的拦截/放行日志排在判定理由之后
             self._finish(record, PROCESS if should_reply else KILL)
@@ -442,6 +546,12 @@ class PatrolManager:
         rows = self._short_term.messages_since(record.chat_id, since)
         if not rows:
             return False, "窗口里没有新消息", False
+
+        # 窗口里只有她自己的发言（例如平台把机器人发出的消息也回灌成事件）：
+        # 没有可接的内容，也不能据此让会话进入冷却，否则她刚说完一句，
+        # 下一句话就会被自己触发的冷却挡掉。
+        if all(str(row["role"] or "") == "assistant" for row in rows):
+            return False, "窗口里只有我自己的发言", False
 
         if bool(getattr(self._config, "patrol_noise_filter", True)):
             noise = noise_reason(rows)

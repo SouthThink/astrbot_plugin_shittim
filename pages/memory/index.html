@@ -178,6 +178,43 @@
       }
       .status.error { color: var(--warn); }
       .hidden { display: none; }
+      .hint { color: var(--muted); font-size: 12px; }
+      .actions {
+        display: flex;
+        gap: 8px;
+        margin-top: 10px;
+        flex-wrap: wrap;
+      }
+      .actions button { padding: 4px 12px; font-size: 13px; }
+      .actions button.danger { color: var(--warn); border-color: var(--warn); }
+      .actions button.primary { color: var(--accent); border-color: var(--accent); }
+      textarea {
+        width: 100%;
+        min-height: 90px;
+        font: inherit;
+        color: var(--text);
+        background: var(--bg);
+        border: 1px solid var(--line);
+        border-radius: 8px;
+        padding: 8px 10px;
+        resize: vertical;
+      }
+      .grid {
+        display: grid;
+        grid-template-columns: repeat(auto-fit, minmax(170px, 1fr));
+        gap: 8px;
+      }
+      .param {
+        background: var(--bg);
+        border: 1px solid var(--line);
+        border-radius: 8px;
+        padding: 8px 10px;
+        font-size: 13px;
+      }
+      .param .k { color: var(--muted); font-size: 12px; }
+      .param .v { font-weight: 600; }
+      .section-title { font-size: 14px; font-weight: 600; margin: 18px 0 8px; }
+      .section-title.first { margin-top: 0; }
     </style>
   </head>
   <body>
@@ -193,10 +230,18 @@
       <button data-tab="short" class="active">短期账本</button>
       <button data-tab="long">长期记忆</button>
       <button data-tab="permanent">永久记忆</button>
+      <button data-tab="profiles">用户画像</button>
+      <button data-tab="runtime">巡检与焦点</button>
+      <button data-tab="context">当前上下文</button>
     </div>
 
     <div class="filters" id="filters">
       <select id="chat-filter"><option value="">全部会话</option></select>
+    </div>
+
+    <div class="filters hidden" id="context-filters">
+      <select id="context-chat"><option value="">选择会话</option></select>
+      <span class="hint">这里显示该会话最近一次请求真正发给主脑的内容。</span>
     </div>
 
     <main id="list"></main>
@@ -213,7 +258,7 @@
       const PLUGIN = "astrbot_plugin_shittim";
       const PAGE_LIMIT = 50;
 
-      const state = { tab: "short", chatId: "", offset: 0, total: 0 };
+      const state = { tab: "short", chatId: "", offset: 0, total: 0, contextChatId: "" };
 
       const el = {
         stats: document.getElementById("stats"),
@@ -221,6 +266,8 @@
         tabs: document.getElementById("tabs"),
         filters: document.getElementById("filters"),
         chatFilter: document.getElementById("chat-filter"),
+        contextFilters: document.getElementById("context-filters"),
+        contextChat: document.getElementById("context-chat"),
         list: document.getElementById("list"),
         pager: document.getElementById("pager"),
         pageInfo: document.getElementById("pageinfo"),
@@ -265,6 +312,38 @@
         const body = await resp.json();
         if (body && body.status === "error") throw new Error(body.message || "请求失败");
         return body && "data" in body ? body.data : body;
+      }
+
+      async function apiPost(path, body) {
+        const bridge = await waitForBridge();
+        if (bridge) {
+          await bridge.ready();
+          if (typeof bridge.apiPost !== "function") {
+            throw new Error("当前 AstrBot 版本不支持页面写操作，请升级后再试");
+          }
+          const result = await bridge.apiPost(path, body || {});
+          if (result && result.status === "error") {
+            throw new Error(result.message || "请求失败");
+          }
+          return result && "data" in result ? result.data : result;
+        }
+        const url = new URL(`/api/plug/${PLUGIN}/${path}`, location.origin);
+        const resp = await fetch(url.toString(), {
+          method: "POST",
+          credentials: "include",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify(body || {}),
+        });
+        const payload = await resp.json();
+        if (payload && payload.status === "error") throw new Error(payload.message || "请求失败");
+        return payload && "data" in payload ? payload.data : payload;
+      }
+
+      function fmtSeconds(sec) {
+        const value = Math.max(Number(sec) || 0, 0);
+        if (value < 60) return `${value.toFixed(1)} 秒`;
+        if (value < 3600) return `${Math.round(value / 60)} 分钟`;
+        return `${(value / 3600).toFixed(1)} 小时`;
       }
 
       function fmtTime(ts) {
@@ -318,6 +397,7 @@
           ["活跃会话", data.chats],
           ["长期记忆", data.long],
           ["永久记忆", data.permanent],
+          ["用户画像", data.profiles],
           ["关注中会话", data.focused],
         ];
         cards.forEach(([cap, num]) => {
@@ -491,8 +571,424 @@
             quote.textContent = `原话：${item.source_quote}`;
             box.appendChild(quote);
           }
+          // 手工维护：正文由编辑框直接改写，删除会同时抑制它被重新压缩回来
+          const actions = document.createElement("div");
+          actions.className = "actions";
+          const editButton = document.createElement("button");
+          editButton.textContent = "编辑";
+          editButton.addEventListener("click", () => startEdit(body, actions, item));
+          const deleteButton = document.createElement("button");
+          deleteButton.className = "danger";
+          deleteButton.textContent = "删除";
+          deleteButton.addEventListener("click", () => deleteMemory(item));
+          actions.append(editButton, deleteButton);
+          box.appendChild(actions);
           el.list.appendChild(box);
         });
+      }
+
+      // 用户画像：一行就是一个人。身份是「平台 + QQ 号」，所以私聊与群聊
+      // 共用同一张卡片；aliases 里是他用过的不同名字。
+      function renderProfiles(items) {
+        el.list.replaceChildren();
+        if (!items.length) {
+          el.list.appendChild(
+            emptyNode("还没有用户画像。聊过一段时间、整理过一次记忆后，这里会逐渐出现对每个人的印象。")
+          );
+          return;
+        }
+        items.forEach((item) => {
+          const box = document.createElement("div");
+          box.className = "item";
+          const meta = document.createElement("div");
+          meta.className = "meta";
+          meta.appendChild(line(item.display_name || item.user_id, "who"));
+          meta.appendChild(tag(`QQ ${item.user_id}`));
+          if (item.message_count) {
+            meta.appendChild(tag(`${item.message_count} 条发言`));
+          }
+          if (item.platform) {
+            meta.appendChild(line(item.platform));
+          }
+          if (item.last_seen) {
+            meta.appendChild(line(`最近说话 ${fmtAge(item.last_seen)}`));
+          }
+          box.appendChild(meta);
+
+          if (item.aliases && item.aliases.length) {
+            const aliases = document.createElement("div");
+            aliases.className = "tags";
+            aliases.textContent = `用过的名字：${item.aliases.join(" / ")}`;
+            box.appendChild(aliases);
+          }
+
+          const body = document.createElement("div");
+          body.className = "body";
+          body.textContent =
+            item.summary || "（还没有形成描述；整理记忆后会逐渐完善）";
+          box.appendChild(body);
+
+          if (item.keywords && item.keywords.length) {
+            const words = document.createElement("div");
+            words.className = "tags";
+            words.textContent = item.keywords.map((word) => `#${word}`).join(" ");
+            box.appendChild(words);
+          }
+
+          const foot = document.createElement("div");
+          foot.className = "meta";
+          foot.appendChild(
+            line(
+              item.profiled_at
+                ? `画像更新于 ${fmtAge(item.profiled_at)}`
+                : "画像尚未整理"
+            )
+          );
+          if (item.first_seen) {
+            foot.appendChild(line(`首次见面 ${fmtTime(item.first_seen)}`));
+          }
+          box.appendChild(foot);
+          el.list.appendChild(box);
+        });
+      }
+
+      function paramBox(key, value) {
+        const box = document.createElement("div");
+        box.className = "param";
+        const k = document.createElement("div");
+        k.className = "k";
+        k.textContent = key;
+        const v = document.createElement("div");
+        v.className = "v";
+        v.textContent = String(value);
+        box.append(k, v);
+        return box;
+      }
+
+      function sectionTitle(text) {
+        const div = document.createElement("div");
+        div.className = "section-title";
+        div.textContent = text;
+        return div;
+      }
+
+      function textBlock(text) {
+        const box = document.createElement("div");
+        box.className = "item";
+        const body = document.createElement("div");
+        body.className = "body";
+        body.textContent = text || "（空）";
+        box.appendChild(body);
+        return box;
+      }
+
+      const FOCUS_STATUS = { focused: "关注中", left: "已离开", expired: "已超时" };
+      const VERDICT_LABEL = {
+        reply: "开口",
+        silent: "沉默",
+        superseded: "被新消息取代",
+        cooldown: "冷却拦下",
+        release: "静默放行",
+        skipped: "未判定",
+      };
+      const ENTRY_KIND = {
+        history: "原生历史",
+        timeline: "账本时间线",
+        injected: "注入块",
+        persona: "人格预设对话",
+      };
+      const ROLE_LABEL = { user: "用户", assistant: "你", system: "系统", tool: "工具" };
+
+      // 巡检与焦点：上面是配置参数，下面是此刻真正在等的窗口 / 判定 / 冷却。
+      // 参数与运行时状态放在一起，才能回答「为什么这句话没被放行」。
+      function renderRuntime(data) {
+        el.list.replaceChildren();
+        const dec = data.decision || {};
+        const focusCfg = data.focus_config || {};
+
+        el.list.appendChild(sectionTitle("巡检参数"));
+        const grid = document.createElement("div");
+        grid.className = "grid";
+        [
+          ["接管对话", dec.enabled ? "开" : "关"],
+          ["群聊巡检", dec.patrol_enabled ? "开" : "关"],
+          ["巡检窗口静默时长", `${dec.patrol_window_seconds} 秒`],
+          ["判为不回后的冷却", fmtSeconds(dec.patrol_cooldown_seconds)],
+          ["噪声预过滤", dec.patrol_noise_filter ? "开" : "关"],
+          ["私聊与 @ 防抖", `${dec.private_debounce_seconds} 秒`],
+          [
+            "防抖最长等待",
+            dec.private_debounce_max_seconds > 0
+              ? `${dec.private_debounce_max_seconds} 秒`
+              : "不封顶",
+          ],
+          ["判定带入前文", `${dec.context_messages} 条`],
+          ["私聊直接回复", dec.always_reply_private ? "是" : "否"],
+          ["被 @ 必回", dec.always_reply_when_mentioned ? "是" : "否"],
+          ["焦点超时", `${focusCfg.timeout_minutes} 分钟`],
+          ["主动发言需焦点", focusCfg.require_focus_for_say ? "是" : "否"],
+        ].forEach(([key, value]) => grid.appendChild(paramBox(key, value)));
+        el.list.appendChild(grid);
+
+        if (data.sleep) {
+          el.list.appendChild(sectionTitle("当前作息"));
+          const sleepGrid = document.createElement("div");
+          sleepGrid.className = "grid";
+          [
+            ["阶段", data.sleep.phase_label || data.sleep.phase],
+            ["入睡", fmtClock(data.sleep.sleep_at)],
+            ["起床", fmtClock(data.sleep.wake_at)],
+            ["本轮推迟", `${data.sleep.postponed_hours || 0} 小时`],
+          ].forEach(([key, value]) => sleepGrid.appendChild(paramBox(key, value)));
+          el.list.appendChild(sleepGrid);
+        }
+
+        const patrol = data.patrol || {};
+        const windows = patrol.windows || [];
+        el.list.appendChild(sectionTitle("等待中的窗口"));
+        if (!windows.length) {
+          el.list.appendChild(emptyNode("当前没有正在计时的窗口"));
+        }
+        windows.forEach((item) => {
+          const box = document.createElement("div");
+          box.className = "item";
+          const meta = document.createElement("div");
+          meta.className = "meta";
+          meta.appendChild(line(item.chat_label || item.chat_id, "who"));
+          meta.appendChild(tag(item.silent ? "静默防抖" : "巡检窗口", item.silent ? "ok" : ""));
+          if (item.mention) meta.appendChild(tag("含名字提及", "warn"));
+          meta.appendChild(line(`剩余 ${fmtSeconds(item.remaining)}`));
+          meta.appendChild(line(`本轮等待 ${fmtSeconds(item.delay)}`));
+          box.appendChild(meta);
+          el.list.appendChild(box);
+        });
+
+        const judging = patrol.judging || [];
+        el.list.appendChild(sectionTitle("正在判定"));
+        if (!judging.length) {
+          el.list.appendChild(emptyNode("没有正在询问判定模型的会话"));
+        }
+        judging.forEach((item) => {
+          const box = document.createElement("div");
+          box.className = "item";
+          const meta = document.createElement("div");
+          meta.className = "meta";
+          meta.appendChild(line(item.chat_label || item.chat_id, "who"));
+          meta.appendChild(tag("判定中", "warn"));
+          meta.appendChild(line("单次判定最长等待 30 秒"));
+          box.appendChild(meta);
+          el.list.appendChild(box);
+        });
+
+        const cooldowns = patrol.cooldowns || [];
+        el.list.appendChild(sectionTitle("冷却中"));
+        if (!cooldowns.length) {
+          el.list.appendChild(emptyNode("没有被判为不回后静默的会话"));
+        }
+        cooldowns.forEach((item) => {
+          const box = document.createElement("div");
+          box.className = "item";
+          const meta = document.createElement("div");
+          meta.className = "meta";
+          meta.appendChild(line(item.chat_label || item.chat_id, "who"));
+          meta.appendChild(tag("冷却", "warn"));
+          meta.appendChild(line(`剩余 ${fmtSeconds(item.remaining)}，期间普通消息不判定`));
+          box.appendChild(meta);
+          el.list.appendChild(box);
+        });
+
+        const focusItems = data.focus_items || [];
+        el.list.appendChild(sectionTitle("会话焦点"));
+        if (!focusItems.length) {
+          el.list.appendChild(emptyNode("还没有任何会话获得过焦点"));
+        }
+        focusItems.forEach((item) => {
+          const box = document.createElement("div");
+          box.className = "item";
+          const meta = document.createElement("div");
+          meta.className = "meta";
+          meta.appendChild(line(item.chat_label || item.chat_id, "who"));
+          meta.appendChild(
+            tag(
+              FOCUS_STATUS[item.status] || item.status,
+              item.status === "focused" ? "ok" : "warn"
+            )
+          );
+          meta.appendChild(line(`最近活跃 ${fmtAge(item.focused_at)}`));
+          meta.appendChild(line(`空闲 ${fmtSeconds(item.idle_seconds)}`));
+          box.appendChild(meta);
+          el.list.appendChild(box);
+        });
+
+        const lastDecisions = patrol.last_decisions || [];
+        el.list.appendChild(sectionTitle("最近判定（每个会话最后一条）"));
+        if (!lastDecisions.length) {
+          el.list.appendChild(emptyNode("还没有判定记录"));
+        }
+        lastDecisions.forEach((item) => {
+          const box = document.createElement("div");
+          box.className = "item";
+          const meta = document.createElement("div");
+          meta.className = "meta";
+          meta.appendChild(line(item.chat_label || item.chat_id, "who"));
+          const good = item.verdict === "reply" || item.verdict === "release";
+          meta.appendChild(
+            tag(VERDICT_LABEL[item.verdict] || item.verdict, good ? "ok" : "warn")
+          );
+          meta.appendChild(tag(item.judged ? "模型判定" : "未调用模型"));
+          meta.appendChild(line(`${fmtTime(item.at)} · ${fmtAge(item.at)}`));
+          const body = document.createElement("div");
+          body.className = "body";
+          body.textContent = item.reason || "";
+          box.append(meta, body);
+          el.list.appendChild(box);
+        });
+      }
+
+      function renderContextSessions(items) {
+        el.contextChat.replaceChildren();
+        const blank = document.createElement("option");
+        blank.value = "";
+        blank.textContent = items.length ? "选择会话" : "暂无会话";
+        el.contextChat.appendChild(blank);
+        items.forEach((item) => {
+          const option = document.createElement("option");
+          option.value = item.chat_id;
+          const count = (item.counts && item.counts.contexts) || 0;
+          option.textContent = `${item.chat_label || item.chat_id}（${count} 条上下文）`;
+          el.contextChat.appendChild(option);
+        });
+      }
+
+      // 当前上下文：逐字展示最近一次请求的内容——系统提示词、上下文条目、
+      // 本轮消息、临时内容块。顺序即模型读取顺序。
+      function renderContext(snap) {
+        el.list.replaceChildren();
+        if (!snap) {
+          el.list.appendChild(emptyNode("该会话还没有捕获到主脑请求"));
+          return;
+        }
+        const counts = snap.counts || {};
+        const head = document.createElement("div");
+        head.className = "item";
+        const meta = document.createElement("div");
+        meta.className = "meta";
+        meta.appendChild(
+          tag(
+            snap.mode === "takeover" ? "接管上下文" : "原生按会话历史",
+            snap.mode === "takeover" ? "warn" : "ok"
+          )
+        );
+        meta.appendChild(line(`捕获于 ${fmtTime(snap.captured_at)} · ${fmtAge(snap.captured_at)}`));
+        if (snap.model) meta.appendChild(tag(snap.model));
+        meta.appendChild(
+          line(
+            `${counts.contexts || 0} 条上下文 · ${counts.extra_parts || 0} 个临时块 · ${counts.chars || 0} 字`
+          )
+        );
+        if (counts.dropped_contexts > 0) {
+          meta.appendChild(tag(`为控制体积省略了最早 ${counts.dropped_contexts} 条`, "warn"));
+        }
+        if (!snap.memory_enabled) meta.appendChild(tag("记忆停用", "warn"));
+        if (!snap.schedule_enabled) meta.appendChild(tag("作息停用", "warn"));
+        head.appendChild(meta);
+        el.list.appendChild(head);
+
+        el.list.appendChild(sectionTitle("系统提示词"));
+        el.list.appendChild(textBlock(snap.system_prompt));
+
+        el.list.appendChild(sectionTitle("上下文条目（按发送顺序）"));
+        const contexts = snap.contexts || [];
+        if (!contexts.length) el.list.appendChild(emptyNode("上下文为空"));
+        contexts.forEach((entry) => {
+          const box = document.createElement("div");
+          box.className = "item";
+          const entryMeta = document.createElement("div");
+          entryMeta.className = "meta";
+          entryMeta.appendChild(
+            tag(
+              ROLE_LABEL[entry.role] || entry.role || "未知",
+              entry.role === "assistant" ? "" : "ok"
+            )
+          );
+          if (entry.kind && entry.kind !== "history") {
+            entryMeta.appendChild(line(ENTRY_KIND[entry.kind] || entry.kind));
+          }
+          const body = document.createElement("div");
+          body.className = "body";
+          body.textContent = entry.content || "（空）";
+          box.append(entryMeta, body);
+          el.list.appendChild(box);
+        });
+
+        el.list.appendChild(sectionTitle("本轮用户消息"));
+        el.list.appendChild(textBlock(snap.prompt));
+
+        el.list.appendChild(sectionTitle("临时内容块（随本轮发送，不写入历史）"));
+        const extra = snap.extra_parts || [];
+        if (!extra.length) el.list.appendChild(emptyNode("本轮没有临时内容块"));
+        extra.forEach((part) => {
+          const box = document.createElement("div");
+          box.className = "item";
+          const partMeta = document.createElement("div");
+          partMeta.className = "meta";
+          partMeta.appendChild(tag(part.label || "临时内容块", "warn"));
+          const body = document.createElement("div");
+          body.className = "body";
+          body.textContent = part.content || "";
+          box.append(partMeta, body);
+          el.list.appendChild(box);
+        });
+      }
+
+      function startEdit(body, actions, item) {
+        const textarea = document.createElement("textarea");
+        textarea.value = item.content;
+        const toolbar = document.createElement("div");
+        toolbar.className = "actions";
+        const save = document.createElement("button");
+        save.className = "primary";
+        save.textContent = "保存";
+        const cancel = document.createElement("button");
+        cancel.textContent = "取消";
+        toolbar.append(save, cancel);
+        body.replaceWith(textarea);
+        actions.replaceWith(toolbar);
+
+        cancel.addEventListener("click", () => reload());
+        save.addEventListener("click", async () => {
+          const content = textarea.value.trim();
+          if (!content) {
+            setStatus("记忆内容不能为空", true);
+            return;
+          }
+          save.disabled = true;
+          cancel.disabled = true;
+          try {
+            await apiPost("memories/update", { id: item.id, content });
+            await reload();
+            setStatus("已保存修改");
+          } catch (error) {
+            setStatus(`保存失败：${error.message || error}`, true);
+            save.disabled = false;
+            cancel.disabled = false;
+          }
+        });
+        textarea.focus();
+      }
+
+      async function deleteMemory(item) {
+        const ok = confirm(
+          `确定删除这条记忆？\n\n${item.content}\n\n删除后它不会在下一次压缩时被重新写回。`
+        );
+        if (!ok) return;
+        try {
+          await apiPost("memories/delete", { id: item.id });
+          await reload();
+          setStatus("已删除该条记忆");
+        } catch (error) {
+          setStatus(`删除失败：${error.message || error}`, true);
+        }
       }
 
       function emptyNode(text) {
@@ -520,6 +1016,26 @@
       }
 
       async function loadList() {
+        if (state.tab === "runtime") {
+          renderRuntime(await apiGet("runtime"));
+          state.total = 0;
+          renderPager();
+          return;
+        }
+        if (state.tab === "context") {
+          await loadContext();
+          return;
+        }
+        if (state.tab === "profiles") {
+          const data = await apiGet("profiles", {
+            limit: PAGE_LIMIT,
+            offset: state.offset,
+          });
+          state.total = data.total || 0;
+          renderProfiles(data.items || []);
+          renderPager();
+          return;
+        }
         if (state.tab === "short") {
           // 摘要与消息一起取：页面展示的必须是时间线里真实存在的那批条目
           const [data, sums] = await Promise.all([
@@ -543,6 +1059,33 @@
         });
         state.total = data.total || 0;
         renderMemories(data.items || []);
+        renderPager();
+      }
+
+      // 当前上下文：先取会话列表，再取选中会话最近一次的完整快照。
+      // 默认选最近被唤醒的那个，省掉「先选再找」的一步。
+      async function loadContext() {
+        const data = await apiGet("context");
+        const items = data.items || [];
+        state.total = 0;
+        if (!items.length) {
+          renderContextSessions([]);
+          el.list.replaceChildren(
+            emptyNode("还没有捕获到主脑请求。等她被唤醒一次后再刷新。")
+          );
+          renderPager();
+          return;
+        }
+        if (
+          !state.contextChatId ||
+          !items.some((item) => item.chat_id === state.contextChatId)
+        ) {
+          state.contextChatId = items[0].chat_id;
+        }
+        renderContextSessions(items);
+        el.contextChat.value = state.contextChatId;
+        const snapshot = await apiGet("context", { chat_id: state.contextChatId });
+        renderContext(snapshot);
         renderPager();
       }
 
@@ -571,8 +1114,9 @@
         [...el.tabs.querySelectorAll("button")].forEach((item) =>
           item.classList.toggle("active", item === button)
         );
-        // 会话筛选只对短期账本有意义
+        // 会话筛选只对短期账本有意义；上下文有自己的会话选择器
         el.filters.classList.toggle("hidden", state.tab !== "short");
+        el.contextFilters.classList.toggle("hidden", state.tab !== "context");
         reload();
       });
 
@@ -580,6 +1124,14 @@
         state.chatId = el.chatFilter.value;
         state.offset = 0;
         reload();
+      });
+
+      el.contextChat.addEventListener("change", () => {
+        state.contextChatId = el.contextChat.value;
+        setStatus("载入中…");
+        loadContext()
+          .then(() => setStatus(""))
+          .catch((error) => setStatus(`载入失败：${error.message || error}`, true));
       });
 
       el.prev.addEventListener("click", () => {
