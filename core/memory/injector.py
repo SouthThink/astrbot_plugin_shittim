@@ -236,6 +236,54 @@ def build_profile_block(
     return "\n".join(lines)
 
 
+# ── 工具清单 ──────────────────────────────────────────────
+
+_TOOL_GUIDE_OPEN = "<tool_guide>"
+_TOOL_GUIDE_CLOSE = "</tool_guide>"
+
+# 工具与用法说明。AstrBot 已把 docstring 作为函数声明交给模型，但那只有
+# 「这个工具做什么」；这一段补的是「什么时候该用、和兄弟工具怎么分工」。
+# **新增或改名工具时必须同步这里**，否则模型会照着一份过期的清单做事。
+_TOOL_GUIDE = """下面这些工具由你自己调用，不需要征求同意；用不上的时候不要为了用而用。
+
+【看】
+- list_sessions(limit=15)：看看有哪些会话，返回会话标识、标签与最近活跃时间。要去某个地方之前先用它找准标识。
+- peek_session(session, limit=12)：隔着窗看一眼某个会话最近的对话，不会改变你在哪儿。只是想知道别处的情况时用它。
+- search_history(keyword="", session="", days=7, limit=20)：翻原始聊天记录，包括你已经不记得的、已清空或已压进摘要的那些。只在想确认旧事或原话时用，不要拿它代替回忆。
+
+【走】
+- enter_session(session)：走进某个会话，看那边在你离开期间攒下的消息。想过去说话之前先走进去；它只切换位置，不发言。
+- leave_session(session)：离开某个会话，之后不再主动关注它。
+- rest()：离开所有会话去休息，直到有人再找你。
+
+【说】
+- say(session, text, target_type="auto", force=false)：在某个会话里说一句，说完你就「在」那里了。第一次去某个会话会先把那边的近况给你看、并不发送，确认后带 force=true 再调一次。
+- stay_silent()：这一轮不发言，把已经想好的话丢掉。
+
+【记】
+- remember(content, user_name="", tags="")：记下值得长期保存的事，写入永久记忆。
+- recall(query)：回想一件只剩个大概的旧事，按关键词取回细节再开口。
+- forget(memory)：忘掉某件事，之后不会再被重新记住。
+
+【作息】
+- delay_sleep(hours)：今晚晚点睡，0.5~6 小时，只对今晚有效。
+
+几种常见组合：
+- 去别处说话：list_sessions → enter_session（或 peek_session）→ say。
+- 想核实旧事：recall 找细节，search_history 找原话；两者都查不到就别编。
+- 只是看着、插不上话：leave_session 或 rest，不要硬接。"""
+
+
+def build_tool_guide_block() -> str:
+    """返回工具清单块（稳定文本，每轮注入）。
+
+    内容是「怎么用」而不是参数表：参数已经在函数声明里，重复列一遍只是浪费
+    token。稳定文本放最前，越靠近末尾的越该是本轮独有的内容（判定念头、
+    位置提示、作息提示）。
+    """
+    return "\n".join([_TOOL_GUIDE_OPEN, _TOOL_GUIDE, _TOOL_GUIDE_CLOSE])
+
+
 # ── 判定理由（当作主脑自己的念头）──────────────────────────
 
 _THOUGHT_OPEN = "<own_thought>"
@@ -263,6 +311,36 @@ def build_judge_thought_block(reason: str) -> str:
         _THOUGHT_CLOSE,
     ]
     return "\n".join(lines)
+
+
+# ── 位置提示（本轮切换过会话）──────────────────────────────
+
+_WHEREABOUTS_OPEN = "<whereabouts>"
+_WHEREABOUTS_CLOSE = "</whereabouts>"
+
+
+def build_whereabouts_block(
+    *, here: str, there: str = "", reply_here: bool = False
+) -> str:
+    """说明她此刻人在哪个会话。
+
+    只在本轮切换过会话（`enter_session` / `say`）时注入：切换之后她的
+    注意力已经不在原会话，需要一句话点明「现在在哪儿、话该说在哪儿」，
+    否则模型仍会按原会话的语境组织回复。
+
+    这里不写任何行为准则——说什么、说多少取决于人格，插件只负责告诉她
+    当前所处的位置。
+    """
+    if not here:
+        return ""
+    lines = [f"你此刻在「{here}」。"]
+    if there and there != here:
+        lines.append(f"你刚从「{there}」过来，那边这一轮你不用再回应。")
+    if reply_here:
+        lines.append("你这一轮最后说的话，会直接说在这里。")
+    else:
+        lines.append("要在这里说话，继续用 say，并把 session 指向这里。")
+    return "\n".join([_WHEREABOUTS_OPEN, *lines, _WHEREABOUTS_CLOSE])
 
 
 # ── 作息事件提示 ──────────────────────────────────────────

@@ -13,9 +13,17 @@
 ## 生命周期
 
 - 收到某会话的新消息         → 该会话获得 / 刷新焦点
-- 主动向某会话发言（say）    → 该会话获得 / 刷新焦点
+- 主动进入某会话（enter）    → 该会话获得 / 刷新焦点，并推进已读水位线
+- 主动向某会话发言（say）    → 该会话获得 / 刷新焦点，并推进已读水位线
 - 某会话安静超过 timeout     → 焦点失效
 - 主动 leave / rest          → 立即失效
+
+## 已读水位线
+
+`last_read_at` 记录「她最后一次真正在这个会话里」的时刻，与 `focused_at`
+**不是一回事**：收消息、超时都会刷新焦点，但那不代表她看过那些消息。
+它只用于算「她离开期间攒下的未读」，进入会话（`enter_session`）或在那里
+说过话之后才推进。
 
 注意：焦点失效不等于「离场」——下一条消息仍会触发唤醒，仍会进入决断层判断，
 它只收回「主动开口」的资格。
@@ -72,6 +80,20 @@ class FocusManager:
             (chat_label or "", now, chat_id),
         )
 
+    def mark_read(self, chat_id: str, at: float | None = None) -> None:
+        """推进已读水位线：她此刻就在这个会话里，之后发生的才算未读。
+
+        必须在 `touch()` 之后调用：记录不存在时 `touch()` 先建行，
+        这里才能更新到它。
+        """
+        if not chat_id:
+            return
+        stamp = float(at if at is not None else time.time())
+        self._db.execute(
+            "UPDATE session_focus SET last_read_at = ? WHERE chat_id = ?",
+            (stamp, chat_id),
+        )
+
     def leave(self, chat_id: str) -> bool:
         """主动离开某会话：收回该会话的主动发言资格。"""
         if not self.get_record(chat_id):
@@ -111,6 +133,11 @@ class FocusManager:
         if row is None or int(row["left"] or 0) == 1:
             return False
         return self.idle_seconds(chat_id) <= self.timeout_seconds
+
+    def last_read_at(self, chat_id: str) -> float:
+        """她最后一次在这个会话里的时刻；0 表示从没进去过。"""
+        row = self.get_record(chat_id)
+        return float(row["last_read_at"] or 0.0) if row is not None else 0.0
 
     def idle_seconds(self, chat_id: str) -> float:
         """距上次获得焦点已过去多少秒；无记录返回正无穷。"""

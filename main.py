@@ -58,6 +58,7 @@ from .core.common.config import (
 )
 from .core.common.db import MemoryDB
 from .core.common.event_utils import (
+    EXTRA_ENTERED_TO,
     EXTRA_JUDGE_REASON,
     EXTRA_LEFT_TO,
     EXTRA_MESSAGE_ID,
@@ -96,6 +97,8 @@ from .core.memory.injector import (
     build_profile_block,
     build_related_block,
     build_schedule_notice,
+    build_tool_guide_block,
+    build_whereabouts_block,
 )
 from .core.memory.ledger import (
     SOURCE_LIVE,
@@ -173,6 +176,11 @@ _SLEEP_TICK_SECONDS = 60.0
 # 阶段的中文说法：日志、工具返回、记忆页面共用同一套，避免三处各写一份
 _PHASE_LABELS = {AWAKE: "清醒", SLEEP_LIGHT: "浅睡", DEEP: "深睡"}
 
+# 进入会话时带回的未读：条数与字数双上限。未读只是「补全她不在时发生的事」，
+# 不是本轮要回应的内容，给太多反而会把眼前的目的挤掉。
+_UNREAD_LIMIT = 20
+_UNREAD_CHARS = 1200
+
 # 主脑上下文快照：仅供页面查看，保留最近若干个会话的最后一次请求。
 # 每个会话只留一份，避免热路径无限累积；单段文本做截断，防止内存占用失控。
 _CONTEXT_SNAPSHOT_SESSIONS = 8
@@ -226,6 +234,10 @@ def _part_label(text: str) -> str:
         return "用户画像"
     if "<own_thought>" in text:
         return "判定念头"
+    if "<tool_guide>" in text:
+        return "工具清单"
+    if "<whereabouts>" in text:
+        return "位置提示"
     if "<memory_reference>" in text:
         return "记忆块"
     if "<cross_session_timeline>" in text:
@@ -1022,16 +1034,25 @@ class ShittimPlugin(Star):
 
         结果顺序即模型读取顺序：
 
-            ① 当前说话人的画像 → ② 话题相关召回 → ③ 永久记忆 → ④ 榜前长期记忆
-            → ⑤ 跨会话背景 →（原生历史/时间线）→ ⑥ 判定念头 → 作息事件提示
+            ① 工具清单 → ② 当前说话人的画像 → ③ 话题相关召回 → ④ 永久记忆
+            → ⑤ 榜前长期记忆 → ⑥ 跨会话背景 →（原生历史/时间线）→ ⑦ 判定念头
+            → ⑧ 位置提示 → 作息事件提示
         """
         chat_id = event.unified_msg_origin or ""
         try:
+            # 工具清单是稳定参考，放最前；越靠近末尾的越该是本轮独有的内容。
+            # 记忆关闭时也要注入——它讲的是「你能做什么」，与记忆无关。
+            guide = build_tool_guide_block()
             if self._memory_active():
-                self._inject_memory_blocks(event, req, chat_id)
+                self._inject_memory_blocks(event, req, chat_id, guide=guide)
+            else:
+                self._append_temp_parts(req, [guide])
 
             # 判定念头独立于记忆系统：它解释的是「这一轮为什么被放行」。
             self._inject_judge_thought(event, req)
+
+            # 位置提示同样独立：本轮切换过会话时，她需要知道自己现在在哪儿。
+            self._inject_whereabouts(event, req)
 
             # 作息事件提示独立于记忆系统：睡眠期间发生的事件与记忆是否启用无关，
             # 只要作息功能开启就应注入。
@@ -1058,6 +1079,32 @@ class ShittimPlugin(Star):
         block = build_judge_thought_block(reason)
         if block:
             self._append_temp_parts(req, [block])
+
+    def _inject_whereabouts(self, event: AstrMessageEvent, req) -> None:
+        """本轮切换过会话时，告诉主脑「现在在哪儿、话该说在哪儿」。
+
+        切换之后她的注意力已经不在原会话：不点明位置，模型会继续按原会话的
+        语境组织回复。这里只说位置，不写任何行为准则。
+        """
+        entered = str(get_extra(event, EXTRA_ENTERED_TO, "") or "")
+        said = str(get_extra(event, EXTRA_LEFT_TO, "") or "")
+        target = entered or said
+        if not target:
+            return
+        here = self.short_term.label_for_chat(target) or target
+        origin = event.unified_msg_origin or ""
+        there = self.short_term.label_for_chat(origin) if origin else ""
+        # 只有「走进去、还没说过话」时，本轮收尾发言才会被投递到那里
+        reply_here = bool(entered) and not said and self._redirect_reply_enabled()
+        block = build_whereabouts_block(here=here, there=there, reply_here=reply_here)
+        if block:
+            self._append_temp_parts(req, [block])
+
+    def _redirect_reply_enabled(self) -> bool:
+        """本轮收尾发言是否投递到她刚进入的会话。"""
+        return bool(
+            self._proactive_config().get("redirect_reply_to_target", True)
+        )
 
     def _speaker_profile(self, event: AstrMessageEvent):
         """当前说话人的画像；没有或未开启注入时返回 None。
@@ -1116,10 +1163,15 @@ class ShittimPlugin(Star):
         return [item.memory for item in recalled]
 
     def _inject_memory_blocks(
-        self, event: AstrMessageEvent, req, chat_id: str
+        self, event: AstrMessageEvent, req, chat_id: str, *, guide: str = ""
     ) -> None:
-        """注入记忆块；接管模式下重建时间线，否则追加临时内容块。"""
+        """注入记忆块；接管模式下重建时间线，否则追加临时内容块。
+
+        `guide` 是工具清单：它排在所有记忆块之前，作为稳定的能力参考。
+        """
         blocks: list[str] = []
+        if guide:
+            blocks.append(guide)
 
         # ① 当前说话人的画像：让她知道「现在是谁在跟她说话」。
         #    放在最前，因为它决定其余记忆的解读角度（谁的兴趣、谁的观点）。
@@ -1537,13 +1589,15 @@ class ShittimPlugin(Star):
 
     @filter.on_decorating_result(priority=_PRIORITY_DECORATE)
     async def drop_origin_reply_after_leaving(self, event: AstrMessageEvent):
-        """本轮已前往其他会话时，丢弃原会话的收尾发言。
+        """本轮切换过会话时，决定收尾发言的去向。
 
-        若缺少该步骤，会出现「前往目标会话发言后又返回原会话汇报」的行为，
-        与真实的跨会话发言不符。发言应发生在目标会话，而非原会话。
+        - **已经用 `say` 在别处说过话**：这段收尾是对原会话的汇报，丢弃。
+          否则会出现「前往目标会话发言后又返回原会话汇报」的行为。
+        - **只是用 `enter_session` 走了进去**：她人已经在那儿了，本轮的话
+          本来就该说在那里，投递过去（`redirect_reply_to_target` 可关）。
 
-        注意这不影响调用 `say` **之前**的发言：该部分在工具调用时已发送，
-        因此「好，我这就去」一类过渡语仍会送达，仅丢弃离开后的收尾汇报。
+        注意这不影响调用工具**之前**的发言：该部分在工具调用时已发送，
+        因此「好，我这就去」一类过渡语仍会送达。
 
         该处理器使用最低优先级，待其它插件的结果装饰完成后，再决定是否发送。
         """
@@ -1557,23 +1611,85 @@ class ShittimPlugin(Star):
             except Exception as error:
                 logger.error("[什亭之枢] 丢弃本轮发言失败: %s", error)
             return
+
+        left_to = str(get_extra(event, EXTRA_LEFT_TO, "") or "")
+        entered_to = str(get_extra(event, EXTRA_ENTERED_TO, "") or "")
+        if not left_to and not entered_to:
+            return
         if not self._proactive_config().get("silence_origin_after_say", True):
             return
-        if not get_extra(event, EXTRA_LEFT_TO):
-            return
+
         try:
             result = event.get_result() if hasattr(event, "get_result") else None
             if result is None:
                 return
             chain = getattr(result, "chain", None)
+            # 已经在别处说过话：这段收尾是对原会话的汇报，不能发到目标会话，
+            # 也不能发回原会话——直接丢弃。
+            if left_to:
+                if chain:
+                    result.chain = []
+                    logger.info(
+                        "[什亭之枢] 已在 %s 说过话，原会话本轮发言已省略", left_to
+                    )
+                return
+            # 只是走了进去、还没开口：本轮的话本来就该说在那里，投递过去。
+            if entered_to and self._redirect_reply_enabled():
+                await self._deliver_to(event, result, entered_to)
+                return
             if chain:
                 result.chain = []
                 logger.info(
-                    "[什亭之枢] 已前往 %s，原会话本轮发言已省略",
-                    get_extra(event, EXTRA_LEFT_TO, ""),
+                    "[什亭之枢] 已前往 %s，原会话本轮发言已省略", entered_to
                 )
         except Exception as error:
             logger.error("[什亭之枢] 抑制原会话发言失败: %s", error)
+
+    async def _deliver_to(self, event: AstrMessageEvent, result, umo: str) -> None:
+        """把本轮收尾发言投递到她刚进入的会话。
+
+        「走进去 → 想清楚 → 直接说话」是一个连续动作，若把收尾发言丢掉，
+        就会出现「人已经站在那儿，却什么都没说」。发送前先摘掉原会话的
+        消息链，避免同一句话发到两个地方。
+        """
+        chain = getattr(result, "chain", None)
+        if not chain:
+            return
+        text = extract_reply_text(event)
+        # 先摘链再发送：否则同一段内容会被 AstrBot 发回原会话
+        result.chain = []
+        if not text:
+            return
+        if not self._check_rate_limit(self._proactive_config()):
+            logger.warning("[什亭之枢] 收尾发言未投递（限流）| %s", umo)
+            return
+        try:
+            sent = await self.context.send_message(umo, chain)
+        except Exception as error:
+            logger.error("[什亭之枢] 收尾发言投递失败 | %s | %s", umo, error)
+            return
+        if sent is False:
+            logger.warning("[什亭之枢] 收尾发言未被平台接受 | %s", umo)
+            return
+
+        self._send_timestamps.append(time.time())
+        label = self.short_term.label_for_chat(umo)
+        self.focus.touch(umo, label)
+        self.focus.mark_read(umo)
+        if self._memory_active():
+            # 主动发言不在 AstrBot 的历史里，标记 gated 供上下文构建时补回
+            self.short_term.add(
+                chat_id=umo,
+                chat_label=label,
+                chat_kind="private" if is_private_chat(umo) else "group",
+                sender_id="",
+                sender_name="",
+                role="assistant",
+                content=text,
+                gated=True,
+            )
+            self._schedule_condense_if_due()
+        logger.info("[什亭之枢] 收尾发言已投递 | %s | %s", umo, text[:50])
 
     @filter.after_message_sent(priority=_PRIORITY_AFTER_SENT)
     async def after_message_sent(self, event: AstrMessageEvent):
@@ -1812,6 +1928,82 @@ class ShittimPlugin(Star):
             f"{_clock(new_window.wake_at)} 起床。明天照常。"
         )
 
+    @filter.llm_tool(name="enter_session")
+    async def enter_session(self, event: AstrMessageEvent, session: str) -> str:
+        """
+        走进某个会话，看看你不在的时候那边发生了什么。只进去看看，不发言。
+
+        想主动去某个群或某个人的私聊说点什么之前，先用它「走过去」：它会告诉你
+        你离开期间那边攒下的消息，之后你就在那里了，要说话用 say。
+        只是想知道别处最近在聊什么、并不打算过去时，用 peek_session。
+
+        Args:
+            session(string): 要去哪个会话，填群号、QQ号或会话标签（用 list_sessions 查看）
+        """
+        if self._is_terminating:
+            return "插件正在重载，请稍后再试。"
+        token = (session or "").strip()
+        if not token:
+            return "错误：session 不能为空。"
+        try:
+            umo = self.short_term.resolve_chat(token)
+        except Exception as error:
+            logger.error("[什亭之枢] 进入会话失败: %s", error)
+            return f"进入失败：{error}"
+        if not umo:
+            return (
+                f"找不到会话「{session}」，可以先用 list_sessions 看看有哪些。"
+            )
+        label = self.short_term.label_for_chat(umo)
+        try:
+            # 水位线要在推进之前读：推进之后所有消息都算「已读」
+            since = self.focus.last_read_at(umo)
+            self.focus.touch(umo, label)
+            self.focus.mark_read(umo)
+            rows = (
+                self.short_term.unread_since(umo, since, _UNREAD_LIMIT)
+                if since > 0
+                else self.short_term.recent_of_chat(umo, _UNREAD_LIMIT)
+            )
+        except Exception as error:
+            logger.error("[什亭之枢] 进入会话失败 | %s: %s", umo, error)
+            return f"进入失败：{error}"
+
+        # 走进别的会话：本轮收尾发言可以落在那里（见 decorate 阶段）
+        if umo != (event.unified_msg_origin or ""):
+            set_extra(event, EXTRA_ENTERED_TO, umo)
+        logger.info("[什亭之枢] 进入会话 | %s | 带回 %d 条", umo, len(rows))
+        return self._render_enter(umo, label, rows, first_time=since <= 0)
+
+    def _render_enter(
+        self, umo: str, label: str, rows: list, *, first_time: bool
+    ) -> str:
+        """进入会话时返回给主脑的正文。
+
+        措辞必须点明「这不是刚收到的消息」：否则模型会把未读当成新一轮提问，
+        逐条回应，反而把它来这里要做的事冲掉。
+        """
+        name = label or umo
+        if not rows:
+            return (
+                f"你进入了「{name}」，这边没有你错过的消息。你现在在这里。"
+            )
+        text = "\n".join(line for line in map(format_message_line, rows) if line)
+        if len(text) > _UNREAD_CHARS:
+            # 超出预算时保留最新的部分：越近的越可能与眼前的事相关
+            text = "…（更早的略）\n" + text[-_UNREAD_CHARS:]
+        head = (
+            f"你进入了「{name}」。你没有在这里的记录，它最近是这样的："
+            if first_time
+            else f"你进入了「{name}」。你不在的时候，这里有 {len(rows)} 条消息："
+        )
+        return (
+            f"{head}\n{text}\n"
+            "这些是你不在的时候发生的事，不是你刚收到的消息，"
+            "不需要逐条回应；先弄清现在该做什么，再决定要不要开口。\n"
+            "你现在在这里，要说话用 say，并把 session 指向这里。"
+        )
+
     @filter.llm_tool(name="say")
     async def say(
         self,
@@ -1825,8 +2017,9 @@ class ShittimPlugin(Star):
         前往某个会所说一句话。调用后你就「在」那里了，那边之后有人说话你会正常参与。
 
         主动开口前你需要了解那个地方的语境，否则会显得突兀。如果你最近没有关注过
-        目标会话，本次调用不会真的发送，而是先把那个会话的最近对话给你看；
+        目标会话，本次调用不会真的发送，而是先把那边的未读消息给你看；
         读完后确认要说的话合适，带上 force=true 再调用一次即可发出。
+        只想先过去看看、不急着说话，用 enter_session。
 
         Args:
             session(string): 要去哪个会话，填群号、QQ号或会话标签（用 list_sessions 查看）
@@ -1881,6 +2074,8 @@ class ShittimPlugin(Star):
         # 已前往目标会话：刷新焦点，后续该会话的消息会正常参与
         label = self.short_term.label_for_chat(umo)
         self.focus.touch(umo, label)
+        # 在那里说过话＝已经看过那边，已读水位线推到当下
+        self.focus.mark_read(umo)
         # 标记本轮已离开原会话，收尾时据此跳过原会话汇报
         if umo != (event.unified_msg_origin or ""):
             set_extra(event, EXTRA_LEFT_TO, umo)
@@ -2525,9 +2720,9 @@ class ShittimPlugin(Star):
     ) -> str | None:
         """主动发言前置检查：确认是否关注目标会话。返回 None 表示放行。
 
-        不直接拒绝，而是返回目标会话的近期对话；确认后可带 `force=true`
-        重新调用。该设计保留「先看语境再发言」的约束，同时避免工具在
-        「无资格」与「无内容」之间反复调用。
+        不直接拒绝，而是先把那边她错过的消息给她看；确认后可带 `force=true`
+        重新调用，或先 `enter_session` 走进去再说话。该设计保留「先看语境再
+        发言」的约束，同时避免工具在「无资格」与「无内容」之间反复调用。
         """
         if force or not self.focus_config.require_focus_for_say:
             return None
@@ -2537,7 +2732,12 @@ class ShittimPlugin(Star):
         if self.focus.is_focused(umo):
             return None
 
-        rows = self.short_term.recent_of_chat(umo, 12)
+        since = self.focus.last_read_at(umo)
+        rows = (
+            self.short_term.unread_since(umo, since, _UNREAD_LIMIT)
+            if since > 0
+            else self.short_term.recent_of_chat(umo, 12)
+        )
         label = self.short_term.label_for_chat(umo)
         if not rows:
             # 从未见过的会话没有可读语境，不额外限制
@@ -2547,10 +2747,10 @@ class ShittimPlugin(Star):
         idle_desc = "很久之前" if idle == float("inf") else format_age(idle)
         preview = "\n".join(format_message_line(row) for row in rows)
         return (
-            f"你已经有 {idle_desc} 没关注「{label}」了，现在并不在那里。\n"
-            f"它最近的对话是：\n{preview}\n\n"
-            "请先读懂这里的气氛，确认你要说的话合适，"
-            "然后带上 force=true 重新调用 say 发出。"
+            f"你已经有 {idle_desc} 没关注「{label or umo}」了，现在并不在那里。\n"
+            f"你不在的时候那边是这样：\n{preview}\n\n"
+            "请先读懂这里的气氛，确认你要说的话合适，然后带上 force=true "
+            "重新调用 say 发出；想先过去看看就用 enter_session。"
         )
 
     def _proactive_config(self) -> dict:

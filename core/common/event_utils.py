@@ -26,6 +26,10 @@ _FALLBACK_COMMAND_PREFIXES = ("/",)
 EXTRA_MESSAGE_ID = "shittim_message_id"
 # 本轮已通过 say 切换到其它会话（值为目标 umo）。据此抑制原会话的收尾发言。
 EXTRA_LEFT_TO = "shittim_left_to"
+# 本轮已通过 enter_session 走进去的会话（值为目标 umo）。与 EXTRA_LEFT_TO
+# 分开：enter 只是「到了那边」，收尾发言可以投递到那里；say 已经说过话，
+# 收尾内容属于对原会话的汇报，不能再发过去。
+EXTRA_ENTERED_TO = "shittim_entered_to"
 # 主脑主动决定本轮不发言：结果装饰时丢弃整条消息链。
 EXTRA_SILENT = "shittim_silent"
 # 巡检判定为「开口」时的理由：注入主脑时当作它自己刚冒出的念头，

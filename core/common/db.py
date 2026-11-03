@@ -12,7 +12,7 @@ import sqlite3
 import threading
 from pathlib import Path
 
-SCHEMA_VERSION = 11
+SCHEMA_VERSION = 12
 
 # 增量列迁移：用于给已存在的库补列，避免升级插件时丢数据
 _COLUMN_MIGRATIONS = (
@@ -53,6 +53,9 @@ _COLUMN_MIGRATIONS = (
     # 被明确要求忘记（§10.3）：立即停止召回，等下一轮整理物理删除
     ("memories", "forget_requested", "INTEGER NOT NULL DEFAULT 0"),
     ("memories", "forget_requested_at", "REAL NOT NULL DEFAULT 0"),
+    # 「她最后一次真正在这个会话里」的时刻，用于算「离开期间攒下的未读」。
+    # 与 focused_at 分开：收消息、超时都会刷新焦点，但都不代表她看过那些消息。
+    ("session_focus", "last_read_at", "REAL NOT NULL DEFAULT 0"),
 )
 
 # 建在「迁移后才存在的列」上的索引：**必须**在补列之后创建。
@@ -201,7 +204,8 @@ CREATE TABLE IF NOT EXISTS session_focus (
     chat_id      TEXT PRIMARY KEY,
     chat_label   TEXT NOT NULL DEFAULT '',
     focused_at   REAL NOT NULL,
-    left         INTEGER NOT NULL DEFAULT 0
+    left         INTEGER NOT NULL DEFAULT 0,
+    last_read_at REAL NOT NULL DEFAULT 0
 );
 CREATE INDEX IF NOT EXISTS idx_focus_recent ON session_focus (left, focused_at);
 

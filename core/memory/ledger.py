@@ -698,6 +698,33 @@ class ShortTermLedger:
         )
         return list(reversed(rows))
 
+    def unread_since(
+        self, chat_id: str, since: float, limit: int = 20
+    ) -> list[sqlite3.Row]:
+        """取某会话在 `since` 之后**别人**说的话（按时间正序）。
+
+        用于「进入会话时看到的未读」：`since` 是她最后一次在这个会话里的时刻
+        （`session_focus.last_read_at`），只算之后新增的内容。只看 `role='user'`：
+        她自己在那边说过的话不叫未读。与其它查询一样走 `_LIVE_SQL` 并排除
+        睡眠期暂存——已清空、已压进摘要、还没放行的消息都不该再当作「未读」。
+        """
+        if not chat_id or limit <= 0:
+            return []
+        rows = self._db.query(
+            f"""
+            SELECT * FROM (
+                SELECT * FROM short_term_messages
+                 WHERE chat_id = ? AND role = 'user'
+                   AND created_at > ? AND {_LIVE_SQL} AND staged = 0
+                 ORDER BY created_at DESC, id DESC
+                 LIMIT ?
+            )
+             ORDER BY created_at ASC, id ASC
+            """,
+            (chat_id, float(since), int(limit)),
+        )
+        return list(rows)
+
     def messages_before(
         self,
         chat_id: str,

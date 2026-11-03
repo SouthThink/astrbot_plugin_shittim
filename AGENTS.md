@@ -61,8 +61,9 @@ pages/memory/   记忆页面
 
 `focus/manager.py` + `session_focus` 表。
 
-- 收消息 / `say` 过去 → 刷新焦点；安静超时或 `leave_session` / `rest` → 失效。
+- 收消息 / `enter_session` / `say` 过去 → 刷新焦点；安静超时或 `leave_session` / `rest` → 失效。
 - 焦点**只约束主动发言**，不约束被动接话——任何消息都能唤醒判定。
+- `last_read_at` 是**已读水位线**，与 `focused_at` 分开：`touch()` 只刷新焦点不动它，只有 `enter_session` 与 `say` 成功后 `mark_read()` 推进。它只用来算「离开期间攒下的未读」（`ledger.unread_since()`），收消息、超时都不代表她看过那些消息。
 
 ### 3.3 作息链路（她醒着吗）
 
@@ -82,7 +83,7 @@ pages/memory/   记忆页面
 
 `ledger`（账本）→ `extractor`（`condense` 压缩、`merge` 合并、`build_profile` 画像）→ `store`（位置榜 / 召回 / 晋升）→ `maintenance`（收口 / 降级 / 遗忘 / 晋升 / 合并），`profile` 负责用户画像的存储与整理更新。主脑上下文默认沿用 AstrBot 原生按会话历史，注入拼装走 `injector`，时间线仅在接管模式下由 `timeline` 从账本重建，图片经 `vision` 转述、合并转发经 `forward` 取回，坏图摘除在 `history`。
 
-**主脑上下文默认不接管**：`memory.context_takeover=False`（默认）时 `on_llm_request` **不修改 `req.contexts`**，说话人画像、话题相关召回、记忆块、跨会话背景（`<cross_session_timeline>`）与作息提示经 `req.extra_user_content_parts` 以 `TextPart(...).mark_as_temp()` 追加，仅本轮可见、不写持久历史，也不会破坏原生前缀缓存。跨会话背景由 `ledger.timeline_entries_balanced()` 取样：每个会话保留最近 `short_term_context_per_chat` 条、纳入最近 `short_term_context_chats` 个会话，**当前会话始终入选且其 `gated=1` 消息全量保留**（这些消息没进官方历史），活摘要也一并保留；原生历史为空时 `include_current=True` 兜底。开启接管后才由 `timeline.build_timeline()` 把账本（`archived_at = 0 AND condensed_at = 0 AND staged = 0`）加活着的摘要渲染成 `req.contexts`——她说过的话是 `assistant`（只放原话），别人的话是 `user`（带 `[会话标签] 发言人 (绝对时间戳):`），摘要用 `<earlier_summary>` 包裹，末尾标明「你现在在跟谁说话」。此时 AstrBot 的原生按会话历史被整体丢弃（`_rebuild_timeline()`）。数据源只覆盖**今天**，超预算从**最旧的**开始丢。
+**主脑上下文默认不接管**：`memory.context_takeover=False`（默认）时 `on_llm_request` **不修改 `req.contexts`**，工具清单、说话人画像、话题相关召回、记忆块、跨会话背景（`<cross_session_timeline>`）与作息提示经 `req.extra_user_content_parts` 以 `TextPart(...).mark_as_temp()` 追加，仅本轮可见、不写持久历史，也不会破坏原生前缀缓存。跨会话背景由 `ledger.timeline_entries_balanced()` 取样：每个会话保留最近 `short_term_context_per_chat` 条、纳入最近 `short_term_context_chats` 个会话，**当前会话始终入选且其 `gated=1` 消息全量保留**（这些消息没进官方历史），活摘要也一并保留；原生历史为空时 `include_current=True` 兜底。开启接管后才由 `timeline.build_timeline()` 把账本（`archived_at = 0 AND condensed_at = 0 AND staged = 0`）加活着的摘要渲染成 `req.contexts`——她说过的话是 `assistant`（只放原话），别人的话是 `user`（带 `[会话标签] 发言人 (绝对时间戳):`），摘要用 `<earlier_summary>` 包裹，末尾标明「你现在在跟谁说话」。此时 AstrBot 的原生按会话历史被整体丢弃（`_rebuild_timeline()`）。数据源只覆盖**今天**，超预算从**最旧的**开始丢。
 
 **用户画像以 QQ 号（`user_id`）为身份**：`profile.py` 的 `ProfileStore` 只负责印象（描述 / 关键词 / 更新节拍），名字由 `user_ledger.user_names` 实时累积——两者分开，改名只更新名字列表，不触发画像重写。**不能用 `(platform, user_id)` 做身份**：`platform` 取自 `unified_msg_origin` 首段（平台实例 ID），同一个 QQ 在群聊与私聊、或两套机器人配置下会落到不同实例上，按平台分行就会长出两份画像；`platform` 只作「首次来自哪里」的来源标记。启动时 `_backfill()` 会补空行并把同 `user_id` 的历史重复行并成一行（发言数累加、时间取极值、保留已有印象的那份），名字读取由 `_names()` 按 `user_id` 跨平台合并。`ProfileMaintainer` 在 `MemoryMaintainer.run()` 之后、短期收口**之前**运行：只处理 `profile_window_hours` 内活跃的人，且自 `profiled_at` 之后新增发言达到 `profile_min_messages` 条才调用模型，单次最多 `profile_max_users_per_run` 人。模型输出**完整的新描述 + 新关键词**（整体替换），因此「删除」就是新列表里不再出现它。失败不写 `profiled_at`，下一轮重试，旧画像保持不变。画像块由 `injector.build_profile_block()` 生成，注入时排在最前，只作背景、不得复述。
 
@@ -111,7 +112,15 @@ pages/memory/   记忆页面
 
 ### 3.5 行动链路
 
-`main.py` 的 LLM 工具：`list_sessions` / `peek_session` / `say` / `leave_session` / `rest` / `stay_silent` / `remember` / `recall` / `forget` / `search_history` / `delay_sleep`。
+`main.py` 的 LLM 工具：`list_sessions` / `peek_session` / `enter_session` / `say` / `leave_session` / `rest` / `stay_silent` / `remember` / `recall` / `forget` / `search_history` / `delay_sleep`。
+
+「她像人在 QQ 里走动」由三件工具分工承担：
+
+- `peek_session`：**隔窗看一眼**，不改变她在哪儿。想看别处近况、不打算过去时用。
+- `enter_session`：**走过去**，不发言。切换焦点 + 推进已读水位线，把「她不在时攒下的未读」作为**工具结果**交给她（不是上下文块，因此不会被当成刚收到的消息）。走进别的会话会置 `EXTRA_ENTERED_TO`。
+- `say`：**在那里说一句**。成功后同样刷新焦点并推进已读水位线，置 `EXTRA_LEFT_TO`；`require_focus_for_say` 的「先看后发」会先给出未读预览。
+
+`on_decorating_result` 据此决定本轮收尾发言的去向：`EXTRA_LEFT_TO`（已经说过话）→ 丢弃，那是对原会话的汇报；`EXTRA_ENTERED_TO`（只是走了进去）→ 投递到她进入的会话（`proactive.redirect_reply_to_target`，默认开）。两者同时存在时以 `EXTRA_LEFT_TO` 为准。
 
 两个易混工具的边界：
 
@@ -129,12 +138,12 @@ pages/memory/   记忆页面
 | `core/common/model_json.py` | 模型输出 JSON 容错解析 | 决断层与压缩共用，改动同时影响两边 |
 | `core/gate/engine.py` | 决断层 | `_WINDOW_PROMPT` 是判定质量的直接来源；人格/记忆注入别删 |
 | `core/gate/patrol.py` | 巡检窗口 | 扣押 / 替换 / 冷却 / 噪声 / 最近判定快照都在这里 |
-| `core/focus/manager.py` | 焦点读写 | 只约束主动发言，别在被动接话路径上读它 |
+| `core/focus/manager.py` | 焦点读写 + 已读水位线 | 只约束主动发言，别在被动接话路径上读它；`touch()` 不推进 `last_read_at`，只有 `mark_read()` 推进 |
 | `core/memory/ledger.py` | 账本读写、行格式化、条目查询、压缩落库、清空 | `_LIVE_SQL` 是「她此刻应该记得的」唯一表达，**新增查询必须带上它**；`format_message_line` 供判定，`format_speech` 供时间线 |
 | `core/memory/store.py` | 位置榜、召回打分、等级推导、遗忘请求 | 榜序 `_BOARD_ORDER` 与分档常量在顶部；等级一律用 `curation_level(rank, total)` 推导，不要新增「等级」列；`promoted_at` 是入榜位置，`created_at` 是产生时间，两者不可混用 |
 | `core/memory/maintenance.py` | 压缩 / 树状收口 / 降级 / 遗忘 / 晋升 / 合并 | `run()` 不含收口与清空，那两步在 main；摘要长度常量在文件顶部 |
 | `core/memory/profile.py` | 用户画像的存储与整理更新 | 身份是 `user_id`（QQ 号），`platform` 只是来源标记；名字在 `user_ledger`（按 `user_id` 跨平台合并），画像只存印象；输出整体替换；更新必须在短期收口之前 |
-| `core/memory/injector.py` | 画像 / 相关召回 / 记忆注入块 / 判定念头 + 作息事件提示 | 只负责「长什么样」，「放哪里」在 main |
+| `core/memory/injector.py` | 工具清单 / 画像 / 相关召回 / 记忆注入块 / 判定念头 / 位置提示 + 作息事件提示 | 只负责「长什么样」，「放哪里」在 main；`_TOOL_GUIDE` 必须与 `main.py` 的工具同步 |
 | `core/memory/timeline.py` | 账本条目 → `req.contexts`（仅接管模式） | 默认不参与；摘要包 `<earlier_summary>`；每条都要 `_no_save` |
 | `core/memory/history.py` | 坏图摘除 | 只做「确定读不到的图片引用」，别恢复官方历史回填 |
 | `core/memory/vision.py` | 图片转文字 | 引用必须当场取出，临时文件会失效 |
@@ -155,7 +164,7 @@ pages/memory/   记忆页面
 
 **记忆**
 
-- 调整注入顺序 → `main.inject_memory_context()`：说话人画像 → 话题相关召回 → 永久记忆 → 榜前长期记忆 →（跨会话近况）→（原生历史 / 时间线）→ 判定念头 → 作息事件提示。默认走 `_append_temp_parts()` 追加临时块；`context_takeover=True` 时才整体替换 `req.contexts`。
+- 调整注入顺序 → `main.inject_memory_context()`：工具清单 → 说话人画像 → 话题相关召回 → 永久记忆 → 榜前长期记忆 →（跨会话近况）→（原生历史 / 时间线）→ 判定念头 → 位置提示 → 作息事件提示。默认走 `_append_temp_parts()` 追加临时块；`context_takeover=True` 时才整体替换 `req.contexts`。
 - 调整主脑自动相关召回 → `main._related_memories()`；条数是 `memory.auto_recall_top_k`（0 = 关闭），独立预算是 `auto_recall_token_budget`，阈值复用 `recall_min_score`。它不改变榜序，只有主动 `recall` 才计数。
 - 调整跨会话连续性 → `main._cross_session_block()` + `ledger.timeline_entries_balanced()` + `timeline.build_timeline_block()`；配额是 `memory.short_term_context_*`，预算沿用 `timeline_token_budget` / `timeline_max_messages`。
 - 调整时间线（仅接管模式）→ `memory/timeline.py` 的 `build_timeline()` 与 `ledger.timeline_entries()`；预算是 `memory.timeline_token_budget` / `timeline_max_messages`。
@@ -177,7 +186,8 @@ pages/memory/   记忆页面
 
 **行动与页面**
 
-- 新增 LLM 工具 → `main.py` 的 `@filter.llm_tool(name=...)`，docstring 就是给模型看的说明书，要写清「什么时候该用」。
+- 新增 LLM 工具 → `main.py` 的 `@filter.llm_tool(name=...)`，docstring 就是给模型看的说明书，要写清「什么时候该用」。**同时更新 `injector._TOOL_GUIDE`**：那份清单每轮注入，是模型看到工具的直接来源，漏改会让它照着一份过期的工具表做事。
+- 调整切换会话的体验 → `main.enter_session` / `_render_enter` + `focus.mark_read()` + `ledger.unread_since()`；水位线在 `session_focus.last_read_at`，未读的条数与字数上限是 `main._UNREAD_LIMIT` / `_UNREAD_CHARS`；收尾发言去向在 `on_decorating_result` 与 `proactive.redirect_reply_to_target`，位置提示在 `injector.build_whereabouts_block()`。
 - 调整主动发言风控 → `proactive` 配置组 + `main._check_say_gate()` / `_check_rate_limit()`。
 - 查看主脑上下文 → `main._capture_context_snapshot()` + `web_api.MemoryPageAPI.context()`；快照只存内存（每会话一份、最多 8 个会话），不落库，跟着 `on_llm_request` 更新。
 - 查看巡检与焦点 → `patrol.snapshot()`（窗口 / 判定 / 冷却 / 最近判定）+ `focus.list_all()`（含已离开与已超时）+ `web_api.runtime()`；`_remember()` 只存内存，最多 40 个会话。
@@ -197,6 +207,10 @@ pages/memory/   记忆页面
 **自己的消息不参与判定**：`record_incoming_message` 与 `gate_official_llm` 都用 `_is_self_message()` 提前返回。部分适配器会把机器人发出的消息也回灌成事件；判定若把它当成群友发言，就会开出一个只含 assistant 行的巡检窗口，判为沉默后进入冷却，紧接着的下一句话正好被这段冷却挡掉（表现为「她刚说完，我立刻回一句，她就不理了」）。`patrol._decide()` 另有兜底：窗口里只有 assistant 行时既不当作沉默理由，也不进冷却。
 
 **画像更新必须在短期收口之前**：`ProfileMaintainer` 的素材来自 `ledger.user_messages_since()`（走 `_LIVE_SQL`）。`_run_curation` 里先维护、再更新画像、最后才 `collapse_short_term()`；把画像放到收口之后就只剩空账本，画像会永远停在旧版本且不报错。画像输出是**整体替换**（描述 + 关键词一起重写），不要改成「与旧关键词取并集」——那样被删除的关键词会被合并回来。模型失败时不写 `profiled_at`，旧画像保持不变，下一轮重试。
+
+**未读是「她不在时发生的事」，不是新收到的消息**：`enter_session` 把未读放**工具返回值**里，而不是 `req.extra_user_content_parts`。工具结果天然是「她看到的」，不会被模型当成新一轮用户发言去逐条回应——这正是「切换会话后不把未读当成刚收到的消息」的落点。同理，未读只走 `ledger.unread_since()`（`_LIVE_SQL` + `staged = 0` + `role='user'`），已归档、已压进摘要、睡眠暂存、她自己的话都不算。未读不参与巡检，也不刷新判定状态。
+
+**收尾发言的去向只有一条规则**：本轮若用 `say` 说过话（`EXTRA_LEFT_TO`），收尾一律丢弃——那是对原会话的汇报，发到目标会话是错位；本轮若只是 `enter_session` 走了进去（`EXTRA_ENTERED_TO`），收尾投递到她进入的会话，并同样写回账本（`gated=1`）。投递前必须先 `result.chain = []`，否则同一段内容会被 AstrBot 发回原会话。限流与 `say` 共用同一份滑动窗口。
 
 **`content` 是唯一事实源，`gated` 只是展示用**：`gated=1` 只用于记忆页面与排障，**不要在上下文组装路径上读它**。但**永远不要改写已入账的 `content`**——巡检判据与时间线剔除当前消息都靠它精确匹配。
 

@@ -426,6 +426,11 @@
         "type": "bool",
         "default": true
       },
+      "redirect_reply_to_target": {
+        "description": "进入某个会话后，把本轮收尾发言直接说在那个会话里；关闭时该段发言被丢弃。只影响「只进入、还没发言」的轮次，已用 say 说过话的收尾始终丢弃",
+        "type": "bool",
+        "default": true
+      },
       "allowed_targets": {
         "description": "主动发送的目标白名单，格式 private:QQ号 或 group:群号，留空表示不限制",
         "type": "list",
