@@ -333,7 +333,7 @@ class ShittimPlugin(Star):
         self.db = MemoryDB(data_dir)
         self.short_term = ShortTermLedger(self.db, self.memory_config)
         self.memory_store = MemoryStore(self.db, self.memory_config)
-        # 用户画像：以「平台 + QQ 号」识别同一个人，私聊与群聊共用一份
+        # 用户画像：以 QQ 号（user_id）识别同一个人，私聊与群聊共用一份
         self.profiles = ProfileStore(self.db, self.memory_config)
         # 图片转文字：AstrBot 只给「[图片]」占位，账本里的描述得自己补
         self.captioner = ImageCaptioner(self.db, self.memory_config, self.context)
@@ -349,6 +349,7 @@ class ShittimPlugin(Star):
         # 画像更新复用同一个轻量模型：不额外引入第三套模型配置
         self.profile_maintainer = ProfileMaintainer(
             self.profiles,
+            self.memory_store,
             self.extractor,
             self.short_term,
             self.memory_config,
@@ -2432,9 +2433,10 @@ class ShittimPlugin(Star):
 
         `full_reset=True`（深睡期）：
             1 降级 → 遗忘 → 晋升 → 合并（maintainer.run，作用于现有位置榜）
-            2 短期收口：将短期层压缩为一条「当天摘要」与若干长期记忆
-            3 清空短期层（归档原始消息 + 收起摘要）
-            4 保留期清理
+            2 无价值记忆：删除上次标记的，再标记这一轮判断为无价值的
+            3 短期收口：将短期层压缩为一条「当天摘要」与若干长期记忆
+            4 清空短期层（归档原始消息 + 收起摘要）
+            5 保留期清理
 
         `full_reset=False`（清醒期兜底整理，仅在睡眠窗口未出现时执行）：
             **仅执行第 1 步**，不执行收口。收口会移除当天时间线，与清空同样
@@ -2458,6 +2460,11 @@ class ShittimPlugin(Star):
         try:
             cfg = self.schedule_config
             stats = await self.maintainer.run(curate_budget=cfg.curate_max_per_run)
+            if self._is_terminating:
+                return {}
+            # 无价值记忆：先删掉上一轮标记的，再把这一轮判断出的打上标记。
+            # 放在画像之前——读不出信息的条目不该再被当作画像素材。
+            stats.update(await self.maintainer.curate_worthless())
             if self._is_terminating:
                 return {}
             # 画像必须在收口之前更新：收口会把当天的原始发言归档，

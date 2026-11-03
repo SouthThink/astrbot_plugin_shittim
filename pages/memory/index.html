@@ -199,6 +199,16 @@
         padding: 8px 10px;
         resize: vertical;
       }
+      input[type="text"] {
+        width: 100%;
+        margin-top: 6px;
+        font: inherit;
+        color: var(--text);
+        background: var(--bg);
+        border: 1px solid var(--line);
+        border-radius: 8px;
+        padding: 6px 10px;
+      }
       .grid {
         display: grid;
         grid-template-columns: repeat(auto-fit, minmax(170px, 1fr));
@@ -550,6 +560,9 @@
           if (item.manual) {
             meta.appendChild(tag("手动记住", "ok"));
           }
+          if (item.worthless) {
+            meta.appendChild(tag("待遗忘", "warn"));
+          }
           if (item.chat_label) {
             meta.appendChild(line(`来自 ${item.chat_label}`));
           }
@@ -580,7 +593,7 @@
           const deleteButton = document.createElement("button");
           deleteButton.className = "danger";
           deleteButton.textContent = "删除";
-          deleteButton.addEventListener("click", () => deleteMemory(item));
+          deleteButton.addEventListener("click", () => confirmDelete(actions, item));
           actions.append(editButton, deleteButton);
           box.appendChild(actions);
           el.list.appendChild(box);
@@ -628,10 +641,10 @@
             item.summary || "（还没有形成描述；整理记忆后会逐渐完善）";
           box.appendChild(body);
 
+          const words = document.createElement("div");
+          words.className = "tags";
+          words.textContent = (item.keywords || []).map((word) => `#${word}`).join(" ");
           if (item.keywords && item.keywords.length) {
-            const words = document.createElement("div");
-            words.className = "tags";
-            words.textContent = item.keywords.map((word) => `#${word}`).join(" ");
             box.appendChild(words);
           }
 
@@ -648,6 +661,22 @@
             foot.appendChild(line(`首次见面 ${fmtTime(item.first_seen)}`));
           }
           box.appendChild(foot);
+          // 手工维护：描述与关键词一起改写；删除只清印象，名字与发言记录不动
+          const actions = document.createElement("div");
+          actions.className = "actions";
+          const editButton = document.createElement("button");
+          editButton.textContent = "编辑";
+          editButton.addEventListener("click", () =>
+            startProfileEdit(body, words, actions, item)
+          );
+          const deleteButton = document.createElement("button");
+          deleteButton.className = "danger";
+          deleteButton.textContent = "删除";
+          deleteButton.addEventListener("click", () =>
+            confirmDeleteProfile(actions, item)
+          );
+          actions.append(editButton, deleteButton);
+          box.appendChild(actions);
           el.list.appendChild(box);
         });
       }
@@ -977,18 +1006,122 @@
         textarea.focus();
       }
 
-      async function deleteMemory(item) {
-        const ok = confirm(
-          `确定删除这条记忆？\n\n${item.content}\n\n删除后它不会在下一次压缩时被重新写回。`
-        );
-        if (!ok) return;
-        try {
-          await apiPost("memories/delete", { id: item.id });
-          await reload();
-          setStatus("已删除该条记忆");
-        } catch (error) {
-          setStatus(`删除失败：${error.message || error}`, true);
-        }
+      function confirmDelete(actions, item) {
+        // 不用 window.confirm()：插件页跑在 sandbox iframe 里，没有 allow-modals
+        // 时浏览器会直接忽略弹窗并返回 false，表现为「点删除没反应」。
+        const toolbar = document.createElement("div");
+        toolbar.className = "actions";
+        const hint = document.createElement("span");
+        hint.className = "hint";
+        hint.textContent = "删除后不会再被压缩写回，确定吗？";
+        const confirmButton = document.createElement("button");
+        confirmButton.className = "danger";
+        confirmButton.textContent = "确认删除";
+        const cancel = document.createElement("button");
+        cancel.textContent = "取消";
+        toolbar.append(hint, confirmButton, cancel);
+        actions.replaceWith(toolbar);
+
+        cancel.addEventListener("click", () => reload());
+        confirmButton.addEventListener("click", async () => {
+          confirmButton.disabled = true;
+          cancel.disabled = true;
+          try {
+            await apiPost("memories/delete", { id: item.id });
+            await reload();
+            setStatus("已删除该条记忆");
+          } catch (error) {
+            setStatus(`删除失败：${error.message || error}`, true);
+            confirmButton.disabled = false;
+            cancel.disabled = false;
+          }
+        });
+      }
+
+      // 画像的手工维护：描述与关键词一起改。保存后整页重新拉取——关键词的
+      // 去重与顺序由后端决定，前端不自己回填。
+      function startProfileEdit(body, words, actions, item) {
+        const editor = document.createElement("div");
+        const summary = document.createElement("textarea");
+        summary.value = item.summary || "";
+        summary.placeholder = "对他的印象；留空即清除描述";
+        const keywords = document.createElement("input");
+        keywords.type = "text";
+        keywords.value = (item.keywords || []).join(" ");
+        keywords.placeholder = "关键词，用空格或逗号分隔";
+        const hint = document.createElement("div");
+        hint.className = "hint";
+        hint.textContent = "描述写印象，关键词写标签；下一次整理仍会在此基础上更新。";
+        editor.append(summary, keywords, hint);
+
+        const toolbar = document.createElement("div");
+        toolbar.className = "actions";
+        const save = document.createElement("button");
+        save.className = "primary";
+        save.textContent = "保存";
+        const cancel = document.createElement("button");
+        cancel.textContent = "取消";
+        toolbar.append(save, cancel);
+
+        body.replaceWith(editor);
+        if (words.parentNode) words.remove();
+        actions.replaceWith(toolbar);
+
+        cancel.addEventListener("click", () => reload());
+        save.addEventListener("click", async () => {
+          const text = summary.value.trim();
+          const list = keywords.value
+            .split(/[,，、\s]+/)
+            .map((word) => word.replace(/^#+/, "").trim())
+            .filter(Boolean);
+          save.disabled = true;
+          cancel.disabled = true;
+          try {
+            await apiPost("profiles/update", {
+              user_id: item.user_id,
+              summary: text,
+              keywords: list,
+            });
+            await reload();
+            setStatus("已保存画像");
+          } catch (error) {
+            setStatus(`保存失败：${error.message || error}`, true);
+            save.disabled = false;
+            cancel.disabled = false;
+          }
+        });
+        summary.focus();
+      }
+
+      function confirmDeleteProfile(actions, item) {
+        // 与记忆删除同样就地确认：sandbox 里 window.confirm() 会被静默忽略
+        const toolbar = document.createElement("div");
+        toolbar.className = "actions";
+        const hint = document.createElement("span");
+        hint.className = "hint";
+        hint.textContent = "只清除这份印象，名字与发言记录保留；确定吗？";
+        const confirmButton = document.createElement("button");
+        confirmButton.className = "danger";
+        confirmButton.textContent = "确认删除";
+        const cancel = document.createElement("button");
+        cancel.textContent = "取消";
+        toolbar.append(hint, confirmButton, cancel);
+        actions.replaceWith(toolbar);
+
+        cancel.addEventListener("click", () => reload());
+        confirmButton.addEventListener("click", async () => {
+          confirmButton.disabled = true;
+          cancel.disabled = true;
+          try {
+            await apiPost("profiles/delete", { user_id: item.user_id });
+            await reload();
+            setStatus("已删除这份用户画像");
+          } catch (error) {
+            setStatus(`删除失败：${error.message || error}`, true);
+            confirmButton.disabled = false;
+            cancel.disabled = false;
+          }
+        });
       }
 
       function emptyNode(text) {

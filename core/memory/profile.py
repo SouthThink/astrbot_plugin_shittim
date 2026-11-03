@@ -28,8 +28,16 @@
 - 自上次更新后新增发言达到 `profile_min_messages` 条才调用模型；
 - 单次最多处理 `profile_max_users_per_run` 人，按最近活跃排序。
 
-模型拿到「已有画像 + 这个人最近的发言」，输出**完整的**新描述与关键词。
-因此删除同样成立：新关键词列表里不再出现的词就是被删掉了。
+## 素材与吸收
+
+模型拿到三样东西：已有画像、这个人的**长期 / 永久记忆**、他最近的发言。
+长期记忆必须参与——很多认知早已不在短期账本里（被压缩、被清空），只喂
+发言会让画像反复从头建立。
+
+模型输出**完整的新描述 + 新关键词**（整体替换），因此删除关键词就是
+「新列表里不再出现它」。此外它还返回 `absorbed`：那些内容已被新画像完整
+覆盖、不再有独立价值的记忆编号。调用方据此**删除**这些条目——画像接住了
+它们的信息，留着只是重复。`manual=1`（明确要求记住的）永不参与删除。
 
 ## 失败处理
 
@@ -53,6 +61,8 @@ from .ledger import format_message_line
 _MAX_RECORD_CHARS = 6000
 # 单行最多保留的字符数：图片描述与转发内容可能很长，会挤掉真正有信息量的发言
 _MAX_LINE_CHARS = 200
+# 单次带入的长期 / 永久记忆条数：画像是摘要而不是档案，素材宁精不宁多
+_MAX_PROFILE_MEMORIES = 20
 
 
 def _json_list(raw) -> list:
@@ -328,6 +338,48 @@ class ProfileStore:
         )
         return bool(getattr(cursor, "rowcount", 0))
 
+    def edit(self, user_id: str, *, summary: str, keywords: list[str]) -> bool:
+        """页面手工改写印象（描述与关键词）。
+
+        与 `update()` 的唯一区别是**不推进 `profiled_at`**：那是「素材读到哪」
+        的水位线，由整理流程维护。手工改动若把它抬到当下，此后到今天为止他
+        真正说过的话就再也读不到了，画像会长期停在手工版本。
+        """
+        if not user_id:
+            return False
+        cursor = self._db.execute(
+            """
+            UPDATE user_profiles
+               SET summary = ?,
+                   keywords = ?,
+                   updated_at = ?
+             WHERE user_id = ?
+            """,
+            (
+                (summary or "").strip(),
+                json.dumps(
+                    [str(k).strip() for k in keywords if str(k).strip()],
+                    ensure_ascii=False,
+                ),
+                time.time(),
+                user_id,
+            ),
+        )
+        return bool(getattr(cursor, "rowcount", 0))
+
+    def delete(self, user_id: str) -> bool:
+        """删除一份画像。
+
+        只删印象本身：`user_ledger` 里的名字与发言记录一律不动，所以他下次
+        说话时会重新建一行，之后再按新的素材慢慢长出印象。
+        """
+        if not user_id:
+            return False
+        cursor = self._db.execute(
+            "DELETE FROM user_profiles WHERE user_id = ?", (user_id,)
+        )
+        return bool(getattr(cursor, "rowcount", 0))
+
     # ── 读取 ──────────────────────────────────────────────
 
     def _names(self, user_ids: list[str]) -> dict[str, list[str]]:
@@ -404,8 +456,9 @@ class ProfileStore:
 class ProfileMaintainer:
     """整理记忆时逐步完善用户画像。"""
 
-    def __init__(self, store: ProfileStore, extractor, ledger, config):
+    def __init__(self, store: ProfileStore, memory_store, extractor, ledger, config):
         self._store = store
+        self._memory_store = memory_store
         self._extractor = extractor
         self._ledger = ledger
         self._config = config
@@ -456,7 +509,12 @@ class ProfileMaintainer:
         return stats
 
     async def _update_one(self, profile: UserProfile) -> bool:
-        """用这个人的新增发言重写画像；返回是否真的更新了。"""
+        """用这个人的新增发言**与长期记忆**重写画像；返回是否真的更新了。
+
+        素材有两路：短期账本里的新增发言，以及已经沉淀成长期 / 永久记忆的
+        事实。后者很重要——很多认知早就不在短期账本里了（被压缩、被清空），
+        只喂发言会让画像反复从头建立，还容易丢掉已经确认过的事。
+        """
         rows = self._ledger.user_messages_since(
             profile.user_id,
             profile.profiled_at,
@@ -469,6 +527,7 @@ class ProfileMaintainer:
         if not records:
             return False
 
+        memories = self._memories_of(profile.user_id)
         result = await self._extractor.build_profile(
             user_id=profile.user_id,
             display_name=profile.display_name,
@@ -476,25 +535,82 @@ class ProfileMaintainer:
             summary=profile.summary,
             keywords=profile.keywords,
             records=records,
+            memories=self._render_memories(memories),
         )
         if result is None:
             return False
-        summary, keywords = result
+        summary, keywords, absorbed = result
         if not self._store.update(
             profile.user_id,
             summary=summary,
             keywords=keywords,
         ):
             return False
+        removed = self._absorb(memories, absorbed)
         logger.info(
-            "[什亭之枢] 用户画像已更新 | %s（%s）| 发言%d条 → 描述%d字 / 关键词%d个",
+            "[什亭之枢] 用户画像已更新 | %s（%s）| 发言%d条 + 记忆%d条 → "
+            "描述%d字 / 关键词%d个 / 吸收删除%d条",
             profile.label(),
             profile.user_id,
             len(rows),
+            len(memories),
             len(summary),
             len(keywords),
+            removed,
         )
         return True
+
+    def _memories_of(self, user_id: str) -> list:
+        """取这个人的长期 / 永久记忆；取不到时退化为只用发言。"""
+        try:
+            return self._memory_store.memories_of_user(
+                user_id, _MAX_PROFILE_MEMORIES
+            )
+        except Exception as error:
+            logger.debug("[什亭之枢] 读取画像素材记忆失败: %s", error)
+            return []
+
+    @staticmethod
+    def _render_memories(memories: list) -> str:
+        """把记忆渲染成「#编号 内容」，编号用于让模型指认可被吸收的条目。"""
+        lines = [
+            f"#{memory.id} {str(memory.content or '').strip()}"
+            for memory in memories
+            if str(memory.content or "").strip()
+        ]
+        return "\n".join(lines[:_MAX_PROFILE_MEMORIES])
+
+    def _absorb(self, memories: list, absorbed_ids: list[int]) -> int:
+        """删除已被画像完整吸收的记忆。
+
+        只删这次真正提交给模型的条目，并跳过 `manual=1`——那是她或用户明确
+        要求记住的，不能由整理隐式删除。模型拿不准时不会列出来，因此列出的
+        条目可以放心删；失败只记日志，不影响画像已经写入的结果。
+        """
+        if not absorbed_ids:
+            return 0
+        candidates = {memory.id: memory for memory in memories if not memory.manual}
+        removed = 0
+        for memory_id in absorbed_ids:
+            memory = candidates.get(int(memory_id))
+            if memory is None:
+                continue
+            try:
+                self._memory_store.delete(memory.id)
+            except Exception as error:
+                logger.error(
+                    "[什亭之枢] 删除被画像吸收的记忆失败 | #%d: %s",
+                    memory.id,
+                    error,
+                )
+                continue
+            removed += 1
+            logger.info(
+                "[什亭之枢] 记忆已并入用户画像并删除 | #%d | %s",
+                memory.id,
+                str(memory.content or "")[:40],
+            )
+        return removed
 
     @staticmethod
     def _render_records(rows: list[sqlite3.Row]) -> str:

@@ -12,7 +12,7 @@ import sqlite3
 import threading
 from pathlib import Path
 
-SCHEMA_VERSION = 12
+SCHEMA_VERSION = 13
 
 # 增量列迁移：用于给已存在的库补列，避免升级插件时丢数据
 _COLUMN_MIGRATIONS = (
@@ -53,6 +53,13 @@ _COLUMN_MIGRATIONS = (
     # 被明确要求忘记（§10.3）：立即停止召回，等下一轮整理物理删除
     ("memories", "forget_requested", "INTEGER NOT NULL DEFAULT 0"),
     ("memories", "forget_requested_at", "REAL NOT NULL DEFAULT 0"),
+    # 「无价值」两段式遗忘：整理时只打标记，下一次整理才真正删除。
+    # `worthless_at` 是标记时刻（删除要等够 _WORTHLESS_TTL_HOURS）；
+    # `worthless_checked_at` 是最近一次被判断的时刻，用于轮转取材，
+    # 否则每晚都会拿同一批「判断过但仍有价值」的旧记忆重复问模型。
+    ("memories", "worthless", "INTEGER NOT NULL DEFAULT 0"),
+    ("memories", "worthless_at", "REAL NOT NULL DEFAULT 0"),
+    ("memories", "worthless_checked_at", "REAL NOT NULL DEFAULT 0"),
     # 「她最后一次真正在这个会话里」的时刻，用于算「离开期间攒下的未读」。
     # 与 focused_at 分开：收消息、超时都会刷新焦点，但都不代表她看过那些消息。
     ("session_focus", "last_read_at", "REAL NOT NULL DEFAULT 0"),
@@ -139,7 +146,10 @@ CREATE TABLE IF NOT EXISTS memories (
     curation_count   INTEGER NOT NULL DEFAULT 0,
     last_curated_at  REAL    NOT NULL DEFAULT 0,
     forget_requested INTEGER NOT NULL DEFAULT 0,
-    forget_requested_at REAL NOT NULL DEFAULT 0
+    forget_requested_at REAL NOT NULL DEFAULT 0,
+    worthless        INTEGER NOT NULL DEFAULT 0,
+    worthless_at     REAL    NOT NULL DEFAULT 0,
+    worthless_checked_at REAL NOT NULL DEFAULT 0
 );
 CREATE INDEX IF NOT EXISTS idx_mem_tier  ON memories (tier, strength);
 CREATE INDEX IF NOT EXISTS idx_mem_user  ON memories (user_id);

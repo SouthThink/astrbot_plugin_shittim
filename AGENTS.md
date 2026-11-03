@@ -85,7 +85,7 @@ pages/memory/   记忆页面
 
 **主脑上下文默认不接管**：`memory.context_takeover=False`（默认）时 `on_llm_request` **不修改 `req.contexts`**，工具清单、说话人画像、话题相关召回、记忆块、跨会话背景（`<cross_session_timeline>`）与作息提示经 `req.extra_user_content_parts` 以 `TextPart(...).mark_as_temp()` 追加，仅本轮可见、不写持久历史，也不会破坏原生前缀缓存。跨会话背景由 `ledger.timeline_entries_balanced()` 取样：每个会话保留最近 `short_term_context_per_chat` 条、纳入最近 `short_term_context_chats` 个会话，**当前会话始终入选且其 `gated=1` 消息全量保留**（这些消息没进官方历史），活摘要也一并保留；原生历史为空时 `include_current=True` 兜底。开启接管后才由 `timeline.build_timeline()` 把账本（`archived_at = 0 AND condensed_at = 0 AND staged = 0`）加活着的摘要渲染成 `req.contexts`——她说过的话是 `assistant`（只放原话），别人的话是 `user`（带 `[会话标签] 发言人 (绝对时间戳):`），摘要用 `<earlier_summary>` 包裹，末尾标明「你现在在跟谁说话」。此时 AstrBot 的原生按会话历史被整体丢弃（`_rebuild_timeline()`）。数据源只覆盖**今天**，超预算从**最旧的**开始丢。
 
-**用户画像以 QQ 号（`user_id`）为身份**：`profile.py` 的 `ProfileStore` 只负责印象（描述 / 关键词 / 更新节拍），名字由 `user_ledger.user_names` 实时累积——两者分开，改名只更新名字列表，不触发画像重写。**不能用 `(platform, user_id)` 做身份**：`platform` 取自 `unified_msg_origin` 首段（平台实例 ID），同一个 QQ 在群聊与私聊、或两套机器人配置下会落到不同实例上，按平台分行就会长出两份画像；`platform` 只作「首次来自哪里」的来源标记。启动时 `_backfill()` 会补空行并把同 `user_id` 的历史重复行并成一行（发言数累加、时间取极值、保留已有印象的那份），名字读取由 `_names()` 按 `user_id` 跨平台合并。`ProfileMaintainer` 在 `MemoryMaintainer.run()` 之后、短期收口**之前**运行：只处理 `profile_window_hours` 内活跃的人，且自 `profiled_at` 之后新增发言达到 `profile_min_messages` 条才调用模型，单次最多 `profile_max_users_per_run` 人。模型输出**完整的新描述 + 新关键词**（整体替换），因此「删除」就是新列表里不再出现它。失败不写 `profiled_at`，下一轮重试，旧画像保持不变。画像块由 `injector.build_profile_block()` 生成，注入时排在最前，只作背景、不得复述。
+**用户画像以 QQ 号（`user_id`）为身份**：`profile.py` 的 `ProfileStore` 只负责印象（描述 / 关键词 / 更新节拍），名字由 `user_ledger.user_names` 实时累积——两者分开，改名只更新名字列表，不触发画像重写。**不能用 `(platform, user_id)` 做身份**：`platform` 取自 `unified_msg_origin` 首段（平台实例 ID），同一个 QQ 在群聊与私聊、或两套机器人配置下会落到不同实例上，按平台分行就会长出两份画像；`platform` 只作「首次来自哪里」的来源标记。启动时 `_backfill()` 会补空行并把同 `user_id` 的历史重复行并成一行（发言数累加、时间取极值、保留已有印象的那份），名字读取由 `_names()` 按 `user_id` 跨平台合并。`ProfileMaintainer` 在 `MemoryMaintainer.run()` 之后、短期收口**之前**运行：只处理 `profile_window_hours` 内活跃的人，且自 `profiled_at` 之后新增发言达到 `profile_min_messages` 条才调用模型，单次最多 `profile_max_users_per_run` 人。素材有两路：`ledger.user_messages_since()` 的最近发言，以及 `store.memories_of_user()` 取回的**长期 / 永久记忆**——很多认知早已不在短期账本里（被压缩、被清空），只喂发言会让画像反复从头建立。模型输出**完整的新描述 + 新关键词**（整体替换），因此「删除」就是新列表里不再出现它；同时输出 `absorbed`（内容已被新画像完整覆盖、不再有独立价值的记忆编号），由 `_absorb()` 删除这些记忆，跳过 `manual=1`（明确要求记住的）与本次未提交给模型的条目。失败不写 `profiled_at`，下一轮重试，旧画像保持不变。画像块由 `injector.build_profile_block()` 生成，注入时排在最前，只作背景、不得复述。
 
 **主脑每轮还会做一次话题相关召回**：`main._related_memories()` 用当前消息（为空时退回本会话近期文本）调用 `MemoryStore.recall()`，取 `auto_recall_top_k` 条，使用独立预算 `auto_recall_token_budget`，并排除已在永久段 / 榜前正文 / 索引里的条目。它**不调用 `mark_recalled()`**：自动注入若计数，榜前条目会因反复参与而自我强化。只有主动 `recall`、且 message 通道命中分数 ≥ `recall_min_score` 时才计入召回次数并上浮榜序。
 
@@ -98,13 +98,13 @@ pages/memory/   记忆页面
 - **白天** `condense_short_term()`：条目总数（消息 + 摘要）超 `condense_threshold` 才把最旧 `condense_batch` 条压一轮，职责是「别让上下文太长」。触发点是记账与发送两条路径（`_schedule_condense_if_due()`，30 秒节流 + 防重入），判据是**条数**而非时间，因此不在 `run_maintenance()` 的小时节拍里。
 - **深夜** `collapse_short_term()`：树状收口（100:1 收缩），最后唯一那条是**当天摘要**（`_DAY_SUMMARY_CHARS = 400`），由 `_promote_day_summary()` 写进榜最前。收口是短期→长期的**唯一**通道，也是「睡前所有消息都被处理过一遍」的落点。**只有深睡（`full_reset=True`）才收口**：清醒期收口等于当场失忆。
 
-**位置榜取代权重**：长期记忆按 `promoted_at DESC, id DESC` 排。等级（完整 / 精简 / 关键词）由**名次**推导（榜前 60% / 85% 分档），不落库。沉到**榜尾 5%** 且降级够多次、够久没被召回才遗忘。`tier='permanent'` 不在榜上，不降级不遗忘，注入时全量排最前。
+**位置榜取代权重**：长期记忆按 `promoted_at DESC, id DESC` 排。等级（完整 / 精简 / 只在索引里露开头）由**名次**推导（榜前 60% / 85% 分档），不落库。**榜尾那一档不改正文**——模糊只发生在注入侧，`recall` 仍能捞回完整内容。沉到**榜尾 5%** 且降级够多次、够久没被召回才遗忘。`tier='permanent'` 不在榜上，不降级不遗忘，注入时全量排最前。
 
 **深睡整理**：`main._maybe_curate()` 的判据是 **`phase == DEEP` 且 `last_curation_at < window.sleep_at`**（本轮深睡窗口里还没整理过）。每个 60 秒 tick 都看一次，真正的触发点是进入 DEEP 后的第一个刻度。
 
 - **不要改回「距上次满 N 小时」**：绝对节拍的锚点是上次整理**完成**时刻，启动当晚（22:56 装好、01:30 进深睡只隔 2.5 小时）会被整夜挡掉，锚点还会逐日漂移。
 - 守卫只推迟不丢失：正在整理、正在压缩、记忆停用、**清醒宽限（刚被叫醒、正在回话）**都跳过，下一 tick 再来。
-- `full_reset=True` 顺序固定：维护（降级 → 遗忘 → 晋升 → 合并）→ 短期收口 → 提升当天摘要 → `clear_short_term()` → `purge_expired()`。**收口排在维护之后**，当天摘要最后写入，确定性地落在榜首。
+- `full_reset=True` 顺序固定：维护（降级 → 遗忘 → 晋升 → 合并）→ 无价值记忆（删除上次标记的 + 标记这一轮的）→ 画像更新 → 短期收口 → 提升当天摘要 → `clear_short_term()` → `purge_expired()`。**收口排在维护之后**，当天摘要最后写入，确定性地落在榜首。
 - `full_reset=False` 的兜底（不在深睡且距上次超过 `curation_force_after_hours`）**只做维护**，不收口也不清空。
 - **关掉作息（`schedule.enabled=False`）则 tick 不跑，永远不会整理。**
 
@@ -142,14 +142,14 @@ pages/memory/   记忆页面
 | `core/memory/ledger.py` | 账本读写、行格式化、条目查询、压缩落库、清空 | `_LIVE_SQL` 是「她此刻应该记得的」唯一表达，**新增查询必须带上它**；`format_message_line` 供判定，`format_speech` 供时间线 |
 | `core/memory/store.py` | 位置榜、召回打分、等级推导、遗忘请求 | 榜序 `_BOARD_ORDER` 与分档常量在顶部；等级一律用 `curation_level(rank, total)` 推导，不要新增「等级」列；`promoted_at` 是入榜位置，`created_at` 是产生时间，两者不可混用 |
 | `core/memory/maintenance.py` | 压缩 / 树状收口 / 降级 / 遗忘 / 晋升 / 合并 | `run()` 不含收口与清空，那两步在 main；摘要长度常量在文件顶部 |
-| `core/memory/profile.py` | 用户画像的存储与整理更新 | 身份是 `user_id`（QQ 号），`platform` 只是来源标记；名字在 `user_ledger`（按 `user_id` 跨平台合并），画像只存印象；输出整体替换；更新必须在短期收口之前 |
+| `core/memory/profile.py` | 用户画像的存储与整理更新 | 身份是 `user_id`（QQ 号），`platform` 只是来源标记；名字在 `user_ledger`（按 `user_id` 跨平台合并），画像只存印象；素材含长期 / 永久记忆，被完整吸收的条目会删除（`manual=1` 除外）；输出整体替换；更新必须在短期收口之前 |
 | `core/memory/injector.py` | 工具清单 / 画像 / 相关召回 / 记忆注入块 / 判定念头 / 位置提示 + 作息事件提示 | 只负责「长什么样」，「放哪里」在 main；`_TOOL_GUIDE` 必须与 `main.py` 的工具同步 |
 | `core/memory/timeline.py` | 账本条目 → `req.contexts`（仅接管模式） | 默认不参与；摘要包 `<earlier_summary>`；每条都要 `_no_save` |
 | `core/memory/history.py` | 坏图摘除 | 只做「确定读不到的图片引用」，别恢复官方历史回填 |
 | `core/memory/vision.py` | 图片转文字 | 引用必须当场取出，临时文件会失效 |
 | `core/memory/forward.py` | 合并转发转文字 | 只认 `Forward.id`；接口参数名跨适配器不一致（`message_id` / `id`）；内容写 `forward_content`，不要改写 `content` |
 | `core/schedule/state.py` | 作息推导与状态读写 | 推导保持纯函数；状态只经 `SleepStateStore` 落库 |
-| `web_api.py` | 记忆 / 巡检 / 上下文页面接口 | 只开放记忆正文的编辑与删除；删除必须先 `suppress()`，否则下一次压缩会写回；短期账本不提供写接口 |
+| `web_api.py` | 记忆 / 巡检 / 上下文页面接口 | 只开放记忆正文与用户画像的编辑与删除；删除记忆必须先 `suppress()`，否则下一次压缩会写回；画像手工编辑**不推进 `profiled_at`**（那是素材水位线）；短期账本不提供写接口 |
 | `pages/memory/` | 记忆页面 | 单文件 HTML，标题靠 i18n 覆盖；写操作用 `bridge.apiPost` |
 
 ## 5. 场景导航
@@ -172,8 +172,9 @@ pages/memory/   记忆页面
 - 调整压缩质量 → `extractor.py` 的 `_CONDENSE_PROMPT` / `_EXTRACT_RULES`；阈值与批大小是 `memory.condense_threshold` / `condense_batch`。
 - 调整压缩时机 → `main._schedule_condense_if_due()`（调用点在记账与发送后）；动手门槛在 `maintenance.condense_short_term()`。
 - 调整位置榜分档或遗忘 → `store.py` 顶部常量 + `curation_level()` / `is_tail()`；`maintenance._demote()` / `_forget()`；门槛是 `memory.forget_min_curations` / `forget_stale_days`。入榜位置由 `promoted_at` 决定（普通提炼用 `covered_at`，当天摘要 / 合并用当下）；永久层注入预算是 `permanent_token_budget`。
+- 调整「无价值记忆」的判断 → `maintenance.curate_worthless()` + `extractor.judge_worthless()` + `store.worthless_candidates()/mark_worthless()/delete_worthless()`；批大小与 TTL 是 `maintenance.py` 顶部的 `_WORTHLESS_BATCH` / `_WORTHLESS_TTL_HOURS`；判据（正文 / 原话 / 关键词三者都只剩分类词）写在 `_WORTHLESS_PROMPT` 里。
 - 调整历史回查 → `main.search_history`（参数夹紧、默认当前会话）+ `ledger.search_history()`。它**绕过 `_LIVE_SQL`**，改动前先想清楚哪些行不该被翻出来。
-- 调整用户画像 → `memory/profile.py` 的 `ProfileStore`（身份 / 印象）与 `ProfileMaintainer`（整理时更新，节拍是 `memory.profile_*`）；名字来自 `user_ledger.user_names`，素材来自 `ledger.user_messages_since()`；注入在 `main._speaker_profile()` + `injector.build_profile_block()`；页面走 `web_api.profiles`。
+- 调整用户画像 → `memory/profile.py` 的 `ProfileStore`（身份 / 印象）与 `ProfileMaintainer`（整理时更新，节拍是 `memory.profile_*`）；名字来自 `user_ledger.user_names`，素材来自 `ledger.user_messages_since()` + `store.memories_of_user()`，被画像完整吸收的条目由 `_absorb()` 删除（`manual=1` 除外）；注入在 `main._speaker_profile()` + `injector.build_profile_block()`；页面走 `web_api.profiles`。
 - 调整图片转述 → `memory/vision.py`（取图、data URL、缓存、模型能力检查）。
 - 调整合并转发 → `memory/forward.py`（取 id、调 `get_forward_msg`、渲染与截断）；条数 / 字数是 `memory.forward_max_items` / `forward_max_chars`。
 
@@ -192,6 +193,7 @@ pages/memory/   记忆页面
 - 查看主脑上下文 → `main._capture_context_snapshot()` + `web_api.MemoryPageAPI.context()`；快照只存内存（每会话一份、最多 8 个会话），不落库，跟着 `on_llm_request` 更新。
 - 查看巡检与焦点 → `patrol.snapshot()`（窗口 / 判定 / 冷却 / 最近判定）+ `focus.list_all()`（含已离开与已超时）+ `web_api.runtime()`；`_remember()` 只存内存，最多 40 个会话。
 - 手工编辑与删除记忆 → `store.update_content()`（正文与关键词一起改）+ `web_api.update_memory`；删除先 `store.suppress()` 再 `store.delete()`，否则下一次压缩会把同一条写回来。
+- 手工编辑与删除画像 → `ProfileStore.edit()` / `delete()` + `web_api.update_profile` / `delete_profile`；编辑**不推进 `profiled_at`**（那是素材水位线，推进了这段发言就永久漏读）；删除只删画像行，名字与发言记录留在 `user_ledger`。
 - 新增页面 → `pages/<名字>/index.html` + `web_api.py` 注册路由 + i18n 配 `views.<名字>.title`。
 
 ## 6. 关键机制与坑
@@ -206,7 +208,9 @@ pages/memory/   记忆页面
 
 **自己的消息不参与判定**：`record_incoming_message` 与 `gate_official_llm` 都用 `_is_self_message()` 提前返回。部分适配器会把机器人发出的消息也回灌成事件；判定若把它当成群友发言，就会开出一个只含 assistant 行的巡检窗口，判为沉默后进入冷却，紧接着的下一句话正好被这段冷却挡掉（表现为「她刚说完，我立刻回一句，她就不理了」）。`patrol._decide()` 另有兜底：窗口里只有 assistant 行时既不当作沉默理由，也不进冷却。
 
-**画像更新必须在短期收口之前**：`ProfileMaintainer` 的素材来自 `ledger.user_messages_since()`（走 `_LIVE_SQL`）。`_run_curation` 里先维护、再更新画像、最后才 `collapse_short_term()`；把画像放到收口之后就只剩空账本，画像会永远停在旧版本且不报错。画像输出是**整体替换**（描述 + 关键词一起重写），不要改成「与旧关键词取并集」——那样被删除的关键词会被合并回来。模型失败时不写 `profiled_at`，旧画像保持不变，下一轮重试。
+**画像更新必须在短期收口之前**：`ProfileMaintainer` 的素材来自 `ledger.user_messages_since()`（走 `_LIVE_SQL`）与 `store.memories_of_user()`（长期 / 永久记忆）。`_run_curation` 里先维护、再更新画像、最后才 `collapse_short_term()`；把画像放到收口之后就只剩空账本，画像会永远停在旧版本且不报错。画像输出是**整体替换**（描述 + 关键词一起重写），不要改成「与旧关键词取并集」——那样被删除的关键词会被合并回来。模型同时给出 `absorbed`，`_absorb()` 会删除这些已被画像完整覆盖的记忆：只删本次提交过的条目、跳过 `manual=1`；这条删除是**不可恢复**的，不要放宽成「按相似度批量删」。模型失败时不写 `profiled_at`，旧画像保持不变，下一轮重试。
+
+**无价值记忆是两段式，不要合并成一步**：整理时只打 `worthless` 标记，删除要等标记满 `_WORTHLESS_TTL_HOURS`（24 小时）。中间这一整轮是模型误判的纠错窗口——被 `recall` 想起（`mark_recalled`）、被重新提到（`reinforce_or_add`）、被手工编辑（`update_content`）都会清掉标记。只有长期层参与判断与删除：永久层不该因为「判断没价值」而消失，晋升后的条目也不会被 `delete_worthless()` 误删（它只删 `tier='long'`）。`worthless_checked_at` 用于取材轮转，没有它每晚都会拿同一批「判断过但仍有价值」的旧记忆重复问模型。判据是「正文 / 原话 / 关键词**同时**只剩分类词」，写在 `_WORTHLESS_PROMPT`。
 
 **未读是「她不在时发生的事」，不是新收到的消息**：`enter_session` 把未读放**工具返回值**里，而不是 `req.extra_user_content_parts`。工具结果天然是「她看到的」，不会被模型当成新一轮用户发言去逐条回应——这正是「切换会话后不把未读当成刚收到的消息」的落点。同理，未读只走 `ledger.unread_since()`（`_LIVE_SQL` + `staged = 0` + `role='user'`），已归档、已压进摘要、睡眠暂存、她自己的话都不算。未读不参与巡检，也不刷新判定状态。
 
@@ -230,7 +234,7 @@ pages/memory/   记忆页面
 
 **人格说明在 `system_prompt`，人格预设对话在 `contexts` 最前**：本插件从不写 `req.system_prompt`；但 AstrBot 会把 `begin_dialogs` 用 `req.contexts[:0] = ...` 插到最前（每条带 `_no_save`），随后才轮到我们整体替换 `req.contexts`。所以必须先用 `_persona_dialogs()` 留下头部连续的 `_no_save` 段，否则人格示例会被静默抹掉。
 
-**插件页面必须显式引入 bridge**：`pages/*/index.html` 的 `<head>` 要写 `<script src="/api/plugin/page/bridge-sdk.js"></script>`。若依赖宿主注入，它会晚于页面内联脚本执行，而插件页 iframe 是 sandbox 的 opaque origin，直连必然 401。
+**插件页面必须显式引入 bridge**：`pages/*/index.html` 的 `<head>` 要写 `<script src="/api/plugin/page/bridge-sdk.js"></script>`。若依赖宿主注入，它会晚于页面内联脚本执行，而插件页 iframe 是 sandbox 的 opaque origin，直连必然 401。同理**不要用 `window.confirm` / `alert` / `prompt`**：sandbox 没有 `allow-modals` 时浏览器会静默忽略弹窗并返回 `false`，表现为「点了没反应」——二次确认要在页面里就地做。
 
 **生命周期**：耗时 `await`（尤其等模型）之后检查 `self._is_terminating`；插件卸载后数据库连接会关，`db._NullCursor` 只负责让迟到的读写静默失效，不要依赖它做正确性保证。
 

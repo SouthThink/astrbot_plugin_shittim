@@ -21,7 +21,7 @@ desc: |
   - 判定理由传递：放行的原因以「自己刚冒出的念头」交给主脑，可被驳回并转为沉默
   - 走进会话：先看离开期间攒下的未读再决定说不说，走进去后的话直接说在那里
   - 工具清单常驻：全部工具与用法每轮注入上下文
-version: 1.7.3
+version: 1.7.4
 author: SouthThink # 作者
 repo: https://github.com/SouthThink/astrbot_plugin_shittim # 插件的仓库地址
 astrbot_version: ">=4.17.0"

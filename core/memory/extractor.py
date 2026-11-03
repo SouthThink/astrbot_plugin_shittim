@@ -16,7 +16,7 @@ from __future__ import annotations
 from astrbot.api import logger
 
 from ..common.model_json import parse_model_json
-from ..common.tokenizer import extract_keywords
+from ..common.tokenizer import extract_keywords, is_generic_term
 from .store import Memory
 
 # 单条记忆正文与原文锚点的长度上限
@@ -29,6 +29,8 @@ _MAX_TAGS = 8
 _MAX_PROFILE_SUMMARY = 240
 _MAX_PROFILE_KEYWORDS = 10
 _MAX_PROFILE_KEYWORD_CHARS = 10
+# 单次允许「吸收」的记忆条数上限：超过这个数说明模型在乱列，宁可一条不删
+_MAX_ABSORBED = 20
 
 # 扩大覆盖范围的关键条款：除「稳定事实」外，也记录「当天发生的事件」。
 # 旧提示词把此类内容归入「一次性闲聊」，导致次日追问昨日事件时无法回忆。
@@ -135,20 +137,26 @@ _PROFILE_PROMPT = """你在整理一个人的长期画像。这个人会出现�
 描述：{summary}
 关键词：{keywords}
 
+【关于他的长期记忆】（编号 + 内容；平时沉淀下来的事实，可能已经过时或重复）
+{memories}
+
 【最近的发言】（按时间顺序，来自不同会话）
 {records}
 
 【要做的事】
-根据最近发言更新你对这个人的印象：
+根据上面的材料更新你对这个人的印象：
 1. 保留仍然成立的旧信息，修正与最近发言冲突的内容，删除已经过时或被明确否定的内容。
 2. 只写这个人自己表现出来的东西：身份、兴趣、偏好、习惯、表达过的观点、与人相处的方式。
 3. 不要写助手自己的话，不要推测，不要因为一次玩笑或一句气话就下结论。
 4. 描述用第三人称，1~3 句，不超过 {max_summary} 字；关键词 {max_kw} 个以内，每个不超过 {max_kw_chars} 字。
 5. 信息不足就保持原样；宁可不写，也不要编造。
+6. absorbed：只有当某条长期记忆的内容**已经完整地**体现在你新写的描述或关键词里，
+   而且它不含事件经过、约定、待办、时间、数字等任何额外信息时，才把它的编号放进来。
+   拿不准就不要放——多留一条只是冗余，删错一条就真的丢了。
 
 【输出】
 只输出 JSON，不要解释，不要代码块围栏：
-{{"summary": "对他的印象", "keywords": ["关键词"]}}
+{{"summary": "对他的印象", "keywords": ["关键词"], "absorbed": [编号]}}
 """
 
 
@@ -169,6 +177,56 @@ def _str_list(value, limit: int, max_chars: int = 40) -> list[str]:
         if len(result) >= limit:
             break
     return result
+
+
+def _int_list(value, limit: int) -> list[int]:
+    """从模型输出里取一组正整数编号；非法项静默跳过。"""
+    if not isinstance(value, list):
+        return []
+    result: list[int] = []
+    for item in value:
+        try:
+            number = int(item)
+        except (TypeError, ValueError):
+            continue
+        if number > 0 and number not in result:
+            result.append(number)
+        if len(result) >= limit:
+            break
+    return result
+
+
+_WORTHLESS_PROMPT = """你在清理长期记忆。下面每一条都注明了编号、正文、原话与关键词。
+
+判断哪些条目**已经完全没有任何可用信息**：
+- 正文只剩分类词、标签词或占位词（例如「事实 / 结论」「约定 / 爱好」），读不出具体的人、事、物；
+- 原话为空，或者原话本身也只是这类词；
+- 关键词同样全是这类分类词，没有任何指向具体内容的词。
+
+以上三条要**同时**成立才算无价值。只要还能看出一点具体内容（谁、做了什么、什么时候、
+和谁有关），它就仍然有价值，不要列出来。
+
+被列出的条目会在下一次整理时被删除，所以拿不准就不要列。
+
+【输出】
+只输出 JSON，不要解释，不要代码块围栏：
+{{"worthless": [编号, ...]}}
+
+【记忆列表】
+{memories}
+"""
+
+
+def _render_worthless(memories: list[Memory]) -> str:
+    """把候选记忆渲染成「编号 + 正文 + 原话 + 关键词」，供无价值判断。"""
+    lines: list[str] = []
+    for memory in memories:
+        quote = (memory.source_quote or "").strip() or "（空）"
+        keywords = " / ".join(memory.keywords[:8]) or "（空）"
+        lines.append(
+            f"#{memory.id} 正文：{memory.content}｜原话：{quote}｜关键词：{keywords}"
+        )
+    return "\n".join(lines)
 
 
 class MemoryExtractor:
@@ -287,6 +345,24 @@ class MemoryExtractor:
             return []
         return merged
 
+    async def judge_worthless(self, memories: list[Memory]) -> list[int]:
+        """判断哪些长期记忆已经没有任何可用信息，返回这些记忆的 id。
+
+        只看三个来源：正文、原文锚点、关键词。三者都只剩分类词才算无价值——
+        判断的是「信息被榨干了」，不是「当下用不上」。调用方只会打标记，
+        真正的删除留到下一次整理，期间被召回会解除标记。
+        """
+        if not memories or not self.available:
+            return []
+        rendered = _render_worthless(memories)
+        if not rendered:
+            return []
+        raw = await self._text_chat(_WORTHLESS_PROMPT.format(memories=rendered))
+        payload = parse_model_json(raw)
+        if not isinstance(payload, dict):
+            return []
+        return _int_list(payload.get("worthless"), len(memories))
+
     async def build_profile(
         self,
         *,
@@ -296,16 +372,20 @@ class MemoryExtractor:
         summary: str,
         keywords: list[str],
         records: str,
-    ) -> tuple[str, list[str]] | None:
-        """根据「已有画像 + 这个人最近的发言」重写画像。
+        memories: str = "",
+    ) -> tuple[str, list[str], list[int]] | None:
+        """根据「已有画像 + 这个人的长期记忆 + 最近发言」重写画像。
 
-        输出是**完整替换**：模型看到旧画像与新发言，自行决定保留、改写还是
+        输出是**完整替换**：模型看到旧画像与新素材，自行决定保留、改写还是
         删除。因此关键词被删掉的方式就是「新列表里不再出现它」，不需要额外
         的删除指令。
 
+        同时返回 `absorbed`：内容已被新画像完整覆盖、不再有独立价值的记忆编号。
+        删除由调用方执行——只有它知道哪些条目允许删（例如手动记住的不算）。
+
         Returns:
-            (描述, 关键词)；模型不可用、输出无法解析时返回 None，调用方
-            保持原画像不变，下一轮整理再试。
+            (描述, 关键词, absorbed)；模型不可用、输出无法解析时返回 None，
+            调用方保持原画像不变，下一轮整理再试。
         """
         text = (records or "").strip()
         if not text or not self.available:
@@ -316,6 +396,7 @@ class MemoryExtractor:
             aliases="、".join(aliases[:8]) or "（暂无）",
             summary=summary or "（暂无）",
             keywords=" / ".join(keywords) or "（暂无）",
+            memories=(memories or "").strip() or "（暂无）",
             records=text,
             max_summary=_MAX_PROFILE_SUMMARY,
             max_kw=_MAX_PROFILE_KEYWORDS,
@@ -340,7 +421,8 @@ class MemoryExtractor:
             )
         else:
             new_keywords = list(keywords)
-        return new_summary, new_keywords
+        absorbed = _int_list(payload.get("absorbed"), _MAX_ABSORBED)
+        return new_summary, new_keywords, absorbed
 
     # ── 内部实现 ──────────────────────────────────────────
 
@@ -382,7 +464,11 @@ class MemoryExtractor:
             strength = 5.0
         strength = max(1.0, min(strength, 10.0))
         tags = _str_list(entry.get("tags"), _MAX_TAGS)
-        keywords = _str_list(entry.get("keywords"), _MAX_KEYWORDS)
+        keywords = [
+            keyword
+            for keyword in _str_list(entry.get("keywords"), _MAX_KEYWORDS)
+            if not is_generic_term(keyword)
+        ]
         if not keywords:
             keywords = extract_keywords(content, _MAX_KEYWORDS)
         return {

@@ -17,7 +17,6 @@ from astrbot.api import logger
 from .store import (
     LEVEL_FULL,
     LEVEL_BRIEF,
-    LEVEL_KEYWORDS,
     TIER_LONG,
     Memory,
     MemoryStore,
@@ -29,9 +28,12 @@ from .store import (
 _DEMOTE_INTERVAL_HOURS = 24.0
 # 「精简」级的正文长度上限
 _BRIEF_MAX_CHARS = 30
-# 「仅关键词」档最多并列的词数：数量过多会形成缺少主语的碎片
-# （关键词为字符 bigram，本身较碎，需限制数量）
-_KEYWORD_BODY_MAX = 5
+# 无价值判断：单轮最多送多少条给模型、标记后隔多久才删、单次最多删多少条。
+# TTL 用 24 小时而不是「上一轮」：同一天重复整理不会当天就把内容删掉，
+# 标记期间仍留有一次被召回翻盘的机会。
+_WORTHLESS_BATCH = 20
+_WORTHLESS_TTL_HOURS = 24.0
+_WORTHLESS_DELETE_MAX = 50
 
 # 合并仅作用于位置榜后半段。这是已退役的 merge_max_strength（仅合并弱记忆）
 # 在名次制下的等价约束：榜前记忆是近期被召回的内容，不应在合并中丢失细节。
@@ -122,6 +124,66 @@ class MemoryMaintainer:
             stats["merged_created"],
         )
         return stats
+
+    # ── 无价值记忆（两段式遗忘）───────────────────────────
+
+    async def curate_worthless(self) -> dict:
+        """先删掉上一轮标记的，再判断这一轮还有哪些记忆没有信息价值。
+
+        两段式的意义：模型判断可能出错，所以标记与删除之间隔一次整理。
+        这期间只要它被 `recall` 想起（或又被提到、被人工改过），
+        `store` 会把标记清掉，它就不会被删。真正的删除只留给「一直没人用、
+        也确实读不出信息」的条目。
+        """
+        stats = {"worthless_forgotten": 0, "worthless_marked": 0}
+        if not self._config.maintenance_enabled:
+            return stats
+
+        cutoff = time.time() - _WORTHLESS_TTL_HOURS * 3600
+        try:
+            stats["worthless_forgotten"] = self._store.delete_worthless(
+                cutoff, _WORTHLESS_DELETE_MAX
+            )
+        except Exception as error:
+            logger.error("[什亭之枢] 删除无价值记忆失败: %s", error)
+
+        try:
+            stats["worthless_marked"] = await self._judge_worthless()
+        except Exception as error:
+            logger.error("[什亭之枢] 判断无价值记忆失败: %s", error)
+
+        if stats["worthless_forgotten"] or stats["worthless_marked"]:
+            logger.info(
+                "[什亭之枢] 无价值记忆 删除%d 新标记%d（下次整理删除）",
+                stats["worthless_forgotten"],
+                stats["worthless_marked"],
+            )
+        return stats
+
+    async def _judge_worthless(self) -> int:
+        """让整理模型判断一批记忆是否已无信息价值，返回新标记条数。"""
+        if not getattr(self._extractor, "available", False):
+            return 0
+        candidates = self._store.worthless_candidates(_WORTHLESS_BATCH)
+        if not candidates:
+            return 0
+        known = {memory.id for memory in candidates}
+        judged = await self._extractor.judge_worthless(candidates)
+        marked = [memory_id for memory_id in judged if memory_id in known]
+        # 判断过但仍有价值的条目也要记一笔：否则下一轮取材会永远选中同一批
+        self._store.mark_worthless_checked(
+            [memory.id for memory in candidates if memory.id not in marked]
+        )
+        if not marked:
+            return 0
+        self._store.mark_worthless(marked)
+        logger.info(
+            "[什亭之枢] 标记无价值记忆 %d/%d 条: %s",
+            len(marked),
+            len(candidates),
+            marked,
+        )
+        return len(marked)
 
     # ── 短期压缩 ──────────────────────────────────────────
     #
@@ -313,9 +375,13 @@ class MemoryMaintainer:
     async def _demote(self, budget: int) -> dict:
         """把**榜尾**的记忆逐级变模糊（§3.2）。
 
-        判据不再是积分，而是名次：榜前 60% 完整、到 85% 精简、之后只剩关键词
-        （分档在 `store.curation_level`）。被召回会把自己上浮回榜前，所以常用
-        的记忆根本不会被碰到——「防痴呆」从「加分」变成了「浮上去」。
+        判据不再是积分，而是名次：榜前 60% 完整、到 85% 精简为一句，再往后
+        只在注入的模糊索引里露开头一截（分档在 `store.curation_level`）。
+        被召回会把自己上浮回榜前，所以常用的记忆根本不会被碰到——「防痴呆」
+        从「加分」变成了「浮上去」。
+
+        正文只在「精简」这一档被模型改写；榜尾那一档不动正文，模糊纯粹是
+        展示层的效果，`recall` 仍能捞回完整内容。
 
         `tier='permanent'` 不在榜上，自然不参与。
         """
@@ -352,16 +418,11 @@ class MemoryMaintainer:
 
         `source_quote` 始终不修改：正文可以逐步模糊，但其依据的原文引用
         必须保持不变，否则无法回溯该记忆的来源。
-        """
-        if level == LEVEL_KEYWORDS:
-            # 「只剩关键词」这一档不依赖模型：直接用检索关键词拼，确定性、
-            # 零成本，也绝不可能引入原文里没有的信息。
-            keywords = [k for k in memory.keywords if k][:_KEYWORD_BODY_MAX]
-            if not keywords:
-                return ""
-            body = " / ".join(keywords)
-            return body if body != memory.content else ""
 
+        榜尾那一档**不改正文**：模糊只发生在注入侧（索引行只给开头一截）。
+        早前这里会把正文替换成关键词串，结果是 `recall` 只能捞回
+        「事实 / 结论」这类碎片，信息被永久毁掉，而上下文并不会因此变短。
+        """
         if level != LEVEL_BRIEF:
             return ""
 

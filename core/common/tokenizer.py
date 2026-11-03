@@ -54,7 +54,30 @@ def extract_keywords(text: str, limit: int = 12) -> list[str]:
         return []
     # 频次优先，频次相同则更长的 token 优先（信息量更大）
     ranked = sorted(counter.items(), key=lambda kv: (-kv[1], -len(kv[0]), kv[0]))
-    return [token for token, _ in ranked[:limit]]
+    return [token for token, _ in ranked if not is_generic_term(token)][:limit]
+
+
+# 分类词：它们描述「这是哪一类信息」，而不是内容本身。作为检索词毫无区分度，
+# 作为索引行还会让多条记忆长得一模一样（`fact / conclusion`、`约定 / 爱好`）。
+# 模型产出的 tags / keywords 与正文抽取都可能带上它们，统一在这里挡掉。
+_GENERIC_TERMS = frozenset(
+    {
+        "fact", "facts", "conclusion", "conclusions", "summary", "event",
+        "events", "relationship", "relation", "identity", "preference",
+        "behavior_instruction", "user_behavior", "user_preference",
+        "user_related_fact", "user_info", "arrangement", "plan", "todo",
+        "事实", "结论", "摘要", "当天摘要", "总结", "事件", "约定", "承诺",
+        "待办", "待办事项", "安排", "计划", "关系", "身份", "人物身份",
+        "用户偏好", "用户偏好习惯", "用户相关事实", "用户行为", "用户信息",
+        "讨论结论", "分类", "标签", "爱好",
+    }
+)
+
+
+def is_generic_term(term: str) -> bool:
+    """这个词是否只是分类标签，不携带内容信息。"""
+    return str(term or "").strip().lower() in _GENERIC_TERMS
+
 
 
 def overlap_score(query_tokens: set[str], keywords: list[str]) -> float:

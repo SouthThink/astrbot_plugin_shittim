@@ -8,8 +8,8 @@
 （如 `overview`），宿主自动补成 `/api/plug/astrbot_plugin_shittim/overview`。
 
 读接口提供记忆、短期账本、用户画像、巡检运行时状态与主脑上下文快照；写接口
-只开放长期 / 永久记忆的**手工编辑与删除**——短期账本是原始记录，改动它会让
-上下文与判定失去同一份事实来源。
+只开放长期 / 永久记忆与用户画像的**手工编辑与删除**——短期账本是原始记录，
+改动它会让上下文与判定失去同一份事实来源。
 """
 
 from __future__ import annotations
@@ -35,6 +35,10 @@ _DEFAULT_LIMIT = 50
 
 # 手工编辑的单条记忆长度上限：长期记忆是短句，超长输入多半是误粘贴
 _MAX_MEMORY_CHARS = 4000
+# 手工编辑的用户画像：描述是「印象」，关键词是标签，都不该是长篇
+_MAX_PROFILE_SUMMARY_CHARS = 1000
+_MAX_PROFILE_KEYWORDS = 20
+_MAX_PROFILE_KEYWORD_CHARS = 24
 
 # 记忆页面只认这两层；短期账本走另一个接口
 _VALID_TIERS = ("long", "permanent")
@@ -112,6 +116,25 @@ def _body_int(body: dict, name: str) -> int | None:
     return value if value > 0 else None
 
 
+def _keyword_list(value) -> list[str]:
+    """把页面传来的关键词整理成去重列表。
+
+    接受数组，也接受逗号 / 空格分隔的字符串；页面展示时带 `#` 前缀，
+    因此顺手剥掉，避免手工保存一次就多出一层井号。
+    """
+    if isinstance(value, str):
+        value = value.replace("，", ",").replace("、", ",").split(",")
+        value = [part for item in value for part in str(item).split()]
+    if not isinstance(value, (list, tuple)):
+        return []
+    result: list[str] = []
+    for item in value:
+        text = str(item or "").strip().lstrip("#").strip()
+        if text and text not in result:
+            result.append(text)
+    return result
+
+
 def _short_term_item(row) -> dict:
     try:
         caption = str(row["image_caption"] or "")
@@ -161,7 +184,7 @@ def _summary_item(row) -> dict:
 
 
 # 等级编号 → 页面文案。等级由名次推导（见 store.curation_level），不落库。
-_LEVEL_LABELS = {0: "完整", 1: "精简", 2: "关键词"}
+_LEVEL_LABELS = {0: "完整", 1: "精简", 2: "仅索引"}
 
 
 def _memory_item(memory) -> dict:
@@ -183,6 +206,9 @@ def _memory_item(memory) -> dict:
         "recall_count": memory.recall_count,
         "cross_chat_count": memory.cross_chat_count,
         "manual": bool(memory.manual),
+        # 已被判为「没有信息价值」：下一次整理会删除；期间被召回会自动解除
+        "worthless": int(memory.worthless or 0),
+        "worthless_at": memory.worthless_at,
         "created_at": memory.created_at,
         "last_recalled_at": memory.last_recalled_at,
     }
@@ -478,6 +504,62 @@ class MemoryPageAPI:
         store.delete(memory_id)
         return _ok({"id": memory_id})
 
+    async def update_profile(self) -> Any:
+        """手工改写一份用户画像的描述与关键词。
+
+        不写 `profiled_at`：那是整理流程的素材水位线，手工改动推进它会让
+        这段没读过的发言永久漏掉，见 `ProfileStore.edit()`。
+        """
+        body = await _json_body()
+        user_id = str(body.get("user_id") or "").strip()
+        if not user_id:
+            return _err("缺少 user_id")
+        summary = str(body.get("summary") or "").strip()
+        if len(summary) > _MAX_PROFILE_SUMMARY_CHARS:
+            return _err(
+                f"画像描述过长（最多 {_MAX_PROFILE_SUMMARY_CHARS} 字）"
+            )
+        keywords = _keyword_list(body.get("keywords"))
+        if len(keywords) > _MAX_PROFILE_KEYWORDS:
+            return _err(f"关键词最多 {_MAX_PROFILE_KEYWORDS} 个")
+        too_long = next(
+            (
+                word
+                for word in keywords
+                if len(word) > _MAX_PROFILE_KEYWORD_CHARS
+            ),
+            "",
+        )
+        if too_long:
+            return _err(
+                f"关键词「{too_long}」过长（最多 {_MAX_PROFILE_KEYWORD_CHARS} 字）"
+            )
+
+        store = self._plugin.profiles
+        if store.get(user_id) is None:
+            return _err("画像不存在或已被删除", 404)
+        if not store.edit(user_id, summary=summary, keywords=keywords):
+            return _err("画像更新失败")
+        return _ok({"user_id": user_id})
+
+    async def delete_profile(self) -> Any:
+        """删除一份用户画像。
+
+        只清印象：名字与发言记录都在 `user_ledger` 里，不受影响。他再次说话时
+        会重新建行，之后再按新的素材慢慢形成印象。
+        """
+        body = await _json_body()
+        user_id = str(body.get("user_id") or "").strip()
+        if not user_id:
+            return _err("缺少 user_id")
+
+        store = self._plugin.profiles
+        if store.get(user_id) is None:
+            return _err("画像不存在或已被删除", 404)
+        if not store.delete(user_id):
+            return _err("画像删除失败")
+        return _ok({"user_id": user_id})
+
 
 def register_all_routes(plugin) -> None:
     """把页面路由挂到宿主；宿主不支持插件 Web API 时静默跳过。"""
@@ -496,6 +578,8 @@ def register_all_routes(plugin) -> None:
         ("profiles", api.profiles, ["GET"], "用户画像"),
         ("memories/update", api.update_memory, ["POST"], "编辑长期或永久记忆"),
         ("memories/delete", api.delete_memory, ["POST"], "删除长期或永久记忆"),
+        ("profiles/update", api.update_profile, ["POST"], "编辑用户画像"),
+        ("profiles/delete", api.delete_profile, ["POST"], "删除用户画像"),
         ("runtime", api.runtime, ["GET"], "巡检参数与焦点状态"),
         ("context", api.context, ["GET"], "主脑当前上下文"),
     )

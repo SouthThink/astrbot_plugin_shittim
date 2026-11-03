@@ -42,7 +42,7 @@ TIER_PERMANENT = "permanent"
 # 榜序：谁最后被想起谁排前面。id 兜底保证同刻写入的顺序稳定。
 _BOARD_ORDER = "promoted_at DESC, id DESC"
 
-# 等级：0 完整 / 1 精简 / 2 关键词
+# 等级：0 完整 / 1 精简（一句）/ 2 只出现在模糊索引里（正文保留）
 LEVEL_FULL = 0
 LEVEL_BRIEF = 1
 LEVEL_KEYWORDS = 2
@@ -153,6 +153,11 @@ class Memory:
     last_curated_at: float = 0.0
     forget_requested: int = 0
     forget_requested_at: float = 0.0
+    # 「判断为没有信息价值」的标记：整理时只打标记，下一次整理才删除。
+    # 期间只要被召回、被重新提到或被手工编辑，标记立即解除。
+    worthless: int = 0
+    worthless_at: float = 0.0
+    worthless_checked_at: float = 0.0
     # 位置榜的轴：最后一次被想起（整理产出 / 被召回）的时刻
     promoted_at: float = 0.0
     # 名次与榜长：由查询填进来，不在表里。升/降级形态靠它们推导。
@@ -190,6 +195,9 @@ class Memory:
             last_curated_at=float(row["last_curated_at"] or 0.0),
             forget_requested=int(row["forget_requested"] or 0),
             forget_requested_at=float(row["forget_requested_at"] or 0.0),
+            worthless=int(row["worthless"] or 0),
+            worthless_at=float(row["worthless_at"] or 0.0),
+            worthless_checked_at=float(row["worthless_checked_at"] or 0.0),
             promoted_at=float(row["promoted_at"] or 0.0),
         )
 
@@ -332,7 +340,9 @@ class MemoryStore:
             """
             UPDATE memories
                SET promoted_at = ?,
-                   cross_chat_count = cross_chat_count + ?
+                   cross_chat_count = cross_chat_count + ?,
+                   worthless = 0,
+                   worthless_at = 0
              WHERE id = ?
             """,
             (now, cross_delta, duplicate.id),
@@ -347,6 +357,7 @@ class MemoryStore:
             "useful_count", "cross_chat_count", "manual", "last_recalled_at",
             "last_decay_at", "merged_from", "promoted_at", "curation_count",
             "last_curated_at", "forget_requested", "forget_requested_at",
+            "worthless", "worthless_at", "worthless_checked_at",
         }
         assignments = {k: v for k, v in fields.items() if k in allowed}
         if not assignments:
@@ -380,6 +391,8 @@ class MemoryStore:
             return False
         keywords = [k for k in extract_keywords(text) if k]
         self.update(memory_id, content=text, keywords=keywords)
+        # 人工改写说明这条记忆仍然重要：解除「无价值」标记，别让整理把它删掉
+        self.clear_worthless([memory_id])
         return True
 
     def mark_recalled(self, memory_ids: list[int]) -> None:
@@ -396,11 +409,104 @@ class MemoryStore:
             UPDATE memories
                SET recall_count = recall_count + 1,
                    last_recalled_at = ?,
-                   promoted_at = ?
+                   promoted_at = ?,
+                   worthless = 0,
+                   worthless_at = 0,
+                   worthless_checked_at = ?
+             WHERE id IN ({placeholders})
+            """,
+            (now, now, now, *memory_ids),
+        )
+
+    def worthless_candidates(self, limit: int = 20) -> list[Memory]:
+        """取出这一轮要判断「还有没有信息价值」的长期记忆。
+
+        永久层不参与：它不降级、不遗忘，也不该因为「判断无价值」被删掉。
+        按 `worthless_checked_at` 升序轮转——判断过但仍有价值的条目会被推到
+        队尾，否则每晚都会拿同一批旧记忆重复问模型。
+        """
+        rows = self._db.query(
+            """
+            SELECT * FROM memories
+             WHERE tier = ? AND forget_requested = 0 AND worthless = 0
+             ORDER BY worthless_checked_at ASC, promoted_at ASC
+             LIMIT ?
+            """,
+            (TIER_LONG, max(int(limit), 1)),
+        )
+        return [Memory.from_row(row) for row in rows]
+
+    def mark_worthless(self, memory_ids: list[int]) -> int:
+        """打上「无价值」标记。**不删除**：留给下一次整理执行。"""
+        if not memory_ids:
+            return 0
+        now = time.time()
+        placeholders = ",".join("?" for _ in memory_ids)
+        cursor = self._db.execute(
+            f"""
+            UPDATE memories
+               SET worthless = 1,
+                   worthless_at = ?,
+                   worthless_checked_at = ?
              WHERE id IN ({placeholders})
             """,
             (now, now, *memory_ids),
         )
+        return int(cursor.rowcount or 0)
+
+    def mark_worthless_checked(self, memory_ids: list[int]) -> None:
+        """记录「已经判断过、结论是仍有价值」，让取材轮转到后面的条目。"""
+        if not memory_ids:
+            return
+        placeholders = ",".join("?" for _ in memory_ids)
+        self._db.execute(
+            f"UPDATE memories SET worthless_checked_at = ? WHERE id IN ({placeholders})",
+            (time.time(), *memory_ids),
+        )
+
+    def clear_worthless(self, memory_ids: list[int]) -> int:
+        """解除「无价值」标记（被召回 / 被重新提到 / 被手工编辑时调用）。"""
+        if not memory_ids:
+            return 0
+        placeholders = ",".join("?" for _ in memory_ids)
+        cursor = self._db.execute(
+            f"""
+            UPDATE memories
+               SET worthless = 0, worthless_at = 0, worthless_checked_at = ?
+             WHERE id IN ({placeholders})
+            """,
+            (time.time(), *memory_ids),
+        )
+        return int(cursor.rowcount or 0)
+
+    def delete_worthless(self, before_ts: float, limit: int = 50) -> int:
+        """删除标记已过期（`worthless_at <= before_ts`）的无价值记忆。
+
+        只删长期层：万一标记之后被晋升成永久记忆，就不该再按这条规则消失。
+        """
+        rows = self._db.query(
+            """
+            SELECT id FROM memories
+             WHERE tier = ? AND worthless = 1
+               AND worthless_at > 0 AND worthless_at <= ?
+             ORDER BY worthless_at ASC
+             LIMIT ?
+            """,
+            (TIER_LONG, float(before_ts), max(int(limit), 1)),
+        )
+        ids = [int(row["id"]) for row in rows]
+        if not ids:
+            return 0
+        placeholders = ",".join("?" for _ in ids)
+        with self._db.lock:
+            self._db.execute(
+                f"DELETE FROM memory_keywords WHERE memory_id IN ({placeholders})",
+                tuple(ids),
+            )
+            self._db.execute(
+                f"DELETE FROM memories WHERE id IN ({placeholders})", tuple(ids)
+            )
+        return len(ids)
 
     def request_forget(self, memory_id: int) -> bool:
         """「被明确要求忘记」：从永久层拉回长期层，并要求遗忘（§10.3）。
@@ -505,6 +611,26 @@ class MemoryStore:
 
     def list_by_tier(self, tier: str, limit: int = 500) -> list[Memory]:
         return self.ranked(tier, limit=int(limit))
+
+    def memories_of_user(self, user_id: str, limit: int = 20) -> list[Memory]:
+        """某个人的长期与永久记忆，供画像整理取材。
+
+        永久层排前面：它们是最确定的认知。其余按位置榜倒序，保证「最近还在
+        用的」优先进入画像素材。已要求遗忘的条目不参与。
+        """
+        if not user_id:
+            return []
+        rows = self._db.query(
+            f"""
+            SELECT * FROM memories
+             WHERE user_id = ? AND forget_requested = 0
+             ORDER BY CASE tier WHEN '{TIER_PERMANENT}' THEN 0 ELSE 1 END,
+                      {_BOARD_ORDER}
+             LIMIT ?
+            """,
+            (user_id, max(int(limit), 1)),
+        )
+        return [Memory.from_row(row) for row in rows]
 
     def ranked(self, tier: str = TIER_LONG, limit: int | None = None) -> list[Memory]:
         """按**位置榜**读某一层，并把名次与榜长填进每条记忆。

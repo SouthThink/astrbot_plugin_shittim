@@ -15,11 +15,16 @@
 | --- | --- | --- |
 | ① 永久记忆 | 全量正文 | 已确认的事，不参与榜序 |
 | ② 榜前 N 条 | 完整正文 | 位置榜（最近被想起的记忆） |
-| ③ 关键词索引 | **只给一行词，不给正文** | 元记忆 |
+| ③ 模糊索引 | **只给开头一截，不给全文** | 元记忆 |
 
 ③ 是这套设计能正常工作的关键：若只给榜前 N 条，第 N+1 条之后的内容将完全
-不可见，模型也不会主动 `recall` 一个不知道存在的事物。一行关键词代价极小，
+不可见，模型也不会主动 `recall` 一个不知道存在的事物。一行开头代价极小，
 却能提示「还存在这些记忆」，从而触发主动回想。
+
+③ 曾用 tags（分类词）渲染，但模型给出的分类高度重复（`fact / conclusion`、
+`约定 / 爱好`），多条记忆长得一模一样；改用内容关键词同样不可行——零依赖
+分词只能切出二元组碎片（`不喜 / 为对 / 他不`）。因此改为截取正文开头，
+并去掉重复的行。
 
 作息事件提示（被叫醒 / 刚起床）由同一文件的另一入口生成：它属于**时效性事件
 通知**，与记忆背景块方向相反——记忆块插在时间线之前，它追加在末尾。
@@ -46,43 +51,45 @@ _BLOCK_RULES = """使用规则：
 """
 
 _PERPETUAL_HEADER = f"""{_BLOCK_OPEN}
-下面是你确信的事——长期相处中确认过、不会轻易改变的，仅作背景参考。
+下面是你不会忘记的事情。仅作背景参考。
 {_BLOCK_RULES}"""
 
 _BOARD_HEADER = f"""{_BLOCK_OPEN}
-下面是你记得最牢的事（按「最近一次被想起」的顺序排）。仅作背景参考。
+下面是你最近想起的事情。仅作背景参考。
 {_BLOCK_RULES}"""
 
 # 索引段不带那四条「不要复述」的常规规则——它给的恰恰是「去回想」的入口
 _INDEX_HEADER = f"""{_BLOCK_OPEN}
-后面这些你**只记得个大概**：它们躺在记忆深处，细节已经模糊了。
+你对这些事情有印象：它们曾经聊过，但细节已经模糊了。
 如果眼前的话题碰到其中任何一条，先调用 recall 想一想，不要凭印象说。
 """
 
 # 与当前话题相关的自动召回：位置榜负责「最近被想起的」，这一段负责
 # 「恰好对上这句话的」。两者都不计召回次数，只有主动 recall 才影响榜序。
 _RELATED_HEADER = f"""{_BLOCK_OPEN}
-下面这些是你此刻想起的、与眼前话题有关的旧事。它们只是恰好对上了现在这句话。
+下面这些是你此刻想起的、与眼前话题有关的旧事。只是你记忆的无端联想。
 {_BLOCK_RULES}"""
 
-# 索引行最多并列几个词：它只是「提示有这么件事」，不是内容本身
-_INDEX_TERMS_MAX = 6
-# 取不到标签与关键词时的兜底长度
+# 索引行的截断长度：只给开头一截，够让人想起「是哪件事」即可
 _INDEX_FALLBACK_CHARS = 24
 
 
 def index_line(memory: Memory) -> str:
-    """索引行：只给标签或关键词，不给正文。
+    """索引行：给这一条的开头一截，不给全文。
 
-    标签是模型生成的分类词，比 char bigram 关键词更可读，所以优先用它。
+    不用 tags：tags 回答「这条属于哪一类」，模型给出的分类高度重复
+    （`fact / conclusion`、`约定 / 爱好`），多条记忆会渲染成完全一样的一行，
+    既区分不出内容，也提示不了「该去 recall 什么」。
+    也不用关键词：零依赖分词只能切出二元组碎片（`不喜 / 为对 / 他不`），
+    同样没有信息量。开头一截至少能说明这是哪件事，又不足以替代全文——
+    细节仍然要靠 `recall`。
     """
-    terms = [t.strip() for t in memory.tags if t and t.strip()]
-    if not terms:
-        terms = [k.strip() for k in memory.keywords if k and k.strip()]
-    if terms:
-        return "- " + " / ".join(terms[:_INDEX_TERMS_MAX])
     text = " ".join(str(memory.content or "").split())
-    return f"- {text[:_INDEX_FALLBACK_CHARS]}" if text else ""
+    if not text:
+        return ""
+    if len(text) > _INDEX_FALLBACK_CHARS:
+        text = text[:_INDEX_FALLBACK_CHARS].rstrip() + "…"
+    return f"- {text}"
 
 
 def build_memory_blocks(
@@ -126,7 +133,13 @@ def build_memory_blocks(
         blocks.append(block)
         budget -= used
 
-    index_lines = [line for line in (index_line(m) for m in index) if line]
+    # 索引行的作用是「提示还有这么件事」，同一行出现两次没有任何信息量：
+    # 关键词重合的条目会被渲染成一样的文本，这里直接去重。
+    index_lines: list[str] = []
+    for memory in index:
+        line = index_line(memory)
+        if line and line not in index_lines:
+            index_lines.append(line)
     block, _ = _render_block(_INDEX_HEADER, index_lines, budget)
     if block:
         blocks.append(block)
@@ -189,8 +202,7 @@ _PROFILE_OPEN = "<user_profile>"
 _PROFILE_CLOSE = "</user_profile>"
 
 # 画像块的收尾说明：它和记忆块一样只是背景，不能变成回复主题
-_PROFILE_RULES = """这些只是你对他的印象，不要复述，也不要说「我记得你」「你之前说过」。
-像认识的人一样自然交流；印象可能过时，以眼前这句话为准。"""
+_PROFILE_RULES = """这些只是你对他的印象，不要复述，也不要说「我记得你」「你之前说过」。"""
 
 
 def build_profile_block(
