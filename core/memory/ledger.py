@@ -183,6 +183,23 @@ class ShortTermLedger:
         )
         return int(cursor.lastrowid or 0)
 
+    def created_at_of(self, message_id: int) -> float:
+        """取某条消息的记账时刻；查不到返回 0。
+
+        助手回复要落回「触发它的那句话」之后，调用方据此得到回复的记账时间，
+        避免分段发送期间进来的下一句把回复挤到后面。
+        """
+        message_id = int(message_id or 0)
+        if message_id <= 0:
+            return 0.0
+        row = self._db.query_one(
+            "SELECT created_at FROM short_term_messages WHERE id = ?",
+            (message_id,),
+        )
+        if row is None:
+            return 0.0
+        return float(row["created_at"] or 0.0)
+
     def release_staged(self) -> int:
         """起床收口：把睡眠期暂存的消息放行，纳入正常流程。
 

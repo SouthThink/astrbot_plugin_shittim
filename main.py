@@ -1692,6 +1692,23 @@ class ShittimPlugin(Star):
             self._schedule_condense_if_due()
         logger.info("[什亭之枢] 收尾发言已投递 | %s | %s", umo, text[:50])
 
+    def _reply_created_at(self, event: AstrMessageEvent) -> float | None:
+        """助手回复的记账时间：挂在触发这一轮的那条用户消息之后。
+
+        回复是到 `after_message_sent` 才入账的，而分段发送可能已经晚于下一条
+        用户消息：两段分别在 09:49:19 / 09:49:21 发出，09:49:21 进来的下一句
+        先入了账，回复若按此刻记账就会排到它后面。模型看到的是
+        「那句话 → 答非所问的回复 → 下一句」，于是把下一句当成新话题。
+
+        取触发消息的记账时刻加 1 毫秒：排在它后面，又不抢占后来消息的位置。
+        取不到触发消息（主动发言等）时返回 None，由调用方按当下时间记录。
+        """
+        message_id = int(get_extra(event, EXTRA_MESSAGE_ID, 0) or 0)
+        if not message_id:
+            return None
+        created_at = self.short_term.created_at_of(message_id)
+        return created_at + 0.001 if created_at > 0 else None
+
     @filter.after_message_sent(priority=_PRIORITY_AFTER_SENT)
     async def after_message_sent(self, event: AstrMessageEvent):
         """记录助手自身的回复，并在后台触发压缩与维护。"""
@@ -1709,6 +1726,8 @@ class ShittimPlugin(Star):
                     sender_name="",
                     role="assistant",
                     content=content,
+                    # 时间跟着触发消息走，否则分段发送会让回复插到下一句之后
+                    created_at=self._reply_created_at(event),
                 )
         except Exception as error:
             logger.error("[什亭之枢] 记录回复失败: %s", error)
