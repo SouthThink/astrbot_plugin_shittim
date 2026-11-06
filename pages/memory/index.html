@@ -772,6 +772,21 @@
           el.list.appendChild(sleepGrid);
         }
 
+        const brain = data.brain || null;
+        if (brain) {
+          el.list.appendChild(sectionTitle("主脑占用"));
+          const brainGrid = document.createElement("div");
+          brainGrid.className = "grid";
+          [
+            ["当前在说话", brain.busy ? brain.chat_label || brain.chat || "未知" : "空闲"],
+            ["这一轮开始生成", brain.busy ? (brain.begun ? "是" : "还没") : "—"],
+            ["已占用", brain.busy ? fmtSeconds(brain.held_seconds) : "—"],
+            ["让过的路", `${brain.yields || 0} 次`],
+            ["等待上限", fmtSeconds(brain.wait_seconds)],
+          ].forEach(([key, value]) => brainGrid.appendChild(paramBox(key, value)));
+          el.list.appendChild(brainGrid);
+        }
+
         const patrol = data.patrol || {};
         const windows = patrol.windows || [];
         el.list.appendChild(sectionTitle("等待中的窗口"));

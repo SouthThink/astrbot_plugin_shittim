@@ -76,6 +76,7 @@ from .core.common.event_utils import (
 )
 from .core.common.time_utils import format_age, format_clock
 from .core.focus.manager import FocusManager
+from .core.gate.brain import BrainGate
 from .core.gate.engine import DecisionEngine
 from .core.gate.patrol import (
     KILL as PATROL_KILL,
@@ -372,6 +373,9 @@ class ShittimPlugin(Star):
         self.patrol = PatrolManager(
             self.decision_config, self.short_term, self.decider
         )
+        # 主脑占用：AstrBot 只对同一会话串行，跨会话（私聊 vs 群聊）会跑两轮。
+        # 统一人格只有一份记忆，两轮并发会互相读到对方刚写的内容。
+        self.brain = BrainGate()
 
         # ── 运行时状态 ────────────────────────────────────────
         self._background_tasks: set[asyncio.Task] = set()
@@ -845,10 +849,58 @@ class ShittimPlugin(Star):
                 # 点名 / @ 不直接回复：交给巡检窗口，由模型确认是否真的在叫她
                 await self._gate_by_patrol(event, mention=True)
                 return
-            self._apply_decision(event, ruled)
+            await self._apply_decision(event, ruled)
             return
 
         await self._gate_by_patrol(event)
+
+    # ══════════════════════════════════════════════════════════
+    #  事件：主脑起止（占用的确认与交还）
+    # ══════════════════════════════════════════════════════════
+
+    @filter.on_agent_begin()
+    async def on_brain_begin(self, event: AstrMessageEvent, run_context=None):
+        """主脑真的开始跑了。
+
+        占用在拦放链路里**放行之前**就已经拿到（`_release_exclusive`），这里
+        只做核对：若此时占用不在本事件名下，说明这一轮不是我们放行的
+        （命令、别的插件唤醒、异常兜底），记录一条即可，不抢占用。
+        """
+        if self._is_terminating:
+            return
+        if self.brain.owns(event):
+            self.brain.mark_begun(event)
+            logger.debug(
+                "[什亭之枢] 主脑占用确认 | %s | 本轮已开始生成",
+                event.unified_msg_origin or "",
+            )
+            return
+        if not self._gate_active():
+            return
+        if self.brain.busy:
+            logger.warning(
+                "[什亭之枢] 主脑已在别处运行，本轮为并发 | %s | 占用中：%s",
+                event.unified_msg_origin or "",
+                self.brain.holder_chat or "未知",
+            )
+        else:
+            # 占用空闲却不是本事件拿的：这一轮不是拦放链路放行的
+            # （命令、别的插件唤醒等）。不抢占用，只在排障时能看到。
+            logger.debug(
+                "[什亭之枢] 主脑开始运行（未经拦放链路）| %s",
+                event.unified_msg_origin or "",
+            )
+
+    @filter.on_agent_done()
+    async def on_brain_done(
+        self, event: AstrMessageEvent, run_context=None, response=None
+    ):
+        """主脑这一轮结束：交还占用。
+
+        这是最可靠的释放点——无论本轮是否发出消息（`stay_silent`、空回复、
+        被打断），它都会触发；`after_message_sent` 在空消息链时不会触发。
+        """
+        self.brain.release(event, "主脑本轮结束")
 
     async def _gate_silent_debounce(self, event: AstrMessageEvent, ruled) -> None:
         """静默防抖：静默满 `private_debounce_seconds` 秒且无新消息后唤醒主脑。
@@ -862,7 +914,7 @@ class ShittimPlugin(Star):
         chat_id = event.unified_msg_origin or ""
         if seconds <= 0 or not chat_id:
             # 未配置防抖或取不到会话标识：立即放行
-            self._apply_decision(event, ruled)
+            await self._apply_decision(event, ruled)
             return
 
         future = await self.patrol.hold(chat_id, event, silent=True)
@@ -875,10 +927,10 @@ class ShittimPlugin(Star):
             logger.debug("[什亭之枢] 插件已卸载，放弃本次静默防抖结果")
             return
         if verdict == PATROL_PROCESS:
-            self._release(event)
-            logger.info(
-                "[什亭之枢] 放行主脑 [静默防抖] 静默 %.1fs 无新消息", seconds
-            )
+            if await self._release_exclusive(event):
+                logger.info(
+                    "[什亭之枢] 放行主脑 [静默防抖] 静默 %.1fs 无新消息", seconds
+                )
         else:
             self._block(event)
             logger.info("[什亭之枢] 拦截官方 LLM [静默防抖] 被更新的消息取代")
@@ -904,7 +956,7 @@ class ShittimPlugin(Star):
             )
             if self._is_terminating:
                 return
-            self._apply_decision(event, decision)
+            await self._apply_decision(event, decision)
             return
 
         future = await self.patrol.hold(chat_id, event, mention=mention)
@@ -921,21 +973,23 @@ class ShittimPlugin(Star):
             logger.debug("[什亭之枢] 插件已卸载，放弃本次巡检结果")
             return
         if verdict == PATROL_PROCESS:
-            self._release(event)
-            logger.info("[什亭之枢] 放行主脑 [patrol] 窗口判定：开口")
+            if await self._release_exclusive(event):
+                logger.info("[什亭之枢] 放行主脑 [patrol] 窗口判定：开口")
         else:
             self._block(event)
             # 沉默的具体理由由巡检器记录；这里若也打 INFO，噪声跳过会刷屏
             logger.debug("[什亭之枢] 拦截官方 LLM [patrol] 窗口判定：沉默")
 
-    def _apply_decision(self, event: AstrMessageEvent, decision) -> None:
+    async def _apply_decision(self, event: AstrMessageEvent, decision) -> None:
         """按判定结果放行或拦下这条事件。"""
         if decision.passthrough:
             logger.debug("[什亭之枢] 原样让路 [%s] %s", decision.source, decision.reason)
             return
         if decision.should_reply:
-            self._release(event)
-            logger.info("[什亭之枢] 放行主脑 [%s] %s", decision.source, decision.reason)
+            if await self._release_exclusive(event):
+                logger.info(
+                    "[什亭之枢] 放行主脑 [%s] %s", decision.source, decision.reason
+                )
             return
         self._block(event)
         logger.info("[什亭之枢] 拦截官方 LLM [%s] %s", decision.source, decision.reason)
@@ -949,6 +1003,41 @@ class ShittimPlugin(Star):
             event.is_at_or_wake_command = True
         except Exception:
             pass
+
+    async def _release_exclusive(self, event: AstrMessageEvent) -> bool:
+        """申请主脑占用后再放行；占用被别处占着时等到超时，返回 False。
+
+        AstrBot 只在**同一会话**内串行（`session_lock_manager.acquire_lock`），
+        私聊与群聊会各自起一轮。统一人格只有一份记忆，两轮并发时会互相读到
+        对方刚写进去的内容——现象就是「在群里回答私聊的话题」。因此在放行
+        之前先在这里排队。
+
+        等不到就放弃：同一时刻只让一个主脑思考，这条事件拦下不回复。消息本身
+        仍在账本里，同会话的下一条消息会带着它一起进上下文，所以她不会真的漏看。
+        """
+        chat_id = event.unified_msg_origin or ""
+        try:
+            acquired = await self.brain.acquire(event, chat_id)
+        except Exception as error:
+            logger.error("[什亭之枢] 申请主脑占用失败，改为直接放行: %s", error)
+            self._release(event)
+            return True
+        if self._is_terminating:
+            self.brain.release(event, "插件正在卸载")
+            return False
+        if acquired:
+            self._release(event)
+            return True
+        self.brain.yield_once()
+        # 放弃这一条：拦下并记账为「已拦」。消息本身仍在账本里，她重建上下文
+        # 时照常看得到，只是这一条不触发判定——不算漏看，只是没抢到说话的机会。
+        self._block(event)
+        logger.info(
+            "[什亭之枢] 主脑正忙，本条暂不处理 | %s | 占用中：%s",
+            chat_id,
+            self.brain.holder_chat or "未知",
+        )
+        return False
 
     def _block(self, event: AstrMessageEvent) -> None:
         """拦下这条事件：官方 LLM 完全不触发。"""
@@ -1602,6 +1691,10 @@ class ShittimPlugin(Star):
 
         该处理器使用最低优先级，待其它插件的结果装饰完成后，再决定是否发送。
         """
+        # 本轮已经走到收尾：主脑占用在这里可以交还了。这一步早于实际发送，
+        # 但发送是同步的一次平台调用，不再涉及模型生成，让下一条先去思考没问题。
+        self.brain.release(event, "结果装饰")
+
         # 主脑调用 stay_silent：丢弃本轮全部发言，不发送任何消息。
         if get_extra(event, EXTRA_SILENT):
             try:
@@ -1712,6 +1805,8 @@ class ShittimPlugin(Star):
     @filter.after_message_sent(priority=_PRIORITY_AFTER_SENT)
     async def after_message_sent(self, event: AstrMessageEvent):
         """记录助手自身的回复，并在后台触发压缩与维护。"""
+        # 消息已发出：本轮主脑的活儿干完了，交还占用让其它会话接着来。
+        self.brain.release(event, "已发送")
         if self._is_terminating:
             return
         # 她刚说过话：仍在等的新消息要从此刻重新等满一个窗口，否则会出现
@@ -2172,11 +2267,16 @@ class ShittimPlugin(Star):
         决定这一轮不发言。当你判断不该由你回应时调用：例如只是被提到名字、
         对方在讨论智能体或与你无关的话题、接话会打断别人、或你已经无话可说。
         如果你心里那个「这条值得接」的念头其实站不住，也直接调用它收回发言。
-        调用后本轮不会发送任何消息；之后有新消息仍会正常参与判定。
+        调用后本轮不会发送任何消息，而且这个群会安静一阵子：期间普通消息不再
+        拿来问你，只有被 @ 或有人叫你名字时才会重新叫醒你。所以它适合
+        「这段确实不该接」，不适合「我先看看再说」。
         """
         if self._is_terminating:
             return "插件正在重载，请稍后再试。"
         set_extra(event, EXTRA_SILENT, True)
+        # 这一轮不会再有发言，占用就此交还（`on_agent_done` 稍后还会再来一次，
+        # 重复释放是空操作）。不在这里交还会让别的会话白等到超时。
+        self.brain.release(event, "主脑决定不发言")
         # 这是「这一轮最终没有开口」：群里叫了她、她决定不理，与巡检自己判沉默
         # 是同一件事，同样要让该会话冷却，否则下一段闲聊会立刻把她重新拽进判定。
         # 私聊由 `enter_cooldown` 内部挡掉；@ 与名字提及属于群聊，照常冷却。
@@ -2658,6 +2758,7 @@ class ShittimPlugin(Star):
         self._background_tasks.clear()
         # 扣押中的窗口事件统一按拦下处理，避免其永久处于等待状态
         await self.patrol.cleanup()
+        self.brain.clear()
         self.db.close()
         logger.info("[什亭之枢] 已卸载，记忆库已关闭")
 

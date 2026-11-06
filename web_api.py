@@ -421,6 +421,13 @@ class MemoryPageAPI:
         except Exception:
             sleep = None
 
+        try:
+            brain = plugin.brain.snapshot()
+        except Exception:
+            brain = None
+        if brain:
+            brain["chat_label"] = label(str(brain.get("chat") or ""))
+
         return _ok(
             {
                 "gate_active": _active("_gate_active"),
@@ -451,6 +458,7 @@ class MemoryPageAPI:
                     "require_focus_for_say": bool(focus_cfg.require_focus_for_say),
                 },
                 "patrol": patrol,
+                "brain": brain,
                 "focus_items": focus_items,
                 "sleep": sleep,
             }

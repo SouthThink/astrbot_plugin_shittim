@@ -55,6 +55,10 @@ pages/memory/   记忆页面
 
 放行 = `event.is_at_or_wake_command = True`；拦下 = `event.stop_event()` + `_mark_gated()`。
 
+**放行必须经过 `main._release_exclusive()`，不要直接调 `_release()`。** AstrBot 的 LLM 互斥只覆盖同一会话（`session_lock_manager.acquire_lock(event.unified_msg_origin)`），私聊与群聊是两个事件、两个任务，会各自起一轮主脑。统一人格只有一份记忆，两轮并发的现象就是「在群里回答私聊的话题」。因此三条放行路径（`_apply_decision`、`_gate_silent_debounce`、`_gate_by_patrol`）统一走 `_release_exclusive()`：先 `brain.acquire()` 申请占用，拿到才 `_release()`，超时则 `_block()` 并记 INFO「主脑正忙，本条暂不处理」。
+
+占用由 `core/gate/brain.py` 的 `BrainGate` 维护，**没有 `asyncio.Lock`**——检查与置位之间不 `await`，单线程事件循环里就是原子的；真拿锁反而会因占用者异常消失而永久死锁。四收口点谁先到谁释放（重复释放是空操作）：`on_agent_done`（最可靠）、`after_message_sent`、`on_decorating_result`、`stay_silent`。两道兜底时限防「拿到却没释放」：未开始生成 15s（放行后仍可能被白名单 / 会话停用 / 限流拦下，`on_agent_begin` 不会来）、已开始生成 300s；等不到占用的上限是 30s。
+
 判定为**开口**时，巡检把 `reason` 写到事件上（`EXTRA_JUDGE_REASON`），由 `main._inject_judge_thought()` 用 `injector.build_judge_thought_block()` 拼成 `<own_thought>` 追加到本轮请求**末尾**。措辞必须是「你自己刚冒出的念头」：一旦写成「判定模型认为……」，主脑会把它当成另一条消息去回应，出现「主脑和巡检聊天」。这一块只递「为什么值得接」这一条理由，**不写任何判定标准**——该不该接属于人格提示词。主脑认为念头站不住时调 `stay_silent` 收回。
 
 ### 3.2 焦点链路（她在哪）
@@ -138,6 +142,7 @@ pages/memory/   记忆页面
 | `core/common/model_json.py` | 模型输出 JSON 容错解析 | 决断层与压缩共用，改动同时影响两边 |
 | `core/gate/engine.py` | 决断层 | `_WINDOW_PROMPT` 是判定质量的直接来源；人格/记忆注入别删 |
 | `core/gate/patrol.py` | 巡检窗口 | 扣押 / 替换 / 冷却 / 噪声 / 最近判定快照都在这里 |
+| `core/gate/brain.py` | 主脑占用（同一时刻只许一轮） | 放行前 `acquire()`、四收口点 `release()`；**不要改成 `asyncio.Lock`**（占用者异常消失会永久死锁）；`_stale()` 的两档时限是防「拿到不释放」的唯一兜底 |
 | `core/focus/manager.py` | 焦点读写 + 已读水位线 | 只约束主动发言，别在被动接话路径上读它；`touch()` 不推进 `last_read_at`，只有 `mark_read()` 推进 |
 | `core/memory/ledger.py` | 账本读写、行格式化、条目查询、压缩落库、清空 | `_LIVE_SQL` 是「她此刻应该记得的」唯一表达，**新增查询必须带上它**；`format_message_line` 供判定，`format_speech` 供时间线 |
 | `core/memory/store.py` | 位置榜、召回打分、等级推导、遗忘请求 | 榜序 `_BOARD_ORDER` 与分档常量在顶部；等级一律用 `curation_level(rank, total)` 推导，不要新增「等级」列；`promoted_at` 是入榜位置，`created_at` 是产生时间，两者不可混用 |
@@ -205,6 +210,13 @@ pages/memory/   记忆页面
 - `on_llm_request` 默认**不覆盖** `req.contexts`，只追加临时内容块；开启 `memory.context_takeover` 后会整体替换，此时必须晚于同样覆盖 `req.contexts` 的插件（天使之心 50），否则注入块会被抹掉。
 
 **记账必须快**：记账是事件链第一环，任何耗时操作（模型调用、下载）都要 `self._spawn()` 丢后台。
+
+**同一时刻只允许一轮主脑**：AstrBot 只为同一 `unified_msg_origin` 加 LLM 锁，私聊与群聊并发时两轮会同时生成；统一人格只有一份记忆，于是「在群里回答私聊的话题」。插件用 `core/gate/brain.py` 的 `BrainGate` 自己补这层互斥：放行前 `acquire()`、四收口点 `release()`。几处不要改坏：
+
+- **必须走 `_release_exclusive()`**，直接 `_release()` 会绕过闸门。`_release_exclusive()` 返回 True 表示已放行，False 表示已 `_block()`，调用方不要再补 block。
+- **不要换成 `asyncio.Lock`**：占用者若在异常路径上消失，锁会被永久带走。现在的实现是「检查 + 置位之间没有 `await`」，单线程事件循环里本身就是原子的。
+- **释放点宁多勿少**：`on_agent_done`（唯一在所有路径上都触发的钩子）、`after_message_sent`、`on_decorating_result`、`stay_silent`。空消息链不触发 `after_message_sent`，所以只挂它一定漏。
+- **两道超时是唯一兜底**：拿到占用却没能开始生成（白名单 / 会话停用 / 限流把事件拦在了 `ProcessStage` 之前）走 15s；开始之后异常消失走 300s。等不到占用上限 30s，超时就把这条拦下——消息仍在账本里，同会话的下一条会把它带进上下文，不是真的漏看。
 
 **回复的记账时间跟着触发消息走**：回复是到 `after_message_sent` 才写进账本的，而分段发送可能已经晚于下一条用户消息（第一段发出后，第二段发出前，对方又说了下一句）。若按当下时间记，回复就会排到下一句后面，模型看到的是「那句话 → 答非所问的回复 → 下一句」，于是把下一句当成新话题（表现为「受不了了」之后回「怎么了呀」）。`main._reply_created_at()` 取 `EXTRA_MESSAGE_ID` 那条消息的 `created_at + 1ms`，取不到（主动发言）才用当下时间。不要改回 `time.time()`，也不要为此在排序层面加特例——账本只认 `(created_at, id)`。
 
