@@ -1712,7 +1712,15 @@ class ShittimPlugin(Star):
     @filter.after_message_sent(priority=_PRIORITY_AFTER_SENT)
     async def after_message_sent(self, event: AstrMessageEvent):
         """记录助手自身的回复，并在后台触发压缩与维护。"""
-        if self._is_terminating or not self._memory_active():
+        if self._is_terminating:
+            return
+        # 她刚说过话：仍在等的新消息要从此刻重新等满一个窗口，否则会出现
+        # 「她说完一句、下一句立刻又被判定」——开口不设冷却，但也不该贴身紧跟。
+        try:
+            await self.patrol.note_spoke(event.unified_msg_origin or "")
+        except Exception as error:
+            logger.debug("[什亭之枢] 顺延巡检窗口失败: %s", error)
+        if not self._memory_active():
             return
         try:
             content = extract_reply_text(event)
@@ -2096,6 +2104,8 @@ class ShittimPlugin(Star):
         self.focus.touch(umo, label)
         # 在那里说过话＝已经看过那边，已读水位线推到当下
         self.focus.mark_read(umo)
+        # 那边若还有扣押中的窗口，也要从此刻重新等满一个窗口
+        await self.patrol.note_spoke(umo)
         # 标记本轮已离开原会话，收尾时据此跳过原会话汇报
         if umo != (event.unified_msg_origin or ""):
             set_extra(event, EXTRA_LEFT_TO, umo)
@@ -2167,6 +2177,15 @@ class ShittimPlugin(Star):
         if self._is_terminating:
             return "插件正在重载，请稍后再试。"
         set_extra(event, EXTRA_SILENT, True)
+        # 这是「这一轮最终没有开口」：群里叫了她、她决定不理，与巡检自己判沉默
+        # 是同一件事，同样要让该会话冷却，否则下一段闲聊会立刻把她重新拽进判定。
+        # 私聊由 `enter_cooldown` 内部挡掉；@ 与名字提及属于群聊，照常冷却。
+        try:
+            await self.patrol.enter_cooldown(
+                event.unified_msg_origin or "", "主脑决定本轮不发言"
+            )
+        except Exception as error:
+            logger.debug("[什亭之枢] 进入巡检冷却失败: %s", error)
         logger.info("[什亭之枢] 主脑决定本轮不发言 | %s", event.unified_msg_origin)
         return "已决定本轮保持沉默，不会发送任何消息。"
 

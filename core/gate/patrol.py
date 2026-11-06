@@ -20,11 +20,14 @@
 - 窗口内出现新消息时，旧事件以 KILL 结束，仅最后一条事件持有窗口，
   同时把静默计时重置为完整窗口。
 - 窗口安静满 `patrol_window_seconds` 后判定一次。持续发言时不封顶判定，
-  只在真正无人说话时才询问模型。
+  只在真正无人说话时才询问模型。**开口之后同样要重新等满一个窗口**：
+  她说完一句，下一句仍要等对话再次安静，不会因为「刚说过话」就立刻判定。
 - 判定为不回复 → 该会话进入 `patrol_cooldown_seconds` 冷却期，冷却期内不开启窗口。
 - 判定为回复 → 放行最后一条事件。被 KILL 的消息仍记录在账本中，主脑通过全局时间线读取完整对话。
-- 开口后**不设冷却**：下一条消息立刻重新开窗，连续对话不会在她第一次开口后断掉。
-  冷却只有一种，就是「判为不回复」之后的静默期。
+- **开口本身不写冷却**：判定只说「值得接」，真正决定说不说的是主脑。主脑随后
+  调用 `stay_silent` 收回发言时，才由 `enter_cooldown()` 让该会话进入冷却——
+  「巡检判了沉默」与「主脑决定不说」是同一件事的两个环节，都算沉默。
+- 冷却只挡**普通群消息**：@、私聊与文本里提到名字都能穿透，仍会开窗。
 - 窗口正文包含**她紧邻的上一句话**：判定看到的是「她说 → 对方回」的完整来回，
   按发生顺序排列，顺序本身说明关系，不额外加提示词。
 
@@ -60,6 +63,7 @@ from astrbot.api import logger
 from ..common.event_utils import (
     EXTRA_JUDGE_REASON,
     is_placeholder_only,
+    is_private_chat,
     set_extra,
 )
 from ..memory.ledger import format_message_line
@@ -93,6 +97,9 @@ class PatrolRecord:
     # 窗口首次开启时刻。续窗时保持不变，作为本次判定取样起点的基准：
     # 连续发言被拆成多个窗口时，判定仍能看到整段对话。
     opened_at: float
+    # 计时轮次。顺延窗口时递增，旧计时任务据此识别自己已过期：
+    # 只靠 `cancel()` 不够——已睡醒、正在等锁的旧任务取消不掉。
+    epoch: int = 0
     timer: asyncio.Task | None = None
     # 静默窗口（私聊防抖 / 群内 @）：到期直接放行，不调用模型、不进入冷却。
     silent: bool = False
@@ -157,8 +164,9 @@ class PatrolManager:
         self._records: dict[str, PatrolRecord] = {}
         # 正在判定中的会话：跨 await 的判定必须串行，避免两轮判定并发读写同一段账本
         self._judging: set[str] = set()
-        # 判为不回复后的冷却：完全关掉该会话的判定。开口不设冷却，
-        # 她说完一句之后下一句话立刻就能重新开窗（见 `hold`）。
+        # 判为不回复后的冷却：完全关掉该会话的判定。开口不写冷却——
+        # 她说完一句之后，新消息照常开窗，只是要重新等满一个窗口
+        # （见 `note_spoke`）。
         self._cooldown_until: dict[str, float] = {}
         # 最近一次判定（每个会话一条），供页面排障
         self._last_decisions: dict[str, dict] = {}
@@ -247,10 +255,12 @@ class PatrolManager:
                 blocked.set_result(KILL)
                 return blocked
 
-            # 冷却期内不开普通巡检窗口；静默窗口（@ / 私聊）不受冷却限制。
-            # 冷却只有一种：**上一轮判为不回复**。她开口过不构成冷却，
-            # 下一句照样立刻开窗——否则一问一答会在她第一次开口后断掉。
-            if not silent and existing is None:
+            # 冷却期内不开普通巡检窗口。能穿透冷却的是「有人明确在叫她」：
+            # 静默窗口（@ / 私聊）与文本里提到了名字。@ 与私聊本来就要回，
+            # 提及则至少值得再问一次模型——把人叫了名字却完全不理，比多说一句更糟。
+            # 冷却只挡没人叫她的普通群消息。冷却只有一种来源：**这一轮最终沉默**
+            # （巡检判了不回复，或主脑判定开口后用 `stay_silent` 收回）。
+            if not silent and not mention and existing is None:
                 if self._cooldown_until.get(chat_id, 0.0) > now:
                     logger.debug("[什亭之枢] 巡检冷却中，拦下 | %s", chat_id)
                     self._remember(
@@ -260,8 +270,12 @@ class PatrolManager:
                         judged=False,
                     )
                     return None
-                # 过期的记录顺手清掉，避免计时字典随会话数无限增长
-                self._cooldown_until.pop(chat_id, None)
+
+            # 走到这里就是要开新窗口：上一轮留下的冷却到此为止。
+            # 穿透冷却的那一句已经开过窗（她可能已经回话），残留的冷却不能再挡
+            # 紧跟着的闲聊，否则表现为「叫了她、她答了，下一句又不理」。
+            # 顺带清掉过期记录，避免计时字典随会话数无限增长。
+            self._cooldown_until.pop(chat_id, None)
 
             if existing is not None:
                 # 旧事件 KILL，只留最后一条持有窗口
@@ -288,7 +302,7 @@ class PatrolManager:
                 mention=keep_mention,
                 deadline=now + delay,
             )
-            record.timer = asyncio.create_task(self._timer(record))
+            record.timer = asyncio.create_task(self._timer(record, record.epoch))
             self._records[chat_id] = record
             logger.debug(
                 "[什亭之枢] %s %s | %s | 等待%.1fs",
@@ -311,6 +325,86 @@ class PatrolManager:
         timers = [record.timer for record in records if record.timer]
         if timers:
             await asyncio.gather(*timers, return_exceptions=True)
+
+    async def enter_cooldown(
+        self,
+        chat_id: str,
+        reason: str = "主脑决定本轮不发言",
+        *,
+        mention: bool = False,
+    ) -> None:
+        """让该会话进入巡检冷却：这一轮最终没有开口。
+
+        巡检判「开口」只说明值得接，真正说不说由主脑决定。主脑调用
+        `stay_silent` 收回发言时，从群友的视角看就是「叫了她、她没理」，
+        与巡检自己判沉默没有区别，因此同样要进入冷却——否则会被立刻
+        重新开窗，下一段闲聊又把她拽进判定。
+
+        Args:
+            reason: 写进最近判定快照的理由，页面据此回答「为什么静默」。
+            mention: 本轮是文本提到名字，仅用于快照展示。
+        """
+        if self._closed or not chat_id:
+            return
+        # 冷却只由群聊的「说还是不说」产生：私聊的静默窗口不参与。
+        if is_private_chat(chat_id):
+            return
+        until = time.time() + self._cooldown_seconds()
+        async with self._lock:
+            self._cooldown_until[chat_id] = until
+            # 她组织语言期间进来的消息可能已经开过窗：那批消息属于「这一轮」，
+            # 冷却就要当场把它们一起挡掉，否则它们到点仍会判定一次。
+            pending = self._records.pop(chat_id, None)
+        if pending is not None:
+            self._kill(pending, "本轮最终没有开口，一起进入冷却")
+        self._remember(chat_id, "silent", reason, judged=False)
+        logger.info("[什亭之枢] 巡检判定 | %s | 沉默 | %s", chat_id, reason)
+        logger.debug(
+            "[什亭之枢] 进入巡检冷却 | %s | 冷却%.0fs | mention=%s",
+            chat_id,
+            self._cooldown_seconds(),
+            bool(mention),
+        )
+
+    async def note_spoke(self, chat_id: str) -> None:
+        """记下她刚在这个会话说过话，并把仍在等的新消息推后一个完整窗口。
+
+        开口不写冷却：她说完一句，下一句话照常判定。但她组织语言、分段发送
+        期间进来的消息往往已经开过窗，计时可能在她说完之前就到了——那会表现
+        成「她刚说完立刻又接一句」。这些窗口已经开过、改判据来不及，只能把
+        计时从此刻重新起算：判定仍要等对话重新安静满一个窗口。
+
+        只动计时，不动取样起点（`opened_at`）：她说话期间进来的消息还没被
+        判定过，把它们挪出窗口等于直接丢掉。
+        """
+        if self._closed or not chat_id:
+            return
+        now = time.time()
+        rescheduled = 0.0
+        async with self._lock:
+            record = self._records.get(chat_id)
+            # 静默窗口（@ / 私聊）等的是「对方说完」，与她说没说无关，不动。
+            if record is not None and not record.silent:
+                delay = self._window_delay()
+                deadline = now + delay
+                if float(record.deadline or 0.0) < deadline:
+                    if record.timer and not record.timer.done():
+                        record.timer.cancel()
+                    record.delay = delay
+                    record.deadline = deadline
+                    record.epoch += 1
+                    # 取消旧 timer 与新建任务之间没有 await，旧的不会插进来；
+                    # 已睡醒的旧任务靠 epoch 认出自己过期。
+                    record.timer = asyncio.create_task(
+                        self._timer(record, record.epoch)
+                    )
+                    rescheduled = delay
+        if rescheduled > 0:
+            logger.debug(
+                "[什亭之枢] 巡检窗口顺延 | %s | 她刚说完，重新等%.1fs",
+                chat_id,
+                rescheduled,
+            )
 
     # ── 内部 ──────────────────────────────────────────────
 
@@ -360,7 +454,9 @@ class PatrolManager:
             record.timer.cancel()
         record.delay = self._silent_delay(record.opened_at, now)
         record.deadline = now + record.delay
-        record.timer = asyncio.create_task(self._timer(record))
+        # 只有 cancel() 不够：已睡醒、正在等锁的旧任务取消不掉，epoch 让它自己认出过期。
+        record.epoch += 1
+        record.timer = asyncio.create_task(self._timer(record, record.epoch))
         logger.debug(
             "[什亭之枢] 静默窗口顺延 | %s | 等待%.1fs",
             record.chat_id,
@@ -397,7 +493,7 @@ class PatrolManager:
             oldest = next(iter(self._last_decisions))
             self._last_decisions.pop(oldest, None)
 
-    async def _silent_timer(self, record: PatrolRecord) -> None:
+    async def _silent_timer(self, record: PatrolRecord, epoch: int) -> None:
         """静默防抖：静默满时长后直接放行最后一条事件，不调用模型、不进入冷却。"""
         try:
             await asyncio.sleep(record.delay)
@@ -405,6 +501,9 @@ class PatrolManager:
                 current = self._records.get(record.chat_id)
                 if current is None or current.version != record.version:
                     # 已被更新的消息取代，或已被清理
+                    return
+                if record.epoch != epoch:
+                    # 计时已被顺延，这一轮作废
                     return
                 self._records.pop(record.chat_id, None)
             self._remember(
@@ -420,10 +519,10 @@ class PatrolManager:
             logger.error("[什亭之枢] 静默防抖异常，按放行处理: %s", error, exc_info=True)
             self._finish(record, PROCESS)
 
-    async def _timer(self, record: PatrolRecord) -> None:
+    async def _timer(self, record: PatrolRecord, epoch: int) -> None:
         """窗口计时；到点后占用会话做一次判定。"""
         if record.silent:
-            await self._silent_timer(record)
+            await self._silent_timer(record, epoch)
             return
         try:
             await asyncio.sleep(record.delay)
@@ -432,6 +531,10 @@ class PatrolManager:
                 current = self._records.get(record.chat_id)
                 if current is None or current.version != record.version:
                     # 已被更新的消息取代，或已被清理
+                    return
+                if record.epoch != epoch:
+                    # 计时已被顺延（她刚说完话，或静默窗口续时）：这一轮作废，
+                    # 新任务负责下一次到期。
                     return
                 if record.chat_id in self._judging:
                     # 上一轮判定尚未结束：本次窗口直接作废，不排队、不补偿。
@@ -471,8 +574,8 @@ class PatrolManager:
                 verdict = "silent"
             else:
                 verdict = "skipped"
-            # 开口不设冷却：她说完这一句，下一句话立刻就能重新开窗判定。
-            # 只有「判为不回复」才写 `_cooldown_until`（上面的分支）。
+            # 开口不写冷却：她说完这一句，下一句话照常开窗，只是要重新等满
+            # 一个窗口（`note_spoke`）。只有「判为不回复」才写 `_cooldown_until`。
             # 未调用模型就跳过（噪声预过滤 / 窗口没有新消息）只记 DEBUG，
             # 避免刷屏；真正由模型判定的沉默才记 INFO。
             log = logger.info if enter_cooldown else logger.debug
