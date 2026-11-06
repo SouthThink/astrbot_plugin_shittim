@@ -354,7 +354,12 @@ class PatrolManager:
             self._cooldown_until[chat_id] = until
             # 她组织语言期间进来的消息可能已经开过窗：那批消息属于「这一轮」，
             # 冷却就要当场把它们一起挡掉，否则它们到点仍会判定一次。
-            pending = self._records.pop(chat_id, None)
+            # 静默窗口例外——那里面是 @ 或私聊，本来就必回，不能被这一轮沉默掐掉。
+            pending = self._records.get(chat_id)
+            if pending is not None and not pending.silent:
+                self._records.pop(chat_id, None)
+            else:
+                pending = None
         if pending is not None:
             self._kill(pending, "本轮最终没有开口，一起进入冷却")
         self._remember(chat_id, "silent", reason, judged=False)
