@@ -213,3 +213,6 @@ docs/
 build/
 plan/
 
+
+# 本地排查用的临时脚本与抓取物，不进版本库
+_scratch/
