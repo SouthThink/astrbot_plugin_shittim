@@ -23,6 +23,7 @@ from astrbot.api import logger
 
 from ..common.event_utils import (
     call_str,
+    extract_at_targets,
     get_message_text,
     is_private_chat,
     is_upstream_command_event,
@@ -66,7 +67,7 @@ _WINDOW_PROMPT = """你是「{alias}」，正在「{chat_label}」。
 【这段对话】（按发生顺序）
 {content}
 
-{mention_note}【判断标准】
+{at_note}{mention_note}【判断标准】
 你要判断的不是「群里热不热闹」，而是「这段话是不是在叫我」。
 
 默认不开口。开口的前提是这段话**在内容上指向你**：
@@ -80,6 +81,7 @@ _WINDOW_PROMPT = """你是「{alias}」，正在「{chat_label}」。
 - 对方在群里自述近况、心情、抱怨——那是在说给他自己或别人听，不是在叫你；
 - 别人在群里分享情绪、报消息、聊得热闹——那是他们之间的事，不需要你表态；
 - 气氛合适、你想参与、你觉得该表示一下；
+- 这条消息 @ 的是别人或全体成员，而不是你（见上方 @ 说明）；
 - 另一个机器人/助手说的话（除非人类在问你关于它的事）；
 - 别人之间在聊，或者对方叫的是别人的名字、说完就转去跟别人说话；
 - 纯图片、纯链接、复读、表情；
@@ -100,6 +102,46 @@ _MENTION_NOTE = """【关于名字】
 - 只是在讨论：把你当例子，或在跟别人聊「智能体」「AI」这类话题 → 不回复。
 看到名字不等于必须开口；拿不准就按不回复处理。
 """
+
+
+# 窗口里出现 `[At:数字]` 时追加的事实说明。
+#
+# 这是**事实**而不是行为要求：AstrBot 把 @ 渲染成 `[At:QQ号]` 的纯文本，
+# 判定模型无从得知那一串数字是谁，于是把任何一个 @ 都当成在叫自己
+# （线上症状：「@大肥鱼 …」被当成叫她）。以前这条事实是靠人格提示词里
+# 硬编码「只有 [At:3534759795] 才算叫你」补上的——换个机器人就失效，
+# 也让人格无谓地膨胀。归属由插件算好、连同这段对话一起交过去。
+_AT_NOTE = """【这段对话里的 @】
+你自己的 QQ 是 {self_id}。上面的 `[At:数字]` 里：
+{detail}
+"""
+
+_AT_NOTE_UNKNOWN_SELF = """【这段对话里的 @】
+上面的 `[At:数字]` 是 @ 到某个具体的人，`[At:全体成员]` 是 @ 全体；
+这些文本本身没有说明是叫你，是否在叫你请按上下文判断。
+"""
+
+
+def _at_note(self_id: str, lines: list[str]) -> str:
+    """生成「这些 @ 是 @ 到谁」的事实说明；窗口里没有 @ 时不生成。"""
+    targets: list[str] = []
+    for line in lines:
+        for target in extract_at_targets(line):
+            if target not in targets:
+                targets.append(target)
+    if not targets:
+        return ""
+    if not self_id:
+        return _AT_NOTE_UNKNOWN_SELF
+    details: list[str] = []
+    for target in targets:
+        if target == self_id:
+            details.append(f"- `[At:{target}]` 是 @ 你。")
+        elif target == "全体成员":
+            details.append(f"- `[At:{target}]` 是 @ 全体，不是单独叫你。")
+        else:
+            details.append(f"- `[At:{target}]` 是 @ 别人，不是叫你。")
+    return _AT_NOTE.format(self_id=self_id, detail="\n".join(details))
 
 
 @dataclass
@@ -185,25 +227,29 @@ class DecisionEngine:
         return None
 
     def _is_at(self, event) -> bool:
-        """是否直接 @ 了自己，排除 @全体。
+        """是否直接 @ 了自己，排除 @全体、引用回复与唤醒前缀。
 
         `is_at_or_wake_command` 同时覆盖 @自己、@全体、引用回复与唤醒前缀，
-        不能直接当作「在叫自己」。有消息组件时按 `At.qq` 精确判断；取不到
-        组件时才退回唤醒标记（其他平台可能没有 At 组件）。
+        **不能**当作「在叫自己」：用它兜底会把「@别人 + 引用回复」判成被 @，
+        于是她对着别人的对话开口（线上症状：@大肥鱼 也被当成叫她）。
+
+        因此只在**拿得到消息组件**时按 `At.qq` 精确判断；拿不到组件就没有
+        可靠依据，一律判否——「该不该开口」仍由巡检窗口按内容判断，这里少判
+        一次不会让她漏听，判错一次却会让她插进别人的对话。
         """
         try:
             messages = event.get_messages() or []
         except Exception:
             messages = []
         self_id = call_str(event, "get_self_id")
-        if messages:
-            return any(
-                type(message).__name__ == "At"
-                and self_id
-                and str(getattr(message, "qq", "")) == self_id
-                for message in messages
-            )
-        return bool(getattr(event, "is_at_or_wake_command", False))
+        if not messages:
+            return False
+        return any(
+            type(message).__name__ == "At"
+            and self_id
+            and str(getattr(message, "qq", "")) == self_id
+            for message in messages
+        )
 
     def _is_named(self, text: str) -> bool:
         """文本里是否出现了智能体名称 / 唤醒词。"""
@@ -218,6 +264,7 @@ class DecisionEngine:
         lines: list[str],
         before: list[str] | None = None,
         mention: bool = False,
+        self_id: str = "",
     ) -> Decision:
         """判定一段时间内的对话是否需要接话。
 
@@ -232,6 +279,11 @@ class DecisionEngine:
         `mention=True` 表示窗口里有消息只是提到了名字。此时额外要求模型区分
         「在叫她」与「只是在讨论她 / 智能体」，后者不应回复。被 @ 的消息不走
         这条判定，由规则层直接进入静默防抖。
+
+        `self_id` 是她自己的 QQ 号。AstrBot 把 @ 渲染成 `[At:QQ号]` 的纯文本，
+        不给出归属，判定模型就会把任何一个 @ 都当成在叫自己。传进来之后，
+        窗口里每个 @ 到底是 @ 她、@ 别人还是 @ 全体，由插件作为**事实**写进
+        提示词——这条事实不该由人格提示词背下来（换个机器人就失效）。
         """
         provider = self._resolve_provider()
         if provider is None:
@@ -264,6 +316,7 @@ class DecisionEngine:
             chat_label=chat_label or "群聊",
             history=history or "（这段对话就是开头）",
             content=body,
+            at_note=_at_note(self_id, lines),
             mention_note=mention_note,
         )
 

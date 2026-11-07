@@ -63,6 +63,7 @@ from .core.common.event_utils import (
     EXTRA_LEFT_TO,
     EXTRA_MESSAGE_ID,
     EXTRA_SILENT,
+    EXTRA_TOOL_NAMES,
     call_str,
     describe_chat,
     describe_non_text,
@@ -98,6 +99,7 @@ from .core.memory.injector import (
     build_profile_block,
     build_related_block,
     build_schedule_notice,
+    build_situation_block,
     build_tool_guide_block,
     build_whereabouts_block,
 )
@@ -233,6 +235,8 @@ def _part_label(text: str) -> str:
     """按注入块自带的标签给出页面上的段落名。"""
     if "<user_profile>" in text:
         return "用户画像"
+    if "<situation>" in text:
+        return "当前处境"
     if "<own_thought>" in text:
         return "判定念头"
     if "<tool_guide>" in text:
@@ -952,7 +956,12 @@ class ShittimPlugin(Star):
             # 巡检关闭：退化为逐条判定，以账本中最新消息作为判据
             chat_label, lines, before = self._latest_window(chat_id)
             decision = await self.decider.judge_window(
-                chat_id, chat_label, lines, before=before, mention=mention
+                chat_id,
+                chat_label,
+                lines,
+                before=before,
+                mention=mention,
+                self_id=call_str(event, "get_self_id"),
             )
             if self._is_terminating:
                 return
@@ -1067,7 +1076,8 @@ class ShittimPlugin(Star):
 
     @filter.on_llm_request(priority=_PRIORITY_TOOLS)
     async def hide_builtin_send_tool(self, event: AstrMessageEvent, req):
-        """把 AstrBot 内置的 send_message_to_user 从本次请求的可用工具里摘掉。
+        """把 AstrBot 内置的 send_message_to_user 从本次请求的可用工具里摘掉，
+        并记下本轮**真正可用**的工具名。
 
         为什么必须在这一层：全局的 `provider_manager.llm_tools.remove_func()` 对
         这个内置工具无效——调用不报错，日志显示「已移除」，但模型照样能调用
@@ -1076,35 +1086,66 @@ class ShittimPlugin(Star):
         为什么必须摘掉：该工具参数写错时**不报错，而是静默把消息发到当前会话**。
         已经造成两次错发——本该发给别人的话发给了正在对话的人。它还绕过我们的
         会话解析（平台前缀修正）与焦点校验。
+
+        顺带采集工具名：注入层要据此告诉模型「本轮有没有搜索工具」。模型自己
+        看不到工具清单的全貌，只能靠猜——猜的结果就是凭印象编事实，或者声称
+        「我搜一下」却没有这个工具。这件事插件比模型清楚，就不该写进人格提示词。
         """
-        if not self.decision_config.disable_builtin_send_tool:
-            return
         try:
             func_tool = getattr(req, "func_tool", None)
-            if func_tool is None:
-                # 本次请求压根没有任何工具，无从摘除，也不算异常
-                return
-            remover = getattr(func_tool, "remove_tool", None)
-            if not callable(remover):
-                if not self._tool_removal_warned:
+            if func_tool is not None:
+                remover = getattr(func_tool, "remove_tool", None)
+                if callable(remover) and self.decision_config.disable_builtin_send_tool:
+                    remover(_BUILTIN_SEND_TOOL)
+                    if not self._tool_removal_logged:
+                        # 只报一次，既给排障一个明确信号，又不刷屏
+                        self._tool_removal_logged = True
+                        logger.info(
+                            "[什亭之枢] 已从请求工具列表中摘除内置 %s，跨会话发言统一走 say",
+                            _BUILTIN_SEND_TOOL,
+                        )
+                elif self.decision_config.disable_builtin_send_tool and not self._tool_removal_warned:
                     self._tool_removal_warned = True
                     logger.warning(
                         "[什亭之枢] 当前 AstrBot 版本不支持 req.func_tool.remove_tool，"
                         "无法摘除内置 send_message_to_user；请留意模型误用它导致错发"
                     )
-                return
-            remover(_BUILTIN_SEND_TOOL)
-            if not self._tool_removal_logged:
-                # 只报一次，既给排障一个明确信号，又不刷屏
-                self._tool_removal_logged = True
-                logger.info(
-                    "[什亭之枢] 已从请求工具列表中摘除内置 %s，跨会话发言统一走 say",
-                    _BUILTIN_SEND_TOOL,
-                )
+                names = self._tool_names(func_tool)
+                if names is not None:
+                    set_extra(event, EXTRA_TOOL_NAMES, names)
         except Exception as error:
             if not self._tool_removal_warned:
                 self._tool_removal_warned = True
                 logger.warning("[什亭之枢] 摘除内置发送工具失败: %s", error)
+
+    @staticmethod
+    def _tool_names(func_tool) -> tuple[str, ...] | None:
+        """从本次请求的工具集里取出可用工具名；结构不认识时返回 None。
+
+        返回 None 表示**无从得知**，与空元组（确实一个工具都没有）不同：
+        前者不能下「没有搜索工具」的结论，后者可以。
+        """
+        tools = getattr(func_tool, "tools", None)
+        if not isinstance(tools, list):
+            return None
+        names: list[str] = []
+        for tool in tools:
+            if getattr(tool, "active", True) is False:
+                continue
+            name = str(getattr(tool, "name", "") or "")
+            if name:
+                names.append(name)
+        return tuple(names)
+
+    def _available_tools(self, event: AstrMessageEvent) -> set[str] | None:
+        """本轮可用工具名集合；采集不到时返回 None（调用方据此不作判断）。"""
+        names = get_extra(event, EXTRA_TOOL_NAMES, None)
+        if names is None:
+            return None
+        try:
+            return {str(name) for name in names}
+        except Exception:
+            return None
 
     @filter.on_llm_request(priority=_PRIORITY_INJECT)
     async def inject_memory_context(self, event: AstrMessageEvent, req):
@@ -1124,19 +1165,26 @@ class ShittimPlugin(Star):
 
         结果顺序即模型读取顺序：
 
-            ① 工具清单 → ② 当前说话人的画像 → ③ 话题相关召回 → ④ 永久记忆
-            → ⑤ 榜前长期记忆 → ⑥ 跨会话背景 →（原生历史/时间线）→ ⑦ 判定念头
-            → ⑧ 位置提示 → 作息事件提示
+            ① 工具清单 → ② 当前处境 → ③ 当前说话人的画像 → ④ 话题相关召回
+            → ⑤ 永久记忆 → ⑥ 榜前长期记忆 → ⑦ 跨会话背景 →（原生历史/时间线）
+            → ⑧ 判定念头 → ⑨ 位置提示 → 作息事件提示
         """
         chat_id = event.unified_msg_origin or ""
         try:
             # 工具清单是稳定参考，放最前；越靠近末尾的越该是本轮独有的内容。
             # 记忆关闭时也要注入——它讲的是「你能做什么」，与记忆无关。
-            guide = build_tool_guide_block()
+            available = self._available_tools(event)
+            guide = build_tool_guide_block(available)
+            # 当前处境紧跟在能力之后：她在哪儿、她是谁、手上的东西是什么性质。
+            situation = self._situation_block(event, available)
             if self._memory_active():
-                self._inject_memory_blocks(event, req, chat_id, guide=guide)
+                self._inject_memory_blocks(
+                    event, req, chat_id, guide=guide, situation=situation
+                )
             else:
-                self._append_temp_parts(req, [guide])
+                self._append_temp_parts(
+                    req, [block for block in (guide, situation) if block]
+                )
 
             # 判定念头独立于记忆系统：它解释的是「这一轮为什么被放行」。
             self._inject_judge_thought(event, req)
@@ -1154,6 +1202,40 @@ class ShittimPlugin(Star):
             # 快照只复制、不修改请求，失败也不影响本轮。
             self._capture_context_snapshot(event, req, chat_id)
 
+
+    def _situation_block(
+        self, event: AstrMessageEvent, available: set[str] | None
+    ) -> str:
+        """本轮「她在哪儿、她是谁、手上的东西是什么性质」的事实块。
+
+        只递事实、不写准则：这些信息以前是写进人格提示词里的（硬编码自己的
+        QQ 号、提醒「私聊里也能处理群里的请求」、提醒「图片转述只是参考」），
+        换一个机器人或换一个群就全部失效，而且让人格无谓地膨胀。
+
+        `available` 为 None 表示拿不到工具清单，此时不下「有没有搜索工具」的
+        结论——说错比不说更糟。
+        """
+        chat_id = event.unified_msg_origin or ""
+        try:
+            chat_kind, chat_label = describe_chat(event)
+        except Exception:
+            chat_kind, chat_label = "", ""
+        private = chat_kind == "private" if chat_kind else is_private_chat(chat_id)
+        group_id = "" if private else call_str(event, "get_group_id")
+        has_search = None if available is None else self._has_search_tool(available)
+        return build_situation_block(
+            chat_label=chat_label or self.short_term.label_for_chat(chat_id),
+            chat_id=chat_id,
+            self_id=call_str(event, "get_self_id"),
+            group_id=group_id,
+            is_private=private,
+            has_search=has_search,
+        )
+
+    @staticmethod
+    def _has_search_tool(available: set[str]) -> bool:
+        """本轮工具里是否有搜索类工具（按名字含 search 判断）。"""
+        return any("search" in str(name).lower() for name in available)
 
     def _inject_judge_thought(self, event: AstrMessageEvent, req) -> None:
         """把巡检「为什么值得接」作为念头追加进本轮请求。
@@ -1253,15 +1335,24 @@ class ShittimPlugin(Star):
         return [item.memory for item in recalled]
 
     def _inject_memory_blocks(
-        self, event: AstrMessageEvent, req, chat_id: str, *, guide: str = ""
+        self,
+        event: AstrMessageEvent,
+        req,
+        chat_id: str,
+        *,
+        guide: str = "",
+        situation: str = "",
     ) -> None:
         """注入记忆块；接管模式下重建时间线，否则追加临时内容块。
 
-        `guide` 是工具清单：它排在所有记忆块之前，作为稳定的能力参考。
+        `guide` 是工具清单、`situation` 是当前处境：它们排在所有记忆块之前，
+        作为稳定的能力与位置参考。
         """
         blocks: list[str] = []
         if guide:
             blocks.append(guide)
+        if situation:
+            blocks.append(situation)
 
         # ① 当前说话人的画像：让她知道「现在是谁在跟她说话」。
         #    放在最前，因为它决定其余记忆的解读角度（谁的兴趣、谁的观点）。

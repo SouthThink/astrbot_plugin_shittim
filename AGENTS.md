@@ -148,7 +148,7 @@ pages/memory/   记忆页面
 | `core/memory/store.py` | 位置榜、召回打分、等级推导、遗忘请求 | 榜序 `_BOARD_ORDER` 与分档常量在顶部；等级一律用 `curation_level(rank, total)` 推导，不要新增「等级」列；`promoted_at` 是入榜位置，`created_at` 是产生时间，两者不可混用 |
 | `core/memory/maintenance.py` | 压缩 / 树状收口 / 降级 / 遗忘 / 晋升 / 合并 | `run()` 不含收口与清空，那两步在 main；摘要长度常量在文件顶部 |
 | `core/memory/profile.py` | 用户画像的存储与整理更新 | 身份是 `user_id`（QQ 号），`platform` 只是来源标记；名字在 `user_ledger`（按 `user_id` 跨平台合并），画像只存印象；素材含长期 / 永久记忆，被完整吸收的条目会删除（`manual=1` 除外）；输出整体替换；更新必须在短期收口之前 |
-| `core/memory/injector.py` | 工具清单 / 画像 / 相关召回 / 记忆注入块 / 判定念头 / 位置提示 + 作息事件提示 | 只负责「长什么样」，「放哪里」在 main；`_TOOL_GUIDE` 必须与 `main.py` 的工具同步 |
+| `core/memory/injector.py` | 工具清单 / 当前处境 / 画像 / 相关召回 / 记忆注入块 / 判定念头 / 位置提示 + 作息事件提示 | 只负责「长什么样」，「放哪里」在 main；`_TOOL_GUIDE` 必须与 `main.py` 的工具同步；`build_tool_guide_block(available)` 与 `build_situation_block()` 只写**事实**（本轮有哪些工具、在哪个会话、自己的账号），行为准则留在人格提示词 |
 | `core/memory/timeline.py` | 账本条目 → `req.contexts`（仅接管模式） | 默认不参与；摘要包 `<earlier_summary>`；每条都要 `_no_save` |
 | `core/memory/history.py` | 坏图摘除 | 只做「确定读不到的图片引用」，别恢复官方历史回填 |
 | `core/memory/vision.py` | 图片转文字 | 引用必须当场取出，临时文件会失效 |
@@ -169,7 +169,8 @@ pages/memory/   记忆页面
 
 **记忆**
 
-- 调整注入顺序 → `main.inject_memory_context()`：工具清单 → 说话人画像 → 话题相关召回 → 永久记忆 → 榜前长期记忆 →（跨会话近况）→（原生历史 / 时间线）→ 判定念头 → 位置提示 → 作息事件提示。默认走 `_append_temp_parts()` 追加临时块；`context_takeover=True` 时才整体替换 `req.contexts`。
+- 调整注入顺序 → `main.inject_memory_context()`：工具清单 → 当前处境 → 说话人画像 → 话题相关召回 → 永久记忆 → 榜前长期记忆 →（跨会话近况）→（原生历史 / 时间线）→ 判定念头 → 位置提示 → 作息事件提示。默认走 `_append_temp_parts()` 追加临时块；`context_takeover=True` 时才整体替换 `req.contexts`。
+- 调整「她知道自己在哪儿」→ `main._situation_block()` + `injector.build_situation_block()`（`<situation>`）。这里只放**事实**（会话标签与群号、自己的 QQ、图片/转发是转述、本轮有无搜索工具），不放行为准则。判定层同理：`engine.judge_window(self_id=...)` 把 `[At:数字]` 的归属写进 `_WINDOW_PROMPT` 的 `{at_note}`。**这些事实一旦下沉到插件，就不要写回人格提示词**——写回去等于把同一个补丁维护两遍，换机器人就失效。
 - 调整主脑自动相关召回 → `main._related_memories()`；条数是 `memory.auto_recall_top_k`（0 = 关闭），独立预算是 `auto_recall_token_budget`，阈值复用 `recall_min_score`。它不改变榜序，只有主动 `recall` 才计数。
 - 调整跨会话连续性 → `main._cross_session_block()` + `ledger.timeline_entries_balanced()` + `timeline.build_timeline_block()`；配额是 `memory.short_term_context_*`，预算沿用 `timeline_token_budget` / `timeline_max_messages`。
 - 调整时间线（仅接管模式）→ `memory/timeline.py` 的 `build_timeline()` 与 `ledger.timeline_entries()`；预算是 `memory.timeline_token_budget` / `timeline_max_messages`。

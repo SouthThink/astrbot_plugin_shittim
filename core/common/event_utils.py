@@ -35,6 +35,9 @@ EXTRA_SILENT = "shittim_silent"
 # 巡检判定为「开口」时的理由：注入主脑时当作它自己刚冒出的念头，
 # 避免主脑把它当成另一个人说的话而开始「和巡检聊天」。
 EXTRA_JUDGE_REASON = "shittim_judge_reason"
+# 本轮请求实际可用的工具名（由摘除内置发送工具的处理器顺带采集，供工具清单
+# 与「当前处境」判断有没有搜索工具）。值为 tuple[str, ...]。
+EXTRA_TOOL_NAMES = "shittim_tool_names"
 
 
 def call_str(event, method_name: str, default: str = "") -> str:
@@ -113,6 +116,22 @@ def is_placeholder_only(text: str) -> bool:
 def is_private_chat(chat_id: str) -> bool:
     """unified_msg_origin 形如 platform:MessageType:session_id。"""
     return "FriendMessage" in (chat_id or "")
+
+
+# AstrBot 把 At 组件转成 `[At:3534759795]` / `[At:全体成员]` 这样的纯文本
+# （`astr_message_event._outline_chain`）。判定层与注入层都只能看到这个文本，
+# 若不把「谁是你」一并给出，模型会把任何一个 `[At:数字]` 都当成在叫自己。
+_AT_RE = re.compile(r"\[At:([^\]\s]+)\]")
+
+
+def extract_at_targets(text: str) -> list[str]:
+    """取出文本里所有 @ 目标（QQ 号或「全体成员」），按出现顺序去重。"""
+    targets: list[str] = []
+    for match in _AT_RE.findall(text or ""):
+        value = match.strip()
+        if value and value not in targets:
+            targets.append(value)
+    return targets
 
 
 def platform_of(event) -> str:

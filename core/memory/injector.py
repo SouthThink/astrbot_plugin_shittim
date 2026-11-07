@@ -267,6 +267,7 @@ _TOOL_GUIDE = """下面这些工具由你自己调用，不需要征求同意；
 【说】
 - say：在某个会话里说一句，说完你就「在」那里了。第一次去某个会话只把近况给你看、不发送，确认后带 force=true 再调一次。
 - stay_silent：这一轮不发言，把已经想好的话丢掉；这个群随后安静一阵，只有被 @ 或叫名字才会再叫醒你。
+  不想说话就调用它，**不要用文字表示沉默**——不要发「（保持安静）」「（不发言）」这类话。
 
 【记】
 - remember：记下值得长期保存的事，写入永久记忆。
@@ -276,20 +277,131 @@ _TOOL_GUIDE = """下面这些工具由你自己调用，不需要征求同意；
 【作息】
 - delay_sleep：今晚晚点睡，只对今晚有效。
 
+调用工具是内部动作：直接调用，不要用文字预告或复述过程（不写「让我查一下」「已调用工具」），也不要把思考过程说给别人听。
+做完再说结果；没真的调用就不要说「我这就去」「已经好了」。
+工具报错最多重试一次，不要连着调同一个失败的工具。
+
 几种常见组合：
 - 去别处说话：list_sessions → enter_session（或 peek_session）→ say。
 - 想核实旧事：recall 找细节，search_history 找原话；两者都查不到就别编。
 - 只是看着、插不上话：leave_session 或 rest，不要硬接。"""
 
+# 群管理工具的用法，仅在真的具备这两个工具时才追加。
+#
+# 人格提示词里曾写「在私聊里说你做不了是错的，先进群再试一次」——这是在给
+# admin_tools 的一个实现细节打补丁：它的 `set_group_ban(group_id="", ...)` 会先取
+# 参数、取不到再回退到 `event.get_group_id()`，私聊里回退为空，于是报「请提供
+# 目标群号 group_id，或到群聊里操作」。工具本身没毛病，缺的是「该填哪个群号」。
+# 群号由 <situation> 直接给出，这段只讲分工与默认值。
+_TOOL_GUIDE_GROUP_ADMIN = """
+【管】
+- set_group_ban / set_group_kick：禁言、踢人。在群里直接调；在私聊里调同样可用，
+  但要把 group_id 填成目标群号（群号见上面的当前处境）。不需要先「走进」那个群。
+- 没人说禁多久，就先用 60 秒，并说明是你先这么定的；工具返回的时长以它为准。"""
 
-def build_tool_guide_block() -> str:
+# 「本轮有哪些额外的工具可用」——只写结论，不复述参数表。
+#
+# 为什么必须由插件说：模型看不到工具清单的全貌，也判断不了「我这轮到底有没有
+# 搜索能力」，于是要么凭印象编事实，要么声称「我搜一下」却并没有这个工具。
+# 这两种毛病以前是靠人格提示词里写一大段「遇到价格就先搜」补上的。
+_SEARCH_HINT = "search"
+# 出现其中任意一个，就说明本轮可以管群，追加【管】那一段。
+_GROUP_ADMIN_TOOLS = ("set_group_ban", "set_group_kick")
+
+_TOOL_AVAIL_SEARCH = (
+    "本轮你还有搜索工具可用（{names}）：遇到价格、版本、新闻、参数、活动时间这类"
+    "可能过时的事实，先查再答。"
+)
+_TOOL_AVAIL_NO_SEARCH = (
+    "本轮你没有搜索工具。查不到或不确定的事，直接说不知道，"
+    "不要凭印象编，也不要声称「我搜一下」。"
+)
+
+
+def build_tool_guide_block(available: set[str] | None = None) -> str:
     """返回工具清单块（稳定文本，每轮注入）。
 
     内容是「怎么用」而不是参数表：参数已经在函数声明里，重复列一遍只是浪费
     token。稳定文本放最前，越靠近末尾的越该是本轮独有的内容（判定念头、
     位置提示、作息提示）。
+
+    `available` 是本轮该请求**实际可用**的工具名集合；传 None 表示调用方拿不到
+    清单（旧版本 AstrBot），此时不加任何可用性结论，避免说错。群管理那一段
+    同样按实际工具决定是否出现——没装 admin_tools 时不该提它。
     """
-    return "\n".join([_TOOL_GUIDE_OPEN, _TOOL_GUIDE, _TOOL_GUIDE_CLOSE])
+    lines = [_TOOL_GUIDE_OPEN, _TOOL_GUIDE]
+    if available is not None:
+        if any(name in available for name in _GROUP_ADMIN_TOOLS):
+            lines.append(_TOOL_GUIDE_GROUP_ADMIN)
+        search_tools = sorted(name for name in available if _SEARCH_HINT in name.lower())
+        if search_tools:
+            lines.append(_TOOL_AVAIL_SEARCH.format(names="、".join(search_tools)))
+        else:
+            lines.append(_TOOL_AVAIL_NO_SEARCH)
+    lines.append(_TOOL_GUIDE_CLOSE)
+    return "\n".join(lines)
+
+
+# ── 当前处境（会话、身份、可用上下文的事实）──────────────────
+
+_SITUATION_OPEN = "<situation>"
+_SITUATION_CLOSE = "</situation>"
+
+
+def build_situation_block(
+    *,
+    chat_label: str,
+    chat_id: str = "",
+    self_id: str = "",
+    group_id: str = "",
+    is_private: bool = False,
+    has_search: bool | None = None,
+) -> str:
+    """说明她此刻身处何处、以什么身份、手上有什么。
+
+    这里只放**事实**，不放行为准则——「该不该说、怎么说」属于人格提示词。
+    每条事实都对应一个曾经写进人格提示词的补丁：
+
+    - **会话与群号**：人格里曾写「你在私聊也能处理群里的请求，不要说做不了」，
+      真正的原因是群管理工具需要显式 `group_id`，而模型不知道自己身在哪个群。
+      把位置与群号给出来，这条规则就不必再背在人格里。
+    - **自己的 QQ**：人格里曾硬编码「爱丽丝的 QQ 是 3534759795。只有
+      `[At:3534759795]` 才算叫你」；归属已由判定层直接给出（见
+      `engine.judge_window` 的 `self_id`），这里只是让主脑也知道自己是谁。
+    - **图片与转发的文字是转述**：人格里曾写「别人发图，图片转文字只是参考，
+      没被问就不要解释图」。转述本身没有署名，模型分不清「这是转述」还是
+      「有人这么说了」，于是把图片内容当成话题去接。
+    - **搜索能力**（`has_search`）：人格里曾写「遇到价格、新闻、版本就先搜」
+      「没有搜索工具也不要假装搜过」。本轮有没有搜索工具，插件比模型清楚，
+      所以由插件直接说明，人格不必再操心。
+    """
+    head: list[str] = []
+    where = (chat_label or "").strip() or "某个会话"
+    if is_private:
+        head.append(f"你现在在「{where}」——这是私聊。")
+    else:
+        head.append(f"你现在在「{where}」——这是群聊。")
+    if group_id:
+        head.append(f"这个群的群号是 {group_id}；要在这个群里做禁言、踢人这类操作，"
+                    "把 group_id 填成它。")
+    elif is_private and chat_id:
+        head.append("你人在私聊里。群里的事照样能做：调用群管理工具时把 group_id "
+                    "填成目标群号即可，不需要先「走过去」。")
+    if self_id:
+        head.append(f"你自己（机器人账号）的 QQ 是 {self_id}。")
+
+    hints = [
+        "别人发的图片只在账本里留成一句转述（「图片内容：…」），那是旁人对画面的描述，"
+        "不是他说的原话，也不是新收到的消息。",
+        "合并转发里的内容同理，是转述不是原文。",
+    ]
+    if has_search is True:
+        hints.append("本轮你有搜索工具，可以查证。")
+    elif has_search is False:
+        hints.append("本轮你没有搜索工具，不确定的事就说不知道，别声称搜过。")
+
+    lines = [*head, "", *hints]
+    return "\n".join([_SITUATION_OPEN, *lines, _SITUATION_CLOSE])
 
 
 # ── 判定理由（当作主脑自己的念头）──────────────────────────

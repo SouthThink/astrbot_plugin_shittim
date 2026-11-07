@@ -62,6 +62,7 @@ from astrbot.api import logger
 
 from ..common.event_utils import (
     EXTRA_JUDGE_REASON,
+    call_str,
     is_placeholder_only,
     is_private_chat,
     set_extra,
@@ -689,6 +690,9 @@ class PatrolManager:
             lines,
             before=before,
             mention=record.mention,
+            # 判定模型只能看到 `[At:数字]` 这串文本，必须由这里告诉它谁是自己，
+            # 否则它会以为任何一个 @ 都是在叫它。
+            self_id=call_str(record.event, "get_self_id"),
         )
         # 技术性失败（超时 / 异常 / 解析失败）不进入冷却：上游抖动不应让群聊静默。
         return (
