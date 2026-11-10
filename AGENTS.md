@@ -15,10 +15,10 @@
 
 ```
 core/
-├── common/     通用基础设施：配置、数据库、事件取值、时间与分词、模型 JSON 解析
+├── common/     通用基础设施：配置、数据库、事件取值、时间与分词、模型 JSON 解析、时间词换算
 ├── gate/       拦放链路：决断层 engine.py + 群聊巡检 patrol.py
 ├── focus/      焦点链路：manager.py
-├── memory/     记忆链路：ledger / extractor / store / maintenance / profile
+├── memory/     记忆链路：ledger / extractor / store / maintenance / profile / stance
 │               / timeline / injector / history / vision / forward
 └── schedule/   作息链路：state.py
 
@@ -85,13 +85,36 @@ pages/memory/   记忆页面
 
 ### 3.4 记忆链路
 
-`ledger`（账本）→ `extractor`（`condense` 压缩、`merge` 合并、`build_profile` 画像）→ `store`（位置榜 / 召回 / 晋升）→ `maintenance`（收口 / 降级 / 遗忘 / 晋升 / 合并），`profile` 负责用户画像的存储与整理更新。主脑上下文默认沿用 AstrBot 原生按会话历史，注入拼装走 `injector`，时间线仅在接管模式下由 `timeline` 从账本重建，图片经 `vision` 转述、合并转发经 `forward` 取回，坏图摘除在 `history`。
+`ledger`（账本）→ `extractor`（`condense` 压缩、`merge` 合并、`build_profile` 画像）→ `store`（位置榜 / 召回 / 晋升）→ `maintenance`（收口 / 降级 / 遗忘 / 晋升 / 合并），`profile` 负责用户画像的存储与整理更新，`stance` 负责「对人对事的看法」，`timeexpr` 把中文时间词换算成日期区间。主脑上下文默认沿用 AstrBot 原生按会话历史，注入拼装走 `injector`，时间线仅在接管模式下由 `timeline` 从账本重建，图片经 `vision` 转述、合并转发经 `forward` 取回，坏图摘除在 `history`。
+
+**记忆分三层，缺一层就不像人**：`memories` 存「发生过什么」（陈述 + 原话），`stances` 存「她怎么看」（第一人称看法），`user_profiles` 存「她认识的这个人」（观察 + 态度 + 关系三维）。三者不是同一种数据的三种视图，而是三套不同的生命周期：
+
+| 层 | 主体 | 会不会消失 | 怎么变 |
+| --- | --- | --- | --- |
+| 记忆 | 事件 / 人 / 话题 | 会（榜尾遗忘） | 被召回上浮、被降级压缩、被遗忘 |
+| 态度 | 人 / 事（`subject_type`+`subject_key`） | **不会删除**，只淡化 | 同主体同维度只有一行，新证据**改写**并 `revision+1` |
+| 画像 | 一个 `user_id` | 手工可删 | 整理时整体替换，关系维度缓慢回归 |
+
+- **态度没有「强度阈值」只有「证据数」**：`StanceStore.apply()` 里置信度由 `_confidence_cap(evidence_count)` 推导，模型给的 `confidence` 不作数——这就是「一次情绪不算立场」的落点。强度按 `_blend = 0.6*new + 0.4*old` 融合，`effective_intensity()` 再按 45 天半衰期往 `_INTENSITY_FLOOR=0.15` 回落；**落库值不动**，回落是算出来的，所以「她最近不太提这事了」不需要写回数据库。
+- **`basis_quote` 为空的态度直接丢弃**（`_normalize_stance()`）。没有原话支撑的看法是模型编的，不是她形成的。
+- **`subject_type='user'` 必须映射到 `user_id`**：`apply(items, name_to_id=...)` 里映射不到就跳过。按名字建行会让同一个人长出几条互不相干的态度，改名后还会再长一条。
+- **态度与记忆不共用一个打分**：`store._score()` 是连乘 `相关度 × (0.5 + 0.5×intensity) × 时间衰减`，相关度为 0 就整条为 0。**不要改回加权和**——加权和允许「不相关但很新」靠 0.15 混进上下文，这正是旧版联想看起来很蠢的原因。
+- **画像的「观察」与「态度」分开写**：`summary` 是第三人称客观描述，`stance` 是第一人称看法，两者允许互相矛盾（这恰恰是对的：她可能一边清楚这个人很靠谱、一边不喜欢跟他说话）。`dimensions` 三个键 `familiarity` / `trust` / `closeness` 走 `merge_dimensions()` 的 `0.35*new + 0.65*old`，**注入侧只翻成词、不给数值**（`describe_relation()`）——把 0.73 递给模型，它会照着这个数字表演。三个维度都还在种子值附近时返回空串，刚认识的人不需要一段关系描述。
+
+**时间词由插件算，不当关键词**：`core/common/timeexpr.py` 的 `best_time_hint()` 产出 `TimeHint(start, end, label, explicit)` 区间，`strip_time_phrases()` 把时间词从检索文本里剥掉。**时间不能进倒排索引**：`2026-11-10` 会被 2-gram 切成碎片，而 `_CONDENSE_PROMPT` 本来就不要求正文写日期，索引里根本没有。检索时它是 `WHERE covered_date IN (...)` 条件，走 `store._rank_by_time()`，`channel="time"`。
+
+- **日界＝自然日，不做 04:00 偏移**：凌晨两点说的「昨天」含十小时前的傍晚，往后挪反而指错。
+- **`covered_date` 与 `promoted_at` 不同**：`covered_date` 是「这段对话发生在哪天」（取自 `condense_context()` 的 `covered_at`），`promoted_at` 是「入榜位置」，会被召回推到当下。按时间找旧事必须用前者。`_backfill_covered_date()` 只回填空串行，幂等。
+- **区间要限宽**：`store._days_of()` 只取最后 `_MAX_TIME_DAYS=7` 天——说「前阵子」时更可能指最近几天，整段取回会把上下文塞满。
 
 **主脑上下文默认不接管**：`memory.context_takeover=False`（默认）时 `on_llm_request` **不修改 `req.contexts`**，工具清单、说话人画像、话题相关召回、记忆块、跨会话背景（`<cross_session_timeline>`）与作息提示经 `req.extra_user_content_parts` 以 `TextPart(...).mark_as_temp()` 追加，仅本轮可见、不写持久历史，也不会破坏原生前缀缓存。跨会话背景由 `ledger.timeline_entries_balanced()` 取样：每个会话保留最近 `short_term_context_per_chat` 条、纳入最近 `short_term_context_chats` 个会话，**当前会话始终入选且其 `gated=1` 消息全量保留**（这些消息没进官方历史），活摘要也一并保留；原生历史为空时 `include_current=True` 兜底。开启接管后才由 `timeline.build_timeline()` 把账本（`archived_at = 0 AND condensed_at = 0 AND staged = 0`）加活着的摘要渲染成 `req.contexts`——她说过的话是 `assistant`（只放原话），别人的话是 `user`（带 `[会话标签] 发言人 (绝对时间戳):`），摘要用 `<earlier_summary>` 包裹，末尾标明「你现在在跟谁说话」。此时 AstrBot 的原生按会话历史被整体丢弃（`_rebuild_timeline()`）。数据源只覆盖**今天**，超预算从**最旧的**开始丢。
 
 **用户画像以 QQ 号（`user_id`）为身份**：`profile.py` 的 `ProfileStore` 只负责印象（描述 / 关键词 / 更新节拍），名字由 `user_ledger.user_names` 实时累积——两者分开，改名只更新名字列表，不触发画像重写。**不能用 `(platform, user_id)` 做身份**：`platform` 取自 `unified_msg_origin` 首段（平台实例 ID），同一个 QQ 在群聊与私聊、或两套机器人配置下会落到不同实例上，按平台分行就会长出两份画像；`platform` 只作「首次来自哪里」的来源标记。启动时 `_backfill()` 会补空行并把同 `user_id` 的历史重复行并成一行（发言数累加、时间取极值、保留已有印象的那份），名字读取由 `_names()` 按 `user_id` 跨平台合并。`ProfileMaintainer` 在 `MemoryMaintainer.run()` 之后、短期收口**之前**运行：只处理 `profile_window_hours` 内活跃的人，且自 `profiled_at` 之后新增发言达到 `profile_min_messages` 条才调用模型，单次最多 `profile_max_users_per_run` 人。素材有两路：`ledger.user_messages_since()` 的最近发言，以及 `store.memories_of_user()` 取回的**长期 / 永久记忆**——很多认知早已不在短期账本里（被压缩、被清空），只喂发言会让画像反复从头建立。模型输出**完整的新描述 + 新关键词**（整体替换），因此「删除」就是新列表里不再出现它；同时输出 `absorbed`（内容已被新画像完整覆盖、不再有独立价值的记忆编号），由 `_absorb()` 删除这些记忆，跳过 `manual=1`（明确要求记住的）与本次未提交给模型的条目。失败不写 `profiled_at`，下一轮重试，旧画像保持不变。画像块由 `injector.build_profile_block()` 生成，注入时排在最前，只作背景、不得复述。
 
-**主脑每轮还会做一次话题相关召回**：`main._related_memories()` 用当前消息（为空时退回本会话近期文本）调用 `MemoryStore.recall()`，取 `auto_recall_top_k` 条，使用独立预算 `auto_recall_token_budget`，并排除已在永久段 / 榜前正文 / 索引里的条目。它**不调用 `mark_recalled()`**：自动注入若计数，榜前条目会因反复参与而自我强化。只有主动 `recall`、且 message 通道命中分数 ≥ `recall_min_score` 时才计入召回次数并上浮榜序。
+**主脑每轮还会做一次话题相关联想**：`main._related_memories()` 用当前消息（为空时退回本会话近期文本）调用 `MemoryStore.recall()`，取 `auto_recall_top_k` 条关键词命中 + `time_recall_top_k` 条时间命中，使用独立预算 `auto_recall_token_budget`，并排除已在永久段 / 榜前正文的条目。它**不调用 `mark_recalled()`**：自动注入若计数，榜前条目会因反复参与而自我强化。只有主动 `recall`、且 message 通道命中分数 ≥ `recall_min_score` 时才计入召回次数并上浮榜序。
+
+- **时间词必须先剥掉再检索**：`strip_time_phrases(text, [hint])` 之后的文本才是关键词；把「昨天」原样丢进倒排只会在 `_STOPWORDS` 里被过滤掉，白占一次候选。
+- **同一条联想在冷却期内不重复注入**：`main._dedupe_association()` 按 `(chat_id, memory_id)` 记内存表，窗口是 `auto_recall_cooldown_seconds`（默认 1800 秒）。一轮对话里用户连发几句时，同一条记忆被翻三遍会让模型以为这件事非常重要。
 
 **新记忆的入榜位置按对话时间落**：`ledger.condense_context()` 返回 `covered_at`，`maintenance._write_condensed_memories()` 把它作为 `promoted_at`；`created_at` 仍是真实写入时间，用于遗忘的陈旧度判断。只有当天摘要（`_promote_day_summary`）与合并结果（`_apply_merge`）显式落在当下。把普通提炼结果改回 `now` 会让每晚整理把整张榜刷成「最近整理榜」。永久记忆注入另有独立预算 `permanent_token_budget`，否则永久层增长会静默挤空榜前正文与索引。
 
@@ -147,7 +170,9 @@ pages/memory/   记忆页面
 | `core/memory/ledger.py` | 账本读写、行格式化、条目查询、压缩落库、清空 | `_LIVE_SQL` 是「她此刻应该记得的」唯一表达，**新增查询必须带上它**；`format_message_line` 供判定，`format_speech` 供时间线 |
 | `core/memory/store.py` | 位置榜、召回打分、等级推导、遗忘请求 | 榜序 `_BOARD_ORDER` 与分档常量在顶部；等级一律用 `curation_level(rank, total)` 推导，不要新增「等级」列；`promoted_at` 是入榜位置，`created_at` 是产生时间，两者不可混用 |
 | `core/memory/maintenance.py` | 压缩 / 树状收口 / 降级 / 遗忘 / 晋升 / 合并 | `run()` 不含收口与清空，那两步在 main；摘要长度常量在文件顶部 |
-| `core/memory/profile.py` | 用户画像的存储与整理更新 | 身份是 `user_id`（QQ 号），`platform` 只是来源标记；名字在 `user_ledger`（按 `user_id` 跨平台合并），画像只存印象；素材含长期 / 永久记忆，被完整吸收的条目会删除（`manual=1` 除外）；输出整体替换；更新必须在短期收口之前 |
+| `core/memory/profile.py` | 用户画像的存储与整理更新 | 身份是 `user_id`（QQ 号），`platform` 只是来源标记；名字在 `user_ledger`（按 `user_id` 跨平台合并），画像只存印象；素材含长期 / 永久记忆，被完整吸收的条目会删除（`manual=1` 除外）；输出整体替换；更新必须在短期收口之前；`stance` 与 `summary` 是两回事，`dimensions` 走 `merge_dimensions()` 缓慢回归且**注入侧只翻成词** |
+| `core/memory/stance.py` | 态度的存储、融合与衰减 | 同 `(subject_type, subject_key, dimension)` 唯一；`confidence` 由证据数推导，模型给的不作数；`basis_quote` 为空的态度 `extractor` 就丢了，这里只负责不重复建行；`user` 类型必须映射到 `user_id`，映射不到就跳过 |
+| `core/common/timeexpr.py` | 中文时间词 → 日期区间（纯函数、零依赖） | 日界是自然日、**不做 04:00 偏移**；`_RULES` 的顺序即优先级，已消费的区间不再重复匹配；`best_time_hint()` 的排序键是「确切 > 模糊、窄 > 宽、长 > 短」；解析不出来就返回 `None`，上层退回关键词路 |
 | `core/memory/injector.py` | 工具清单 / 当前处境 / 画像 / 相关召回 / 记忆注入块 / 判定念头 / 位置提示 + 作息事件提示 | 只负责「长什么样」，「放哪里」在 main；`_TOOL_GUIDE` 必须与 `main.py` 的工具同步；`build_tool_guide_block(available)` 与 `build_situation_block()` 只写**事实**（本轮有哪些工具、在哪个会话、自己的账号），行为准则留在人格提示词 |
 | `core/memory/timeline.py` | 账本条目 → `req.contexts`（仅接管模式） | 默认不参与；摘要包 `<earlier_summary>`；每条都要 `_no_save` |
 | `core/memory/history.py` | 坏图摘除 | 只做「确定读不到的图片引用」，别恢复官方历史回填 |
@@ -169,7 +194,11 @@ pages/memory/   记忆页面
 
 **记忆**
 
-- 调整注入顺序 → `main.inject_memory_context()`：工具清单 → 当前处境 → 说话人画像 → 话题相关召回 → 永久记忆 → 榜前长期记忆 →（跨会话近况）→（原生历史 / 时间线）→ 判定念头 → 位置提示 → 作息事件提示。默认走 `_append_temp_parts()` 追加临时块；`context_takeover=True` 时才整体替换 `req.contexts`。
+- 调整注入顺序 → `main.inject_memory_context()` / `_inject_memory_blocks()`：工具清单 → 当前处境 → 说话人画像（含关系词）→ **她自己的态度块** → 话题相关联想 → 永久记忆 → 榜前长期记忆 →（跨会话近况）→（原生历史 / 时间线）→ 判定念头 → 位置提示 → 作息事件提示。默认走 `_append_temp_parts()` 追加临时块；`context_takeover=True` 时才整体替换 `req.contexts`。
+- 调整态度 → `core/memory/stance.py`（`apply()` 的融合与封顶、`_INTENSITY_HALF_LIFE_DAYS` 半衰期）+ `extractor._CONDENSE_PROMPT` 的【第三件：stances】段 + `injector.build_stance_block()`；开关与预算是 `memory.stance_enabled` / `stance_inject` / `stance_top` / `stance_token_budget`；页面走 `web_api.stances`（`stances/update`、`stances/delete`）。
+- 调整时间识别 → `core/common/timeexpr.py` 的 `_RULES`（顺序即优先级）；消费方是 `main.search_history`、`main.recall_memory`、`main._related_memories` 与 `store._rank_by_time()`；条数上限是 `memory.time_recall_top_k`。**新增时间说法只加规则，不要在业务层手写日期计算。**
+- 调整关系维度 → `core/memory/profile.py` 的 `DIMENSIONS` / `_DIMENSION_SEEDS` / `_DIMENSION_RATE` / `describe_relation()`；提示词侧是 `extractor._PROFILE_PROMPT` 第 7 条与 `_RELATION_DIMENSIONS`（两处必须同步）；开关是 `memory.relation_inject`。
+- 调整历史的 `until` 语义 → `ledger.search_history()`（`until=0` 不封顶）与 `ledger.count_history()`（区分「查过没有」与「没查」）。
 - 调整「她知道自己在哪儿」→ `main._situation_block()` + `injector.build_situation_block()`（`<situation>`）。这里只放**事实**（会话标签与群号、自己的 QQ、图片/转发是转述、本轮有无搜索工具），不放行为准则。判定层同理：`engine.judge_window(self_id=...)` 把 `[At:数字]` 的归属写进 `_WINDOW_PROMPT` 的 `{at_note}`。**这些事实一旦下沉到插件，就不要写回人格提示词**——写回去等于把同一个补丁维护两遍，换机器人就失效。
 - 调整主脑自动相关召回 → `main._related_memories()`；条数是 `memory.auto_recall_top_k`（0 = 关闭），独立预算是 `auto_recall_token_budget`，阈值复用 `recall_min_score`。它不改变榜序，只有主动 `recall` 才计数。
 - 调整跨会话连续性 → `main._cross_session_block()` + `ledger.timeline_entries_balanced()` + `timeline.build_timeline_block()`；配额是 `memory.short_term_context_*`，预算沿用 `timeline_token_budget` / `timeline_max_messages`。
@@ -246,6 +275,15 @@ pages/memory/   记忆页面
 **摘要不豁免清空**：「整理完短期层为空」是验收点：当天摘要已先提升为长期记忆，其余摘要与原始消息一起收口。
 
 **名次的唯一事实源是查询填的 `rank` / `rank_total`**：等级由 `curation_level()` 推导、不入库。页面、降级、遗忘都必须走 `store.board()` / `ranked()` / `list_page()`，它们才会填名次。
+
+**联想的四道闸门，缺一道她就退化成「不记得」**：旧版实测「问前几天的事，她先说不知道」的根因是工具错配 + 提示词反向劝退，不是模型懒。
+
+1. **索引段不能限死范围**：`_INDEX_HEADER` 旧写「碰到**其中任何一条**」——只列 30 条却暗示全部就这 30 条。现在 `_index_header(total)` 带上总条数，`_INDEX_HEADER_TAIL` 明说「这里只是冰山一角」。
+2. **说「不记得」之前必须先查**：`_TOOL_GUIDE` 开头那句「这是义务，不是选项」，以及结尾「查不到和没查是两回事」。
+3. **时间词交给插件**：`search_history` 的 docstring 里必须写「不需要把『昨天』当关键词填进来——填了反而查不到」，否则模型会拿时间词去 LIKE，必然 0 命中。
+4. **空结果要能区分「没有」与「没查」**：`search_history` 返回「查过了：{日期}确定没有记录。这是真的没有，不是你忘了」，`recall` 返回「这可能是真的没有，也可能换个词就想起来了」。**不要改回「没想起来相关的」**——那句话让模型学不到「查有用」。
+
+**态度的注入形态是「引子」不是「结论」**：`build_related_block()` 给的是「他上次说「随便」的时候，后来挑了很久。（你当时就觉得：这人嘴上一套）」，不是「小明是个怕担责任的人」。前者她会顺着说出来，后者她会照着念一遍。同理态度块只注入第一人称那句话，**强度与置信度不进上下文**。
 
 **人格说明在 `system_prompt`，人格预设对话在 `contexts` 最前**：本插件从不写 `req.system_prompt`；但 AstrBot 会把 `begin_dialogs` 用 `req.contexts[:0] = ...` 插到最前（每条带 `_no_save`），随后才轮到我们整体替换 `req.contexts`。所以必须先用 `_persona_dialogs()` 留下头部连续的 `_no_save` 段，否则人格示例会被静默抹掉。
 

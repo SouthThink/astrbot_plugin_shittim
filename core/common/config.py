@@ -123,6 +123,21 @@ class MemoryConfig:
     # 它不计入「被想起」，也不上浮榜序——只有主动 recall 才影响位置榜。
     auto_recall_top_k: int = 3
     auto_recall_token_budget: int = 400
+    # 同一段联想在同一个会话里这么多秒内不重复注入：否则一条消息连发几轮，
+    # 上下文里就会出现三遍一模一样的话头，模型会以为这件事很重要。
+    auto_recall_cooldown_seconds: int = 1800
+    # 时间通道最多取几条：用户说「昨天」时，那一天的记忆可能有很多条。
+    time_recall_top_k: int = 4
+
+    # ── 态度 ──────────────────────────────────────────────
+    # 她对某个人、某件事的看法。与「发生过什么」分开存：记忆会淡，
+    # 看法会被后来的证据改写，两者的寿命不一样。
+    stance_enabled: bool = True
+    stance_inject: bool = True            # 是否把她自己的态度注入主脑上下文
+    stance_token_budget: int = 300        # 态度块的 token 预算
+    stance_top: int = 6                   # 态度块最多显示几条（按强度取）
+    # 画像里的关系强度：熟悉 / 信任 / 亲近。只翻译成词注入，数值不进上下文。
+    relation_inject: bool = True
 
     # ── 维护 ──────────────────────────────────────────────
     # 只控制维护步骤（降级 / 遗忘 / 晋升 / 合并）；深睡是否整理由
@@ -196,6 +211,15 @@ class MemoryConfig:
             auto_recall_token_budget=_get_int(
                 cfg, "memory.auto_recall_token_budget", 400
             ),
+            auto_recall_cooldown_seconds=_get_int(
+                cfg, "memory.auto_recall_cooldown_seconds", 1800
+            ),
+            time_recall_top_k=_get_int(cfg, "memory.time_recall_top_k", 4),
+            stance_enabled=bool(_get(cfg, "memory.stance_enabled", True)),
+            stance_inject=bool(_get(cfg, "memory.stance_inject", True)),
+            stance_token_budget=_get_int(cfg, "memory.stance_token_budget", 300),
+            stance_top=_get_int(cfg, "memory.stance_top", 6),
+            relation_inject=bool(_get(cfg, "memory.relation_inject", True)),
             maintenance_enabled=bool(_get(cfg, "memory.maintenance_enabled", True)),
             decay_half_life_days=_get_float(cfg, "memory.decay_half_life_days", 30.0),
             promote_min_recall=_get_int(cfg, "memory.promote_min_recall", 8),

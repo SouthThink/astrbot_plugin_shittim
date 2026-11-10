@@ -241,6 +241,7 @@
       <button data-tab="long">长期记忆</button>
       <button data-tab="permanent">永久记忆</button>
       <button data-tab="profiles">用户画像</button>
+      <button data-tab="stances">她的态度</button>
       <button data-tab="runtime">巡检与焦点</button>
       <button data-tab="context">当前上下文</button>
     </div>
@@ -408,6 +409,7 @@
           ["长期记忆", data.long],
           ["永久记忆", data.permanent],
           ["用户画像", data.profiles],
+          ["态度", data.stances],
           ["关注中会话", data.focused],
         ];
         cards.forEach(([cap, num]) => {
@@ -641,6 +643,22 @@
             item.summary || "（还没有形成描述；整理记忆后会逐渐完善）";
           box.appendChild(body);
 
+          // 「她怎么看这个人」与「他是什么样的人」分开显示：前者是第一人称
+          // 的看法，后者是观察到的描述，两者可以互相矛盾，这是对的。
+          const stanceLine = document.createElement("div");
+          stanceLine.className = "caption";
+          stanceLine.textContent = item.stance
+            ? `她对他：${item.stance}`
+            : "（还没有形成明确的看法）";
+          box.appendChild(stanceLine);
+
+          if (item.relation) {
+            const relation = document.createElement("div");
+            relation.className = "tags";
+            relation.textContent = item.relation;
+            box.appendChild(relation);
+          }
+
           const words = document.createElement("div");
           words.className = "tags";
           words.textContent = (item.keywords || []).map((word) => `#${word}`).join(" ");
@@ -661,13 +679,23 @@
             foot.appendChild(line(`首次见面 ${fmtTime(item.first_seen)}`));
           }
           box.appendChild(foot);
+          // 关系三维只在页面上露数值：注入侧只翻成词（数值会被模型表演）
+          if (item.dimensions && Object.keys(item.dimensions).length) {
+            const dims = document.createElement("div");
+            dims.className = "tags";
+            const NAMES = { familiarity: "熟悉", trust: "信任", closeness: "亲近" };
+            dims.textContent = Object.entries(item.dimensions)
+              .map(([key, value]) => `${NAMES[key] || key} ${Number(value).toFixed(2)}`)
+              .join(" · ");
+            box.appendChild(dims);
+          }
           // 手工维护：描述与关键词一起改写；删除只清印象，名字与发言记录不动
           const actions = document.createElement("div");
           actions.className = "actions";
           const editButton = document.createElement("button");
           editButton.textContent = "编辑";
           editButton.addEventListener("click", () =>
-            startProfileEdit(body, words, actions, item)
+            startProfileEdit(body, words, actions, item, stanceLine)
           );
           const deleteButton = document.createElement("button");
           deleteButton.className = "danger";
@@ -679,6 +707,82 @@
           box.appendChild(actions);
           el.list.appendChild(box);
         });
+      }
+
+      // 她的态度：对人对事的第一人称看法。与记忆分开，因为它们的生命周期
+      // 不同——记忆会模糊、会被遗忘，态度只淡化、会被改写。
+      const SUBJECT_LABEL = { user: "人", topic: "事", self: "他自己" };
+
+      function renderStances(items) {
+        el.list.replaceChildren();
+        if (!items.length) {
+          el.list.appendChild(
+            emptyNode(
+              "还没有形成态度。压缩时会从「她说过什么」里提炼出对某个人、某件事的看法，聊得越多越明显。"
+            )
+          );
+          return;
+        }
+        items.forEach((item) => {
+          const box = document.createElement("div");
+          box.className = "item";
+          const meta = document.createElement("div");
+          meta.className = "meta";
+          meta.appendChild(line(item.label || item.subject_key, "who"));
+          meta.appendChild(tag(SUBJECT_LABEL[item.subject_type] || item.subject_type));
+          if (item.dimension === "relation") {
+            meta.appendChild(tag("关系"));
+          }
+          // 强度用文字给刻度：一条「有点在意」和一条「非常在意」不该看起来一样
+          meta.appendChild(tag(intensityWord(item.intensity), intensityTone(item.intensity)));
+          meta.appendChild(line(`证据 ${item.evidence_count} 次`));
+          if (item.revision > 1) {
+            meta.appendChild(line(`改过 ${item.revision - 1} 次看法`));
+          }
+          meta.appendChild(line(`最近更新 ${fmtAge(item.updated_at)}`));
+          box.appendChild(meta);
+
+          const body = document.createElement("div");
+          body.className = "body";
+          body.textContent = item.stance;
+          box.appendChild(body);
+
+          if (item.subject_type === "user" && item.subject_key) {
+            const who = document.createElement("div");
+            who.className = "tags";
+            who.textContent = `QQ ${item.subject_key}`;
+            box.appendChild(who);
+          }
+
+          const actions = document.createElement("div");
+          actions.className = "actions";
+          const editButton = document.createElement("button");
+          editButton.textContent = "编辑";
+          editButton.addEventListener("click", () => startStanceEdit(body, actions, item));
+          const deleteButton = document.createElement("button");
+          deleteButton.className = "danger";
+          deleteButton.textContent = "删除";
+          deleteButton.addEventListener("click", () => confirmDeleteStance(actions, item));
+          actions.append(editButton, deleteButton);
+          box.appendChild(actions);
+          el.list.appendChild(box);
+        });
+      }
+
+      // 强度只在页面上显示数值：注入侧只翻成词，数值会被模型表演
+      function intensityWord(value) {
+        const num = Number(value) || 0;
+        if (num >= 0.75) return "很在意";
+        if (num >= 0.5) return "比较在意";
+        if (num >= 0.3) return "有点在意";
+        return "淡了";
+      }
+
+      function intensityTone(value) {
+        const num = Number(value) || 0;
+        if (num >= 0.75) return "warn";
+        if (num >= 0.5) return "";
+        return "ok";
       }
 
       function paramBox(key, value) {
@@ -1053,21 +1157,25 @@
         });
       }
 
-      // 画像的手工维护：描述与关键词一起改。保存后整页重新拉取——关键词的
-      // 去重与顺序由后端决定，前端不自己回填。
-      function startProfileEdit(body, words, actions, item) {
+      // 画像的手工维护：描述、关键词与态度一起改。保存后整页重新拉取——
+      // 关键词的去重与顺序由后端决定，前端不自己回填。
+      function startProfileEdit(body, words, actions, item, stanceLine) {
         const editor = document.createElement("div");
         const summary = document.createElement("textarea");
         summary.value = item.summary || "";
-        summary.placeholder = "对他的印象；留空即清除描述";
+        summary.placeholder = "你观察到的他；留空即清除描述";
         const keywords = document.createElement("input");
         keywords.type = "text";
         keywords.value = (item.keywords || []).join(" ");
         keywords.placeholder = "关键词，用空格或逗号分隔";
+        const stance = document.createElement("textarea");
+        stance.value = item.stance || "";
+        stance.placeholder = "你对他怎么看（第一人称口语）；留空即清除";
         const hint = document.createElement("div");
         hint.className = "hint";
-        hint.textContent = "描述写印象，关键词写标签；下一次整理仍会在此基础上更新。";
-        editor.append(summary, keywords, hint);
+        hint.textContent =
+          "上半是观察到的他，下半是你对他的态度；两半可以不一致。下一次整理仍会在此基础上更新。";
+        editor.append(summary, keywords, stance, hint);
 
         const toolbar = document.createElement("div");
         toolbar.className = "actions";
@@ -1080,6 +1188,7 @@
 
         body.replaceWith(editor);
         if (words.parentNode) words.remove();
+        if (stanceLine && stanceLine.parentNode) stanceLine.remove();
         actions.replaceWith(toolbar);
 
         cancel.addEventListener("click", () => reload());
@@ -1096,6 +1205,8 @@
               user_id: item.user_id,
               summary: text,
               keywords: list,
+              // 显式传：允许把态度清空（不传则保留旧值）
+              stance: stance.value.trim(),
             });
             await reload();
             setStatus("已保存画像");
@@ -1131,6 +1242,96 @@
             await apiPost("profiles/delete", { user_id: item.user_id });
             await reload();
             setStatus("已删除这份用户画像");
+          } catch (error) {
+            setStatus(`删除失败：${error.message || error}`, true);
+            confirmButton.disabled = false;
+            cancel.disabled = false;
+          }
+        });
+      }
+
+      // 态度的手工维护：只改那句话与强度。证据数、修订数由系统维护，
+      // 手工纠正措辞不该被算成一次立场转变。
+      function startStanceEdit(body, actions, item) {
+        const editor = document.createElement("div");
+        const text = document.createElement("textarea");
+        text.value = item.stance || "";
+        text.placeholder = "第一人称口语，一句就够";
+        const intensity = document.createElement("input");
+        intensity.type = "range";
+        intensity.min = "0";
+        intensity.max = "1";
+        intensity.step = "0.05";
+        intensity.value = String(item.raw_intensity ?? item.intensity ?? 0.5);
+        const label = document.createElement("div");
+        label.className = "hint";
+        const show = () =>
+          (label.textContent = `在意程度 ${Number(intensity.value).toFixed(2)}（${intensityWord(
+            intensity.value
+          )}）`);
+        show();
+        intensity.addEventListener("input", show);
+        editor.append(text, intensity, label);
+
+        const toolbar = document.createElement("div");
+        toolbar.className = "actions";
+        const save = document.createElement("button");
+        save.className = "primary";
+        save.textContent = "保存";
+        const cancel = document.createElement("button");
+        cancel.textContent = "取消";
+        toolbar.append(save, cancel);
+        body.replaceWith(editor);
+        actions.replaceWith(toolbar);
+
+        cancel.addEventListener("click", () => reload());
+        save.addEventListener("click", async () => {
+          const content = text.value.trim();
+          if (!content) {
+            setStatus("态度不能为空", true);
+            return;
+          }
+          save.disabled = true;
+          cancel.disabled = true;
+          try {
+            await apiPost("stances/update", {
+              id: item.id,
+              stance: content,
+              intensity: Number(intensity.value),
+            });
+            await reload();
+            setStatus("已保存态度");
+          } catch (error) {
+            setStatus(`保存失败：${error.message || error}`, true);
+            save.disabled = false;
+            cancel.disabled = false;
+          }
+        });
+        text.focus();
+      }
+
+      function confirmDeleteStance(actions, item) {
+        const toolbar = document.createElement("div");
+        toolbar.className = "actions";
+        const hint = document.createElement("span");
+        hint.className = "hint";
+        hint.textContent = "删掉之后，若同样的看法再次被提炼出来，她会重新长出这一条。确定吗？";
+        const confirmButton = document.createElement("button");
+        confirmButton.className = "danger";
+        confirmButton.textContent = "确认删除";
+        const cancel = document.createElement("button");
+        cancel.textContent = "取消";
+        toolbar.append(hint, confirmButton, cancel);
+        actions.replaceWith(toolbar);
+
+        cancel.addEventListener("click", () => reload());
+        confirmButton.addEventListener("click", async () => {
+          confirmButton.disabled = true;
+          cancel.disabled = true;
+          try {
+            await apiPost("stances/delete", { id: item.id });
+            await reload();
+            setStatus("已删除这条态度");
           } catch (error) {
             setStatus(`删除失败：${error.message || error}`, true);
             confirmButton.disabled = false;
@@ -1181,6 +1382,16 @@
           });
           state.total = data.total || 0;
           renderProfiles(data.items || []);
+          renderPager();
+          return;
+        }
+        if (state.tab === "stances") {
+          const data = await apiGet("stances", {
+            limit: PAGE_LIMIT,
+            offset: state.offset,
+          });
+          state.total = data.total || 0;
+          renderStances(data.items || []);
           renderPager();
           return;
         }

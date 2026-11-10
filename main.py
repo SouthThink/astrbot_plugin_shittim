@@ -76,6 +76,7 @@ from .core.common.event_utils import (
     set_extra,
 )
 from .core.common.time_utils import format_age, format_clock
+from .core.common.timeexpr import best_time_hint, strip_time_phrases
 from .core.focus.manager import FocusManager
 from .core.gate.brain import BrainGate
 from .core.gate.engine import DecisionEngine
@@ -100,6 +101,7 @@ from .core.memory.injector import (
     build_related_block,
     build_schedule_notice,
     build_situation_block,
+    build_stance_block,
     build_tool_guide_block,
     build_whereabouts_block,
 )
@@ -110,7 +112,12 @@ from .core.memory.ledger import (
     format_message_line,
 )
 from .core.memory.maintenance import MemoryMaintainer
-from .core.memory.profile import ProfileMaintainer, ProfileStore
+from .core.memory.profile import (
+    ProfileMaintainer,
+    ProfileStore,
+    describe_relation,
+)
+from .core.memory.stance import StanceStore
 from .core.memory.store import MemoryStore
 from .core.memory.timeline import build_timeline, build_timeline_block
 from .core.memory.vision import ImageCaptioner
@@ -338,6 +345,8 @@ class ShittimPlugin(Star):
         self.db = MemoryDB(data_dir)
         self.short_term = ShortTermLedger(self.db, self.memory_config)
         self.memory_store = MemoryStore(self.db, self.memory_config)
+        # 态度：她对某人 / 某事的看法。与「发生过什么」分开存，因为寿命不一样。
+        self.stances = StanceStore(self.db, self.memory_config)
         # 用户画像：以 QQ 号（user_id）识别同一个人，私聊与群聊共用一份
         self.profiles = ProfileStore(self.db, self.memory_config)
         # 图片转文字：AstrBot 只给「[图片]」占位，账本里的描述得自己补
@@ -350,6 +359,7 @@ class ShittimPlugin(Star):
             self.extractor,
             self.memory_config,
             short_term=self.short_term,
+            stances=self.stances,
         )
         # 画像更新复用同一个轻量模型：不额外引入第三套模型配置
         self.profile_maintainer = ProfileMaintainer(
@@ -389,6 +399,9 @@ class ShittimPlugin(Star):
         self._allowed_targets = self._load_allowed_targets()
         # 主脑上下文快照：每个会话只保留最后一次请求，供页面直接查看
         self._context_snapshots: dict[str, dict] = {}
+        # 自动联想的去重表：{会话: {记忆 id: 上次注入时刻}}，只存内存。
+        # 同一条记忆在冷却窗内不重复塞进上下文，否则连发几句会把一件事翻三遍。
+        self._association_seen: dict[str, dict[int, float]] = {}
         # 摘除内置工具失败只告警一次，避免每条请求刷屏
         self._tool_removal_warned = False
         self._tool_removal_logged = False
@@ -1298,41 +1311,93 @@ class ShittimPlugin(Star):
             return None
 
     def _related_memories(
-        self, event: AstrMessageEvent, chat_id: str, *, exclude_ids: set[int]
+        self,
+        event: AstrMessageEvent,
+        chat_id: str,
+        *,
+        exclude_ids: set[int],
+        stances: list | None = None,
     ) -> list:
-        """按当前消息做一次话题相关召回，供主脑直接使用。
+        """按当前消息做一次联想，供主脑直接使用。
 
         与榜前记忆互补：榜前负责「最近被想起的」，这里负责「恰好对得上这句话
         的」。命中结果**不调用 `mark_recalled()`**：自动注入若也计数，榜前条目
         会因反复参与而自我强化，榜单就失去意义。只有主脑主动 `recall` 才更新
         召回次数与榜序（见 `recall_memory`）。
+
+        两条路并行：
+        - 关键词：这句话里有什么，就想起什么；
+        - 时间：用户说了「昨天」「上周三」，插件已经算好区间，直接取那几天。
+
+        时间必须由插件算：模型自己算日期会错，而且「昨天」这个词本身在
+        `_STOPWORDS` 里，词法层面根本不是一个可用于检索的关键词。
+
+        `stances` 由调用方传入，避免一轮请求里把态度表读两遍（注入块也用它）。
         """
         try:
             top_k = int(self.memory_config.auto_recall_top_k)
         except (TypeError, ValueError):
             top_k = 0
-        if top_k <= 0:
+        time_top_k = int(self.memory_config.time_recall_top_k or 0)
+        if top_k <= 0 and time_top_k <= 0:
             return []
 
         text = get_message_text(event).strip()
         if not text:
             # 纯图片 / 纯转发消息的 message_str 可能为空，退回本会话最近的文本
             text = self._build_query_text(chat_id).strip()
-        if not text:
-            return []
+
+        hint = best_time_hint(text) if text else None
+        # 时间词本身不参与关键词联想：「昨天」被剥掉之后剩下的才是真正的话题。
+        query_text = strip_time_phrases(text, [hint]) if hint else text
+        query_text = query_text.strip() or text
 
         try:
             recalled = self.memory_store.recall(
-                query_text=text,
+                query_text=query_text,
                 top_k=top_k,
                 user_top_k=0,
                 min_score=self.memory_config.recall_min_score,
                 exclude_ids=exclude_ids,
+                time_hint=hint if time_top_k > 0 else None,
+                stances=stances if stances is not None else self.stances.recent(limit=12),
             )
         except Exception as error:
-            logger.debug("[什亭之枢] 自动相关召回失败: %s", error)
+            logger.debug("[什亭之枢] 自动联想失败: %s", error)
             return []
-        return [item.memory for item in recalled]
+
+        memories = [item.memory for item in recalled if item.channel != "time"]
+        # 时间通道单独限量：它按区间取，可能一口气带回一整天的记忆。
+        timed = [item.memory for item in recalled if item.channel == "time"][:time_top_k]
+        return self._dedupe_association(chat_id, [*memories, *timed])
+
+    def _dedupe_association(self, chat_id: str, memories: list) -> list:
+        """同一段联想在冷却期内不重复注入。
+
+        一轮对话里用户常常连发几句，每句都会触发一次联想。若不做节流，
+        同一条记忆会被翻成三份塞进上下文——模型会以为这件事非常重要。
+        冷却只按「同一条记忆 + 同一个会话 + 同一个时间窗」算，跨会话不受影响。
+        """
+        if not memories:
+            return []
+        try:
+            window = int(self.memory_config.auto_recall_cooldown_seconds)
+        except (TypeError, ValueError):
+            window = 0
+        if window <= 0:
+            return memories
+        now = time.time()
+        seen = self._association_seen.setdefault(chat_id, {})
+        # 顺手清理过期记录，避免这个字典跟着会话无限增长
+        for key in [k for k, ts in seen.items() if now - ts > window]:
+            seen.pop(key, None)
+        kept: list = []
+        for memory in memories:
+            if now - float(seen.get(memory.id, 0.0)) <= window:
+                continue
+            seen[memory.id] = now
+            kept.append(memory)
+        return kept
 
     def _inject_memory_blocks(
         self,
@@ -1356,14 +1421,36 @@ class ShittimPlugin(Star):
 
         # ① 当前说话人的画像：让她知道「现在是谁在跟她说话」。
         #    放在最前，因为它决定其余记忆的解读角度（谁的兴趣、谁的观点）。
+        profile = self._speaker_profile(event)
+        relation = ""
+        if self.memory_config.relation_inject and profile is not None:
+            relation = describe_relation(profile.dimensions)
         profile_block = build_profile_block(
-            self._speaker_profile(event),
+            profile,
             token_budget=self.memory_config.profile_token_budget,
+            stance_text=relation,
         )
         if profile_block:
             blocks.append(profile_block)
 
-        # ② 与当前消息相关的召回：补上「榜前记忆没覆盖、但这句话正好碰上」的部分。
+        # ② 她自己的态度：对某个人、某件事的看法。
+        #    与画像分开：画像针对眼前这个人，态度是她的立场，谁不在场都成立。
+        #    这里读一次，联想打分与行尾附注共用同一份，不重复查库。
+        recent_stances: list = []
+        if self.stances is not None:
+            try:
+                recent_stances = self.stances.recent(limit=12)
+            except Exception as error:
+                logger.debug("[什亭之枢] 读取态度失败: %s", error)
+        if self.memory_config.stance_inject and self.stances is not None:
+            stance_block = build_stance_block(
+                self.stances.ranked(limit=self.memory_config.stance_top),
+                token_budget=self.memory_config.stance_token_budget,
+            )
+            if stance_block:
+                blocks.append(stance_block)
+
+        # ③ 与当前消息相关的联想：补上「榜前记忆没覆盖、但这句话正好碰上」的部分。
         #    **不计入「被想起」**——自动注入若计数，榜前条目会自我强化。
         permanent = self.memory_store.permanents()
         bodies, index = self.memory_store.auto_injection()
@@ -1373,16 +1460,18 @@ class ShittimPlugin(Star):
             # 只排除已经给了完整正文的条目；关键词索引里的条目并不展示内容，
             # 若与这句话相关，补上正文反而更有用。
             exclude_ids={m.id for m in (*permanent, *bodies)},
+            stances=recent_stances,
         )
         related_block = build_related_block(
             memories=related,
             token_budget=self.memory_config.auto_recall_token_budget,
+            stances=recent_stances,
         )
         if related_block:
             blocks.append(related_block)
 
-        # ③ 永久记忆全量 → ④ 榜前 auto_top 条正文 → ⑤ 其后 auto_index
-        #    条关键词索引。自动插入同样不计入「被想起」：仅主动 recall 才计入，
+        # ④ 永久记忆全量 → ⑤ 榜前 auto_top 条正文 → ⑥ 其后 auto_index
+        #    条模糊索引。自动插入同样不计入「被想起」：仅主动 recall 才计入，
         #    否则榜前条目会相互提升排名，导致榜单停止更新。
         for block in build_memory_blocks(
             permanent=permanent,
@@ -1390,6 +1479,7 @@ class ShittimPlugin(Star):
             index=index,
             token_budget=self.memory_config.recall_token_budget,
             permanent_budget=self.memory_config.permanent_token_budget,
+            total=self.memory_store.count_by_tier().get("long", 0),
         ):
             blocks.append(block)
 
@@ -2004,18 +2094,19 @@ class ShittimPlugin(Star):
         limit: int = 20,
     ) -> str:
         """
-        翻看以前的聊天记录，找回已经想不起来的细节。
+        翻看以前的聊天记录，把已经想不起来的细节找回来。
 
-        当你记不清某件事是不是真的发生过、想确认某人的原话，或需要一个
-        具体时间点的细节时调用。它翻的是**原始记录**，包括已经不记得的那些。
+        话题里出现具体时间（昨天、前天、上周三、上个月、三号）时，**先调它**。
+        时间词会由插件换算成日期区间，你不需要自己算，也不需要把「昨天」当成
+        关键词填进来——填了反而查不到。
 
-        只在想确认旧事时用：不要拿它代替回忆，也不要把查到的内容当成
-        本轮回复的主题。
+        它翻的是**原始记录**，包括已经被压进摘要、已经不在上下文里的那些。
+        想不起细节、想确认某句话是谁说的、想知道某件事到底有没有发生过，都用它。
 
         Args:
-            keyword(string): 要找的关键词，可留空（留空就按时间取最近的记录）
+            keyword(string): 要找的关键词；只知道时间、不知道聊了什么时留空，按时间取那几天的记录
             session(string): 在哪个会话说；留空表示当前会话，跨会话才填（用 list_sessions 查看）
-            days(number): 往回查多少天，默认7，最多90
+            days(number): 往回查多少天，默认7，最多90；提到了具体哪天时请把这个天数设得足够大
             limit(number): 最多看多少条，默认20，最多50
         """
         if not self._memory_active():
@@ -2035,10 +2126,24 @@ class ShittimPlugin(Star):
                 chat_id = event.unified_msg_origin or ""
                 if not chat_id:
                     return "当前会话标识不可用，请指定 session。"
+
+            # 时间词优先于天数：用户说「上周三」，那一天的区间比他随手填的
+            # days 更准。找不到时间词才退回「最近 N 天」。
+            hint = best_time_hint(text) if text else None
+            since = time.time() - days * 86400
+            until = 0.0
+            scope_label = f"近 {days} 天"
+            if hint is not None:
+                since = hint.start
+                until = hint.end
+                scope_label = hint.label
+                # 时间词本身不参与 LIKE 匹配：没有任何一行正文写着「昨天」
+                text = strip_time_phrases(text, [hint]).strip()
             rows = self.short_term.search_history(
                 chat_id=chat_id,
                 keyword=text,
-                since=time.time() - days * 86400,
+                since=since,
+                until=until,
                 limit=limit,
             )
         except Exception as error:
@@ -2047,16 +2152,47 @@ class ShittimPlugin(Star):
         if not rows:
             scope = "当前会话" if not (session or "").strip() else f"「{session}」"
             what = f"含「{text}」的" if text else ""
-            return f"{scope}近 {days} 天没有{what}记录。"
+            # 「查过没有」与「没查」必须让模型分得清：这里明确说查过了。
+            # 再分一层：那段时间压根没说话，还是有说话但这个说法没命中——
+            # 后者应该换个词再查，前者应该直接说没有。
+            total = 0
+            try:
+                total = self.short_term.count_history(
+                    chat_id=chat_id, since=since, until=until
+                )
+            except Exception:
+                total = 0
+            if text and total > 0:
+                return (
+                    f"查过了：{scope}{scope_label}有 {total} 条记录，"
+                    f"但没有一条{what}。换个说法再查一次，"
+                    "或者不加关键词、直接按时间看那几天的原话。"
+                )
+            return (
+                f"查过了：{scope}{scope_label}确实没有{what}记录。"
+                "这是真的没有，不是你忘了。"
+            )
 
         label = str(rows[0]["chat_label"] or "") or chat_id
         what = f"含「{text}」的" if text else ""
-        head = f"【{label}】近 {days} 天的{what}记录，共 {len(rows)} 条："
+        # 把「这个范围里一共有多少条」也报出来：只给 20 条命中时，模型会以为
+        # 那段时间只有这 20 条；知道总数它才判断得出「还有更多，可以再翻」。
+        total = 0
+        try:
+            total = self.short_term.count_history(
+                chat_id=chat_id, since=since, until=until
+            )
+        except Exception:
+            total = 0
+        head = f"【{label}】{scope_label}的{what}记录，共 {len(rows)} 条"
+        if total > len(rows):
+            head += f"（这个范围里总共 {total} 条，这里只列了最近的 {len(rows)} 条）"
+        head += "："
         logger.info(
-            "[什亭之枢] 翻查历史 | %s | 关键词=%s | %d 天内 %d 条",
+            "[什亭之枢] 翻查历史 | %s | 关键词=%s | %s | %d 条",
             chat_id,
             text or "-",
-            days,
+            scope_label,
             len(rows),
         )
         return head + "\n" + "\n".join(format_message_line(row) for row in rows)
@@ -2427,20 +2563,34 @@ class ShittimPlugin(Star):
         return f"已永久记住（#{memory_id}）：{text}"
 
     @filter.llm_tool(name="recall")
-    async def recall_memory(self, event: AstrMessageEvent, query: str) -> str:
+    async def recall_memory(
+        self, event: AstrMessageEvent, query: str, when: str = ""
+    ) -> str:
         """
-        回想一件你已经记不清细节的旧事。
-        当你隐约觉得「好像有这么回事」、记忆里只剩个大概，
-        或当前话题碰到某个熟悉但模糊的人、事、地点时调用，先把细节想清楚再开口。
+        按关键词把散在各处的旧印象翻出来。
+
+        当对方提到一件事、你「隐约有点印象但说不上来」，或这个话题让你觉得
+        「以前好像碰过」时调用。它给的是零碎的印象，不是完整记录；要原话和
+        具体细节请用 search_history。
+
+        想不起关键词也没关系：知道大概是哪天，就把时间填进 when。
 
         Args:
-            query(string): 要回想的内容关键词
+            query(string): 能对上那件事的词——人名的、地名、那件事里的关键词
+            when(string): 大概是什么时候，例如「昨天」「上周」「上个月」；不确定就留空
         """
         if not self._memory_active():
             return "记忆系统未启用，无法回忆。"
         text = (query or "").strip()
-        if not text:
-            return "错误：query 不能为空。"
+        when_text = (when or "").strip()
+        if not text and not when_text:
+            return "错误：query 和 when 至少给一个。"
+        hint = best_time_hint(when_text) if when_text else None
+        if hint is None and text:
+            # 有人会把时间直接写进 query，这里一并认出来
+            hint = best_time_hint(text)
+            if hint is not None:
+                text = strip_time_phrases(text, [hint]).strip()
         try:
             recalled = self.memory_store.recall(
                 query_text=text,
@@ -2448,18 +2598,26 @@ class ShittimPlugin(Star):
                 top_k=self.memory_config.recall_top_k,
                 user_top_k=self.memory_config.recall_user_top_k,
                 min_score=0.0,  # 主动回忆不设阈值，由模型自己判断是否可用
+                time_hint=hint,
+                stances=self.stances.recent(limit=12),
             )
         except Exception as error:
             logger.error("[什亭之枢] 主动回忆失败: %s", error)
             return f"回忆失败：{error}"
         if not recalled:
-            return "想了半天，没想起来相关的。"
+            # 让模型分得清「查过确实没有」与「没查」：后果不同，话也不同。
+            if hint is not None:
+                return (
+                    f"想了半天，{hint.label}那段时间的事一点也想不起来。"
+                    "这是真的没有，不是你忘了。"
+                )
+            return "想了半天，没想起来相关的。这可能是真的没有，也可能换个词就想起来了。"
         # 「被想起」是位置榜唯一的加权来源：只有主动 recall 才计数并上浮。
         # 自动注入（榜前正文 / 关键词索引 / 话题相关召回）与判定层的内部召回
         # 都不计入，否则榜前条目会互相抬高名次，榜单就停止更新了。
         #
         # 计数只认**确实命中话题**的结果：user 通道是「这个人相关」的兜底，
-        # 可能零关键词命中；若也计数，会把噪声一步步推成永久记忆。
+        # 可能零关键词命中；时间通道是用户点了名，也不算「关键词想起来的」。
         threshold = self.memory_config.recall_min_score
         remembered = [
             item.memory.id
@@ -2472,7 +2630,8 @@ class ShittimPlugin(Star):
             except Exception as error:
                 # 计数失败不影响把内容交给模型：回忆本身已经完成
                 logger.error("[什亭之枢] 更新召回计数失败: %s", error)
-        return "你想起来了一些事：\n" + "\n".join(
+        head = f"你想起了{hint.label}那几天的一些事：\n" if hint else "你想起来了一些事：\n"
+        return head + "\n".join(
             f"- {item.memory.content}" for item in recalled
         )
 
@@ -2657,6 +2816,18 @@ class ShittimPlugin(Star):
             logger.error("[什亭之枢] 用户画像更新失败: %s", error)
             return {}
 
+    def _stance_count(self) -> int:
+        """现有态度条数，只用于日志。
+
+        态度是附加信息，读失败不该让整轮整理的日志抛异常，因此吞掉异常返回 0。
+        """
+        if self.stances is None:
+            return 0
+        try:
+            return int(self.stances.count())
+        except Exception:
+            return 0
+
     async def _run_curation(self, *, full_reset: bool) -> dict:
         """执行一次记忆整理（§6，顺序固定）。
 
@@ -2733,7 +2904,7 @@ class ShittimPlugin(Star):
             self.sleep_state.save(last_curation_at=time.time())
             logger.info(
                 "[什亭之枢] 记忆整理完成 用时%.0fms | 收口%d条→%d轮 当天摘要%d "
-                "降级%d(重写%d) 遗忘%d 晋升%d 合并%d簇 画像%d | 归档%d条 收起摘要%d条%s",
+                "降级%d(重写%d) 遗忘%d 晋升%d 合并%d簇 画像%d 态度%d条%s",
                 (time.time() - started) * 1000,
                 stats.get("condensed_entries", 0),
                 stats.get("condensed_rounds", 0),
@@ -2744,8 +2915,7 @@ class ShittimPlugin(Star):
                 stats.get("promoted", 0),
                 stats.get("merge_clusters", 0),
                 stats.get("updated", 0),
-                stats.get("archived_messages", 0),
-                stats.get("retired_summaries", 0),
+                self._stance_count(),
                 f" | 保留期清理{stats['purged_expired']}条"
                 if stats.get("purged_expired")
                 else "",

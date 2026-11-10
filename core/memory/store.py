@@ -33,6 +33,7 @@ import time
 from dataclasses import dataclass, field
 
 from ..common.db import MemoryDB
+from ..common.timeexpr import day_key
 from ..common.tokenizer import extract_keywords, overlap_score, tokenize
 
 TIER_LONG = "long"
@@ -81,12 +82,48 @@ def is_tail(rank: int, total: int) -> bool:
     return (total - rank + 1) <= max(int(total * _FORGET_TAIL_RATIO), 1)
 
 
-# 用户通道/消息通道的打分：关键词相关性为主，时间近因与用户匹配为辅。
-# 强度不参与——它已退役，榜序只在自动插入时起作用。
-_W_KEYWORD = 0.70
-_W_RECENCY = 0.15
-_W_USER = 0.15
+def _days_of(hint) -> list[str]:
+    """把时间区间展开成一组本地日期键（`YYYY-MM-DD`）。
 
+    区间太宽时只取**最后** `_MAX_TIME_DAYS` 天：用户说「前阵子」时，他更可能
+    在说最近那几天，一次捞出三十天的记忆只会把上下文灌满。
+    """
+    start = float(getattr(hint, "start", 0.0) or 0.0)
+    end = float(getattr(hint, "end", 0.0) or 0.0)
+    if start <= 0 or end <= start:
+        return []
+    days: list[str] = []
+    cursor = start
+    # 用 86400 步进而不是日历运算：区间边界本来就是按自然日算好的，
+    # 这里只需要覆盖 [start, end) 里出现的每一个日期键。
+    while cursor < end and len(days) < _MAX_TIME_DAYS * 2:
+        key = day_key(cursor)
+        if key and key not in days:
+            days.append(key)
+        cursor += 86400.0
+    tail_key = day_key(end - 1.0)
+    if tail_key and tail_key not in days:
+        days.append(tail_key)
+    return days[-_MAX_TIME_DAYS:]
+
+
+# ── 联想打分（取代旧的关键词+近因加权）───────────────��
+# 旧公式是三个权重的加权和：0.70×关键词 + 0.15×近因 + 0.15×同人。
+# 问题在于「加权和」让三个维度可以互相补偿——一条完全无关但最近的记忆，
+# 靠近因也能拿到 0.15 分混进结果。改成**连乘**之后，任何一维接近 0，
+# 整条就起不来，这才是「相关」应有的语义。
+#
+# 公式：score = 相关度 × (0.5 + 0.5×强度) × 时间衰减
+#   - 相关度：关键词重合率（0~1），为 0 时整条必然为 0
+#   - 强度：她在这件事上的态度有多强烈（0~1）。没有态度时按 0 算，
+#     系数落在 0.5——「我说不上来我喜欢不喜欢，但它就是发生过」
+#   - 时间衰减：久远的事慢慢淡，但留一个地板，不让它彻底归零
+_INTENSITY_WEIGHT = 0.5
+_RECENCY_FLOOR = 0.35
+# 时间通道的相关度基准：用户明确说了「昨天」，那批记忆就一定相关
+_TIME_RELEVANCE = 0.7
+# 时间通道最多覆盖多少天（区间太宽时按最近的几天取，避免一次捞出上百条）
+_MAX_TIME_DAYS = 7
 # 用户通道：偏重重要性，但仍让话题相关的记忆优先浮出
 _WU_KEYWORD = 0.55
 _WU_IMPORTANCE = 0.45
@@ -160,6 +197,10 @@ class Memory:
     worthless_checked_at: float = 0.0
     # 位置榜的轴：最后一次被想起（整理产出 / 被召回）的时刻
     promoted_at: float = 0.0
+    # 这条记忆覆盖的是哪一天（本地日期 YYYY-MM-DD）。
+    # 与 promoted_at 的区别：promoted_at 会被召回推到现在，covered_date 永远
+    # 指向「这段话是什么时候说的」。问「昨天」时按它查才查得准。
+    covered_date: str = ""
     # 名次与榜长：由查询填进来，不在表里。升/降级形态靠它们推导。
     rank: int = 0
     rank_total: int = 0
@@ -199,6 +240,7 @@ class Memory:
             worthless_at=float(row["worthless_at"] or 0.0),
             worthless_checked_at=float(row["worthless_checked_at"] or 0.0),
             promoted_at=float(row["promoted_at"] or 0.0),
+            covered_date=str(row["covered_date"] or ""),
         )
 
     def activity_at(self) -> float:
@@ -248,6 +290,7 @@ class MemoryStore:
         merged_from: list[int] | None = None,
         created_at: float | None = None,
         promoted_at: float | None = None,
+        covered_at: float | None = None,
     ) -> int:
         """写入一条记忆，返回自增 id。
 
@@ -258,10 +301,15 @@ class MemoryStore:
         整理时提炼出的记忆会把入榜位置设为「这段发言覆盖的末尾时间」，
         这样每晚整理不会把所有新条目一起压到榜首、把旧榜整版刷下去。
         只有当天摘要与合并结果才显式落在当下。
+
+        `covered_at` 是这段记忆**说的是哪段时间**的事。它与 `promoted_at`
+        分成两个字段是必要的：被召回会把 `promoted_at` 推到现在，而「昨天说过
+        什么」问的是 `covered_date`。缺省时按 `promoted_at` 归属日期。
         """
         now = time.time()
         created = float(created_at if created_at is not None else now)
         promoted = float(promoted_at if promoted_at is not None else created)
+        covered = day_key(float(covered_at) if covered_at else promoted)
         keyword_list = [k for k in (keywords or extract_keywords(content)) if k]
         if manual:
             tier = TIER_PERMANENT
@@ -271,8 +319,8 @@ class MemoryStore:
                 (tier, content, source_quote, tags, keywords, chat_id, chat_label,
                  user_id, user_name, recall_count, useful_count,
                  cross_chat_count, manual, created_at, last_recalled_at,
-                 last_decay_at, merged_from, promoted_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 0, 0, 1, ?, ?, NULL, ?, ?, ?)
+                 last_decay_at, merged_from, promoted_at, covered_date)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 0, 0, 1, ?, ?, NULL, ?, ?, ?, ?)
             """,
             (
                 tier,
@@ -289,6 +337,7 @@ class MemoryStore:
                 created,
                 json.dumps(merged_from or [], ensure_ascii=False),
                 promoted,
+                covered,
             ),
         )
         memory_id = int(cursor.lastrowid or 0)
@@ -307,6 +356,7 @@ class MemoryStore:
         user_id: str | None = None,
         user_name: str | None = None,
         promoted_at: float | None = None,
+        covered_at: float | None = None,
     ) -> tuple[int, bool]:
         """去重写入。
 
@@ -314,7 +364,8 @@ class MemoryStore:
         想起一次），必要时累加跨会话计数；否则新建。返回 (记忆 id, 是否新建)。
 
         新建时可用 `promoted_at` 指定入榜位置：整理提炼出的记忆按发言覆盖的
-        时间落位，而不是把整批新条目一起压到榜首。
+        时间落位，而不是把整批新条目一起压到榜首。`covered_at` 是这条记忆说的
+        是哪段时间的事，用于「问昨天」时的时间路检索。
         """
         keyword_list = [k for k in (keywords or extract_keywords(content)) if k]
         duplicate = self._find_duplicate(keyword_list, user_id=user_id)
@@ -330,6 +381,7 @@ class MemoryStore:
                     user_id=user_id,
                     user_name=user_name,
                     promoted_at=promoted_at,
+                    covered_at=covered_at,
                 ),
                 True,
             )
@@ -357,7 +409,7 @@ class MemoryStore:
             "useful_count", "cross_chat_count", "manual", "last_recalled_at",
             "last_decay_at", "merged_from", "promoted_at", "curation_count",
             "last_curated_at", "forget_requested", "forget_requested_at",
-            "worthless", "worthless_at", "worthless_checked_at",
+            "worthless", "worthless_at", "worthless_checked_at", "covered_date",
         }
         assignments = {k: v for k, v in fields.items() if k in allowed}
         if not assignments:
@@ -743,12 +795,28 @@ class MemoryStore:
         user_top_k: int | None = None,
         min_score: float | None = None,
         exclude_ids: set[int] | None = None,
+        time_hint=None,
+        stances: list | None = None,
     ) -> list[RecalledMemory]:
-        """双通道召回：消息相关 + 发送者相关，合并去重后返回。"""
+        """多通道联想：关键词 + 时间区间 + 发送者，合并去重后返回。
+
+        与旧版「召回」的区别不只是多了通道，而是**打分换了语义**：旧版是
+        三个权重的加权和，条目的分数可以靠「最近」或「同一个人」补上来；
+        新版用连乘，相关度为零就是零。这样联想出来的东西才会「都是有点关系的」，
+        而不是「凑够三条」。
+
+        `time_hint` 是 `timeexpr.TimeHint`：用户说了「昨天」「上周三」时，
+        插件已经把它算成区间，这里按 `covered_date` 直接取那几天的记忆。
+        时间不能当关键词——日期串在 2-gram 分词里会被切碎，倒排表里也没有它。
+
+        `stances` 是 `Stance` 列表（可为空）：她对这些事的态度强度会抬高
+        相关记忆的分数。有立场的事更容易被想起来，这是联想与人味的一部分。
+        """
         top_k = self._config.recall_top_k if top_k is None else top_k
         user_top_k = self._config.recall_user_top_k if user_top_k is None else user_top_k
         min_score = self._config.recall_min_score if min_score is None else min_score
         exclude_ids = exclude_ids or set()
+        stances = stances or []
 
         query_tokens = set(tokenize(query_text)[:_MAX_QUERY_TOKENS])
 
@@ -757,7 +825,9 @@ class MemoryStore:
 
         # 通道一：与当前消息相关的记忆
         message_hits = 0
-        for memory, score in self._rank_by_keywords(query_tokens, limit=max(top_k * 6, 24)):
+        for memory, score in self._rank_by_keywords(
+            query_tokens, limit=max(top_k * 6, 24), stances=stances
+        ):
             if message_hits >= top_k:
                 break
             if memory.id in exclude_ids or memory.id in seen or score < min_score:
@@ -766,7 +836,15 @@ class MemoryStore:
             message_hits += 1
             results.append(RecalledMemory(memory=memory, score=score, channel="message"))
 
-        # 通道二：这个人的相关记忆（无关键词下限，按重要性兜底）
+        # 通道二：用户提到了具体时间，把那几天的记忆直接取回来
+        if time_hint is not None:
+            for memory, score in self._rank_by_time(time_hint, limit=top_k):
+                if memory.id in exclude_ids or memory.id in seen:
+                    continue
+                seen.add(memory.id)
+                results.append(RecalledMemory(memory=memory, score=score, channel="time"))
+
+        # 通道三：这个人的相关记忆（无关键词下限，按重要性兜底）
         if user_id and user_top_k > 0:
             for memory, score in self._rank_user_memories(
                 user_id, query_tokens, limit=user_top_k
@@ -779,24 +857,55 @@ class MemoryStore:
         return results
 
     def _rank_by_keywords(
-        self, query_tokens: set[str], limit: int
+        self, query_tokens: set[str], limit: int, *, stances: list | None = None
     ) -> list[tuple[Memory, float]]:
-        """用倒排表筛出候选，再按综合分排序。"""
+        """用倒排表筛出候选，再按联想分排序。"""
         now = time.time()
         candidates = self._candidates_by_keywords(query_tokens, limit)
         if not candidates:
             return []
+        stances = stances or []
         scored = [
-            (memory, self._score(memory, query_tokens, now, user_id=None))
+            (memory, self._score(memory, query_tokens, now, stances))
             for memory in candidates
         ]
         scored.sort(key=lambda item: item[1], reverse=True)
         return scored
 
+    def _rank_by_time(self, hint, limit: int) -> list[tuple[Memory, float]]:
+        """按时间区间取记忆：用户说了「昨天」，就把昨天的记忆找出来。
+
+        时间区间只覆盖 `covered_date`（那段话是哪天说的），不看 `promoted_at`
+        ——后者会被召回推到现在，用它查「昨天」会查出今天刚想起的旧事。
+        """
+        days = _days_of(hint)
+        if not days:
+            return []
+        placeholders = ",".join("?" for _ in days)
+        rows = self._db.query(
+            f"""
+            SELECT * FROM memories
+             WHERE covered_date IN ({placeholders}) AND forget_requested = 0
+             ORDER BY {_BOARD_ORDER}
+             LIMIT ?
+            """,
+            (*days, max(int(limit) * 4, 16)),
+        )
+        now = time.time()
+        scored: list[tuple[Memory, float]] = []
+        for row in rows:
+            memory = Memory.from_row(row)
+            # 时间通道的相关度是给死的：用户点了名，这批记忆就算相关。
+            # 分数仍然乘时间衰减，所以区间里更靠后的日子会排在前面。
+            score = _TIME_RELEVANCE * self._recency_factor(memory, now)
+            scored.append((memory, score))
+        scored.sort(key=lambda item: item[1], reverse=True)
+        return scored[: int(limit)]
+
     def _rank_user_memories(
         self, user_id: str, query_tokens: set[str], limit: int
     ) -> list[tuple[Memory, float]]:
-        """某个用户的记忆，按「话题相关 + 时间近因」排序，无阈值兜底。"""
+        """某个用户的记忆，按「话题相关 + 重要度」排序，无阈值兜底。"""
         rows = self._db.query(
             f"SELECT * FROM memories WHERE user_id = ? AND forget_requested = 0 "
             f"ORDER BY {_BOARD_ORDER} LIMIT ?",
@@ -861,16 +970,61 @@ class MemoryStore:
         ]
 
     def _score(
-        self, memory: Memory, query_tokens: set[str], now: float, user_id: str | None
+        self,
+        memory: Memory,
+        query_tokens: set[str],
+        now: float,
+        stances: list | None = None,
     ) -> float:
-        keyword_score = overlap_score(query_tokens, memory.keywords)
-        recency = self._recency(memory, now)
-        user_factor = 1.0 if (user_id and memory.user_id == user_id) else 0.0
-        return (
-            _W_KEYWORD * keyword_score
-            + _W_RECENCY * recency
-            + _W_USER * user_factor
+        """联想分：相关度 × 态度强度 × 时间衰减，三项连乘。
+
+        连乘而不是加权和是有意的：加权和允许「完全不相关但很新」的记忆拿到分数，
+        只要把近因权重调大就能混进结果。连乘下相关度为 0 就整条为 0，联想出来
+        的东西至少都沾点边。
+
+        态度强度那一项从 0.5 起步而不是 0：没有态度不代表没关系，
+        「说不上来喜不喜欢，但它就是发生过」也该被想起。
+        """
+        relevance = overlap_score(query_tokens, memory.keywords)
+        if relevance <= 0:
+            return 0.0
+        intensity = self._stance_intensity(memory, stances or [])
+        return relevance * (_INTENSITY_WEIGHT + (1.0 - _INTENSITY_WEIGHT) * intensity) * (
+            self._recency_factor(memory, now)
         )
+
+    def _stance_intensity(self, memory: Memory, stances: list) -> float:
+        """这条记忆关联着多强的态度（0~1）。
+
+        只在同一个人 / 同一批关键词上找关联，不做语义匹配：零依赖的分词扛不住
+        语义，硬凑出来的关联比没有更糟。找不到就返回 0，让分数只由相关度决定。
+
+        `user` 按 QQ 号比，`topic` 按关键词比：话题态度用的是「爬山」「相亲」
+        这类词，而记忆的 keywords 正是同一套词法切出来的，两边能对上。
+        """
+        if not stances:
+            return 0.0
+        best = 0.0
+        keywords = memory.keywords or []
+        for stance in stances:
+            key = stance.subject_key
+            if not key:
+                continue
+            if stance.subject_type == "user" and memory.user_id:
+                if key == memory.user_id:
+                    best = max(best, stance.effective_intensity())
+            elif stance.subject_type == "topic":
+                if key in keywords or key in memory.content:
+                    best = max(best, stance.effective_intensity())
+        return min(best, 1.0)
+
+    def _recency_factor(self, memory: Memory, now: float) -> float:
+        """时间衰减：久远的事慢慢淡，但留一个地板不让它彻底归零。
+
+        有地板是因为「旧事」本身就有被想起的价值：一段三个月前的对话当然比
+        昨天的更模糊，但用户主动提起它时，它就该能被联动起来。
+        """
+        return _RECENCY_FLOOR + (1.0 - _RECENCY_FLOOR) * self._recency(memory, now)
 
     def _recency(self, memory: Memory, now: float) -> float:
         """时间近因：越久没被用到，时间分越低。永久记忆不衰减。"""

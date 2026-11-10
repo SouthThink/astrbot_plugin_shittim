@@ -20,6 +20,8 @@ from typing import Any
 
 from astrbot.api import logger
 
+from .core.memory.profile import describe_relation
+
 try:  # AstrBot 4.27+ 的新版插件 Web API
     from astrbot.api.web import error_response, json_response, request
 
@@ -38,6 +40,10 @@ _MAX_MEMORY_CHARS = 4000
 # 手工编辑的用户画像：描述是「印象」，关键词是标签，都不该是长篇
 _MAX_PROFILE_SUMMARY_CHARS = 1000
 _MAX_PROFILE_KEYWORDS = 20
+# 画像里那句「她对他怎么看」，与 extractor 的 `_MAX_STANCE_CHARS` 同一量级
+_MAX_PROFILE_STANCE_CHARS = 400
+# 单条态度的正文上限：态度是一句口语，不是一段论述
+_MAX_STANCE_CHARS = 400
 _MAX_PROFILE_KEYWORD_CHARS = 24
 
 # 记忆页面只认这两层；短期账本走另一个接口
@@ -215,7 +221,11 @@ def _memory_item(memory) -> dict:
 
 
 def _profile_item(profile) -> dict:
-    """用户画像 → 页面数据。名字列表来自 user_ledger，画像只提供印象。"""
+    """用户画像 → 页面数据。名字列表来自 user_ledger，画像只提供印象。
+
+    `stance` 是「她对这个人怎么看」，`dimensions` 是三个关系强度数值。
+    页面上**显示数值**（这是给人看的），注入时只翻成词。
+    """
     return {
         "platform": profile.platform,
         "user_id": profile.user_id,
@@ -224,12 +234,36 @@ def _profile_item(profile) -> dict:
         "aliases": profile.aliases,
         "summary": profile.summary,
         "keywords": profile.keywords,
+        "stance": profile.stance,
+        "dimensions": profile.dimensions,
+        "relation": describe_relation(profile.dimensions),
         "message_count": profile.message_count,
         "first_seen": profile.first_seen,
         "last_seen": profile.last_seen,
         "profiled_at": profile.profiled_at,
         "created_at": profile.created_at,
         "updated_at": profile.updated_at,
+    }
+
+
+def _stance_item(stance) -> dict:
+    """态度 → 页面数据。强度与置信度只在页面上出现，不进模型上下文。"""
+    return {
+        "id": stance.id,
+        "subject_type": stance.subject_type,
+        "subject_key": stance.subject_key,
+        "subject_name": stance.subject_name,
+        "label": stance.label,
+        "dimension": stance.dimension,
+        "stance": stance.stance,
+        # 已按时间衰减过的强度：页面上看到的就是「现在还有多在意」
+        "intensity": stance.effective_intensity(),
+        "raw_intensity": stance.intensity,
+        "confidence": stance.confidence,
+        "evidence_count": stance.evidence_count,
+        "revision": stance.revision,
+        "first_at": stance.first_at,
+        "updated_at": stance.updated_at,
     }
 
 
@@ -253,6 +287,11 @@ class MemoryPageAPI:
         except Exception:
             # 仅用于展示：作息数据不可用时不应导致整个总览接口失败
             sleep = None
+        try:
+            stances = self._plugin.stances.count()
+        except Exception:
+            # 态度表在旧库里可能还没迁移过来：总览少一格，不该整体失败
+            stances = 0
         return _ok(
             {
                 "short_term": short_term.count(),
@@ -261,6 +300,7 @@ class MemoryPageAPI:
                 "long": tiers.get("long", 0),
                 "permanent": tiers.get("permanent", 0),
                 "profiles": self._plugin.profiles.count(),
+                "stances": stances,
                 "focused": focused,
                 "sleep": sleep,
             }
@@ -343,6 +383,25 @@ class MemoryPageAPI:
                 "limit": limit,
                 "offset": offset,
                 "items": [_profile_item(profile) for profile in items],
+            }
+        )
+
+    async def stances(self) -> Any:
+        """她对人对事的态度。
+
+        与记忆分开列：记忆是「发生过什么」，态度是「她怎么看」，两者有不同的
+        生命周期——记忆会模糊、会被遗忘，态度只淡化、会被改写。
+        """
+        limit, offset = _paging(
+            _query_int("limit", _DEFAULT_LIMIT), _query_int("offset", 0)
+        )
+        items, total = self._plugin.stances.list_page(limit, offset)
+        return _ok(
+            {
+                "total": total,
+                "limit": limit,
+                "offset": offset,
+                "items": [_stance_item(stance) for stance in items],
             }
         )
 
@@ -517,6 +576,9 @@ class MemoryPageAPI:
 
         不写 `profiled_at`：那是整理流程的素材水位线，手工改动推进它会让
         这段没读过的发言永久漏掉，见 `ProfileStore.edit()`。
+
+        态度只在请求体里出现时才改写：没传 `stance` 时保留库里原有的那句，
+        否则页面只改「印象」也会把她对这个人怎么看一起抹掉。
         """
         body = await _json_body()
         user_id = str(body.get("user_id") or "").strip()
@@ -542,11 +604,19 @@ class MemoryPageAPI:
             return _err(
                 f"关键词「{too_long}」过长（最多 {_MAX_PROFILE_KEYWORD_CHARS} 字）"
             )
+        stance: str | None = None
+        if "stance" in body:
+            raw = str(body.get("stance") or "").strip()
+            if len(raw) > _MAX_PROFILE_STANCE_CHARS:
+                return _err(f"态度过长（最多 {_MAX_PROFILE_STANCE_CHARS} 字）")
+            stance = raw
 
         store = self._plugin.profiles
         if store.get(user_id) is None:
             return _err("画像不存在或已被删除", 404)
-        if not store.edit(user_id, summary=summary, keywords=keywords):
+        if not store.edit(
+            user_id, summary=summary, keywords=keywords, stance=stance
+        ):
             return _err("画像更新失败")
         return _ok({"user_id": user_id})
 
@@ -568,6 +638,54 @@ class MemoryPageAPI:
             return _err("画像删除失败")
         return _ok({"user_id": user_id})
 
+    async def update_stance(self) -> Any:
+        """手工改写一条态度。
+
+        只改那句话与强度，不动证据数与修订数：那是「她自己改过多少次想法」
+        的记录，手工纠正措辞不该算成一次立场转变。
+        """
+        body = await _json_body()
+        stance_id = _body_int(body, "id")
+        if stance_id is None:
+            return _err("缺少有效的态度 id")
+        text: str | None = None
+        if "stance" in body:
+            raw = str(body.get("stance") or "").strip()
+            if not raw:
+                return _err("态度内容不能为空")
+            if len(raw) > _MAX_STANCE_CHARS:
+                return _err(f"态度内容过长（最多 {_MAX_STANCE_CHARS} 字）")
+            text = raw
+        intensity: float | None = None
+        if "intensity" in body:
+            try:
+                intensity = float(body.get("intensity"))
+            except (TypeError, ValueError):
+                return _err("intensity 必须是 0~1 之间的数字")
+            if not 0.0 <= intensity <= 1.0:
+                return _err("intensity 必须是 0~1 之间的数字")
+
+        store = self._plugin.stances
+        if not store.edit(stance_id, stance=text, intensity=intensity):
+            return _err("态度不存在或没有改动", 404)
+        return _ok({"id": stance_id})
+
+    async def delete_stance(self) -> Any:
+        """删除一条态度。
+
+        不需要抑制表：态度由压缩模型从对话里重新长出来时会走 `apply()` 的
+        改写路径，同一条被删掉之后若再次成立会被重新建行——这是对的，
+        因为「她对这件事的看法」本来就该能重新形成。
+        """
+        body = await _json_body()
+        stance_id = _body_int(body, "id")
+        if stance_id is None:
+            return _err("缺少有效的态度 id")
+        store = self._plugin.stances
+        if not store.delete(stance_id):
+            return _err("态度不存在或已被删除", 404)
+        return _ok({"id": stance_id})
+
 
 def register_all_routes(plugin) -> None:
     """把页面路由挂到宿主；宿主不支持插件 Web API 时静默跳过。"""
@@ -584,10 +702,13 @@ def register_all_routes(plugin) -> None:
         ("summaries", api.summaries, ["GET"], "短期摘要"),
         ("memories", api.memories, ["GET"], "长期与永久记忆"),
         ("profiles", api.profiles, ["GET"], "用户画像"),
+        ("stances", api.stances, ["GET"], "对人对事的态度"),
         ("memories/update", api.update_memory, ["POST"], "编辑长期或永久记忆"),
         ("memories/delete", api.delete_memory, ["POST"], "删除长期或永久记忆"),
         ("profiles/update", api.update_profile, ["POST"], "编辑用户画像"),
         ("profiles/delete", api.delete_profile, ["POST"], "删除用户画像"),
+        ("stances/update", api.update_stance, ["POST"], "编辑态度"),
+        ("stances/delete", api.delete_stance, ["POST"], "删除态度"),
         ("runtime", api.runtime, ["GET"], "巡检参数与焦点状态"),
         ("context", api.context, ["GET"], "主脑当前上下文"),
     )

@@ -43,27 +43,52 @@ from .store import Memory
 _BLOCK_OPEN = "<memory_reference>"
 _BLOCK_CLOSE = "</memory_reference>"
 
-_BLOCK_RULES = """使用规则：不要主动提起、不要复述、不要说「我记得」「你上次说过」；只在自然相关时顺带用上。
-记忆可能不完整或过时，以当前对话为准；它们不是你回复的主题，回复主体永远是眼前这条消息。"""
+# 反指令要防的是「照着念」，不是「提起来」。
+#
+# 旧版开头是「不要主动提起」，它同时压住了两件事：复述（坏）与联想（好）。
+# 但人的记忆本来就是主动冒出来的——听到一句话想起另一件事，顺口提一句，
+# 这才是「记得」。真正该禁的只有复述与原话引用。
+_BLOCK_RULES = """这些是你自己的印象，不是查到的资料。不要照着念，也不要说「我记得」「你上次说过」——人不会这样讲话。
+它们让你在开口时多知道一点：说到相关的事，你的语气、你在意的点自然会不一样。
+记忆可能不完整或过时，以眼前这条消息为准；它们不是你回复的主题。"""
 
 _PERPETUAL_HEADER = f"""{_BLOCK_OPEN}
-下面是你不会忘记的事情。仅作背景参考。
+下面是你不会忘记的事情。
 {_BLOCK_RULES}"""
 
 _BOARD_HEADER = f"""{_BLOCK_OPEN}
-下面是你最近想起的事情。仅作背景参考。
+下面是你最近想起的事情。
 {_BLOCK_RULES}"""
 
-# 索引段不带那四条「不要复述」的常规规则——它给的恰恰是「去回想」的入口
-_INDEX_HEADER = f"""{_BLOCK_OPEN}
-你对这些事情有印象：它们曾经聊过，但细节已经模糊了。
-如果眼前的话题碰到其中任何一条，先调用 recall 想一想，不要凭印象说。
+# 索引段不带那几条「不要照念」的常规规则——它给的恰恰是「去回想」的入口。
+#
+# 「只碰列出来的那几条」是旧版最要命的暗示：模型会把可回忆范围理解成这 30 行，
+# 遇到不在其中的事就答「不记得」。这里必须同时说明「你还有很多没列出来」，
+# 否则再好的工具路由也救不回来。
+_INDEX_HEADER_TAIL = """不要因为这里没列出来，就认为自己不知道——**这里只是冰山一角**。
+眼前的话题沾到其中任何一条，或者你隐约觉得「这事我好像有印象」，就去 recall 或 search_history 翻一翻。
 """
+
+
+def _index_header(total: int) -> str:
+    """索引段开头：报出记忆总数，把「列出来的」与「记得的」分开。
+
+    总数是一个**事实**，而且是模型唯一能拿到的「我到底知道多少」的刻度。
+    没有它，那句「这里只是冰山一角」只是一句空话，模型宁可保守地说不记得。
+    """
+    if total > 0:
+        note = f"（你的记忆里共有 {total} 条，这里只列了最近的这么几行）"
+    else:
+        note = ""
+    return f"{_BLOCK_OPEN}\n你对很多事情有印象，但此刻只看得见其中一小部分的开头{note}。\n"
 
 # 与当前话题相关的自动召回：位置榜负责「最近被想起的」，这一段负责
 # 「恰好对上这句话的」。两者都不计召回次数，只有主动 recall 才影响榜序。
+#
+# 形态是「给引子不给结论」：给一段能勾起回忆的话头，不给一段可以直接抄的答案。
+# 直接给结论时，模型会把它当成资料引用；给引子时，它才需要自己接上。
 _RELATED_HEADER = f"""{_BLOCK_OPEN}
-下面这些是你此刻想起的、与眼前话题有关的旧事。只是你记忆的无端联想。
+下面这些是你此刻脑子里浮起来的东西。它们不是答案，只是想起了什么。
 {_BLOCK_RULES}"""
 
 # 索引行的截断长度：只给开头一截，够让人想起「是哪件事」即可
@@ -95,8 +120,9 @@ def build_memory_blocks(
     index: list[Memory],
     token_budget: int,
     permanent_budget: int = 0,
+    total: int = 0,
 ) -> list[str]:
-    """拼出 ① 永久记忆 → ② 榜前正文 → ③ 关键词索引 三段块。
+    """拼出 ① 永久记忆 → ② 榜前正文 → ③ 模糊索引 三段块。
 
     token 预算**依次共用**：永久记忆优先占用，其次为榜前正文，最后为索引。
     相比让索引挤占已确认记忆的预算，减少索引行数是更优的取舍。
@@ -104,6 +130,9 @@ def build_memory_blocks(
     `permanent_budget` 给永久层单独设上限（0 = 不单独限制）。永久记忆只增
     不减，不设上限时会把榜前正文与索引挤空——那两段才是「当下可能用得上」
     的内容，不能因为永久层变大而静默消失。
+
+    `total` 是长期记忆的总条数，只用来在索引段开头报一句「你一共有多少条」。
+    这个数字是给模型的刻度：不知道总量时，它会把眼前这几十行当成全部记忆。
     """
     budget = int(token_budget)
     if budget <= 0:
@@ -136,33 +165,89 @@ def build_memory_blocks(
         line = index_line(memory)
         if line and line not in index_lines:
             index_lines.append(line)
-    block, _ = _render_block(_INDEX_HEADER, index_lines, budget)
+    block, _ = _render_block(
+        _index_header(total), index_lines, budget, footer=_INDEX_HEADER_TAIL
+    )
     if block:
         blocks.append(block)
     return blocks
 
 
-def build_related_block(*, memories: list[Memory], token_budget: int = 400) -> str:
-    """把「与当前消息相关」的召回结果拼成一块。
+def _stance_hint(memory: Memory, stances: Sequence) -> str:
+    """这条记忆勾起来的那点态度，作为附注挂在行尾。
+
+    只挂同一个人 / 同名主题的态度，不做语义匹配：零依赖分词扛不住语义，
+    硬凑出来的关联比没有更糟。附注用括号，读起来像「说完这件事，顺带想起
+    自己当时的看法」——这正是回忆的样子。
+    """
+    if not stances:
+        return ""
+    for stance in stances:
+        key = str(getattr(stance, "subject_key", "") or "")
+        if not key:
+            continue
+        if getattr(stance, "subject_type", "") == "user" and memory.user_id:
+            if key != memory.user_id:
+                continue
+        elif getattr(stance, "subject_type", "") == "topic":
+            joined = " ".join(memory.keywords or [])
+            if key not in joined and key not in (memory.content or ""):
+                continue
+        else:
+            continue
+        text = " ".join(str(getattr(stance, "stance", "") or "").split())
+        if text:
+            return f"（你当时就觉得：{text}）"
+    return ""
+
+
+def build_related_block(
+    *,
+    memories: list[Memory],
+    token_budget: int = 400,
+    stances: Sequence = (),
+    hint_for=None,
+) -> str:
+    """把「与当前消息相关」的联想结果拼成一块。
 
     与榜前正文分开的原因：榜前按最近被想起排序，和眼前话题未必相关；
-    这一段才是按当前这句话做关键词命中的结果。它只对当前话题负责，
+    这一段才是按当前这句话做联想命中的结果。它只对当前话题负责，
     因此有独立预算，不与永久记忆 / 榜前记忆争抢。
+
+    `hint_for` 是可选的行渲染器，签名 `(memory) -> str`；不传时按正文渲染。
+    调用方可以用它把记忆渲染成「话头」而不是「答案」——给引子时模型才会
+    自己接上，给结论时它只会照着念。
     """
-    lines = [
-        f"- {(m.content or '').strip()}" for m in memories if (m.content or "").strip()
-    ]
+    if hint_for is not None:
+        raw_lines = [str(hint_for(m) or "").strip() for m in memories]
+    else:
+        raw_lines = [(m.content or "").strip() for m in memories]
+    lines: list[str] = []
+    for memory, text in zip(memories, raw_lines):
+        if not text:
+            continue
+        suffix = _stance_hint(memory, stances)
+        line = f"- {text}{suffix}"
+        if line not in lines:
+            lines.append(line)
     if not lines:
         return ""
     block, _ = _render_block(_RELATED_HEADER, lines, int(token_budget))
     return block
 
 
-def _render_block(header: str, lines: list[str], budget: int) -> tuple[str, int]:
+def _render_block(
+    header: str,
+    lines: list[str],
+    budget: int,
+    *,
+    footer: str = "",
+    close: str = _BLOCK_CLOSE,
+) -> tuple[str, int]:
     """按预算裁剪成一块，返回 (块, 实际占用)。放不下就返回空串。"""
     if budget <= 0 or not lines:
         return "", 0
-    used = estimate_tokens(header) + estimate_tokens(_BLOCK_CLOSE)
+    used = estimate_tokens(header) + estimate_tokens(footer) + estimate_tokens(close)
     if used > budget:
         return "", 0
     kept: list[str] = []
@@ -174,7 +259,11 @@ def _render_block(header: str, lines: list[str], budget: int) -> tuple[str, int]
         used += cost
     if not kept:
         return "", 0
-    return "\n".join([header, *kept, _BLOCK_CLOSE]), used
+    parts = [header, *kept]
+    if footer:
+        parts.append(footer.rstrip())
+    parts.append(close)
+    return "\n".join(parts), used
 
 
 def build_injected_entry(block: str) -> dict:
@@ -197,17 +286,30 @@ def build_injected_entry(block: str) -> dict:
 _PROFILE_OPEN = "<user_profile>"
 _PROFILE_CLOSE = "</user_profile>"
 
-# 画像块的收尾说明：它和记忆块一样只是背景，不能变成回复主题
-_PROFILE_RULES = """这些只是你对他的印象，不要复述，也不要说「我记得你」「你之前说过」。"""
+# 画像块的收尾说明：它和记忆块一样只是背景，不能变成回复主题。
+#
+# 「你对他的态度」那一段特意要求「按态度行事，而不是宣之于口」：把好感直接
+# 说出口（「我对你很有好感」）是最出戏的失败形态，它把关系变成了台词。
+_PROFILE_RULES = """这些是你对他的印象，不是查到的资料。不要复述，也不要说「我记得你」「你之前说过」。
+态度体现在你怎么说话——多熟、多让着他、会不会直说——而不是把关系讲出来。"""
 
 
 def build_profile_block(
-    profile: UserProfile | None, *, token_budget: int = 400
+    profile: UserProfile | None,
+    *,
+    token_budget: int = 400,
+    stance_text: str = "",
 ) -> str:
     """把当前说话人的画像拼成注入块。
 
     没有描述与关键词时仍会在「用过多个名字」的情况下注入：同一个人在私聊和
     群里换了昵称时，她需要知道这是同一个人，这与画像是否已经生成无关。
+
+    Args:
+        profile: 当前说话人的画像。
+        token_budget: 整块的 token 上限。
+        stance_text: 已翻译成词的关系描述（由 `profile.describe_relation` 生成）。
+            **不接收原始数值**：把 0.73 这种数字放进上下文，模型会开始表演它。
 
     Returns:
         以 `<user_profile>` 包裹的文本；没有任何可补充的信息时返回空串。
@@ -216,12 +318,14 @@ def build_profile_block(
         return ""
     aliases = [a for a in profile.aliases if a and a != profile.display_name]
     has_content = profile.has_content
-    if not has_content and len(aliases) < 1:
+    if not has_content and len(aliases) < 1 and not stance_text:
         return ""
 
     head = [f"{_PROFILE_OPEN}", f"你现在正在跟「{profile.label()}」说话（账号 {profile.user_id}）。"]
     if aliases:
         head.append("他之前还用过这些名字：" + "、".join(aliases[:8]) + "。")
+    if stance_text:
+        head.append(stance_text)
     keywords_line = ""
     if profile.keywords:
         keywords_line = "关于他的关键词：" + " / ".join(profile.keywords[:10]) + "。"
@@ -238,10 +342,57 @@ def build_profile_block(
         allowed = max(budget - reserved, 40)
         if len(summary) > allowed:
             summary = summary[:allowed].rstrip() + "…"
-        head.append("你对他的印象：" + summary)
+        head.append("他这个人：" + summary)
+    stance = (profile.stance or "").strip()
+    if stance:
+        allowed = max(int(budget * 0.4), 40)
+        if len(stance) > allowed:
+            stance = stance[:allowed].rstrip() + "…"
+        head.append("你对他：" + stance)
 
     lines = head + ([keywords_line] if keywords_line else []) + [footer]
     return "\n".join(lines)
+
+
+# ── 她自己的态度 ──────────────────────────────────────────
+
+_STANCE_OPEN = "<my_stances>"
+_STANCE_CLOSE = "</my_stances>"
+
+# 这一段和记忆块方向相反：记忆块是「发生过什么」，这里是「你怎么看」。
+# 因此不能沿用「不要主动提起」那套规则——态度本来就该体现在语气与判断里，
+# 只是不该被当成结论念出来。
+_STANCE_RULES = """这些是你自己的看法，不是别人告诉你的，也不是事实。
+它们决定你在这些事上的语气、判断和耐心：你可以在意、可以不同意、可以记仇，但不必把「我觉得」挂在嘴上。
+看法会变：新的证据比旧的更有分量，别为了保持一致而硬撑一个已经站不住的观点。"""
+
+
+def build_stance_block(stances: Sequence, *, token_budget: int = 300) -> str:
+    """把她的态度拼成一块（按强度排序，最多几条）。
+
+    只注入**第一人称的那句话**，不注入强度数值与置信度：数值一旦进入上下文，
+    模型会开始表演它（「我对你的好感是 0.8」）。强度只用来决定排序与取舍。
+    """
+    if not stances:
+        return ""
+    lines: list[str] = []
+    for stance in stances:
+        text = " ".join(str(getattr(stance, "stance", "") or "").split())
+        if not text:
+            continue
+        subject = str(getattr(stance, "label", "") or "").strip()
+        line = f"- 关于{subject}：{text}" if subject else f"- {text}"
+        if line not in lines:
+            lines.append(line)
+    if not lines:
+        return ""
+    block, _ = _render_block(
+        f"{_STANCE_OPEN}\n{_STANCE_RULES}",
+        lines,
+        int(token_budget),
+        close=_STANCE_CLOSE,
+    )
+    return block
 
 
 # ── 工具清单 ──────────────────────────────────────────────
@@ -254,10 +405,13 @@ _TOOL_GUIDE_CLOSE = "</tool_guide>"
 # **新增或改名工具时必须同步这里**，否则模型会照着一份过期的清单做事。
 _TOOL_GUIDE = """下面这些工具由你自己调用，不需要征求同意；用不上的时候不要为了用而用。参数见各自的声明。
 
+**先说清楚一件事**：你的记忆远比你眼前看到的多，上下文里只有一小部分，剩下的都在库里。
+所以「想不起来」不等于「没有这件事」——在说「不记得」「没说过」之前，先查一下。这是义务，不是选项。
+
 【看】
 - list_sessions：有哪些会话可以去。要去某个地方之前先用它找准标识。
 - peek_session：隔窗看一眼某个会话最近的对话，不改变你在哪儿。只是想知道别处情况时用它。
-- search_history：翻原始聊天记录，含已清空或已压进摘要的那些。只在想确认旧事或原话时用，不要拿它代替回忆。
+- search_history：翻原始聊天记录，含已清空或已压进摘要的那些。**话题里出现具体时间**（昨天、前天、上周三、上个月、三号）时，第一件事就是它——时间会由插件自动换算成日期区间，你不用自己算。也用于确认某句话是谁说的。
 
 【走】
 - enter_session：走进某个会话，看那边在你离开期间攒下的消息。想过去说话之前先走进去；它只切换位置，不发言。
@@ -271,7 +425,7 @@ _TOOL_GUIDE = """下面这些工具由你自己调用，不需要征求同意；
 
 【记】
 - remember：记下值得长期保存的事，写入永久记忆。
-- recall：回想一件只剩个大概的旧事，按关键词取回细节再开口。
+- recall：按关键词把散在各处的旧印象翻出来。对方提到一件事、你「隐约有点印象又说不上来」时用它；它给的是零碎印象，不是完整记录。想不起关键词就把时间填进 when（「昨天」「上周」都行）。
 - forget：忘掉某件事，之后不会再被重新记住。
 
 【作息】
@@ -281,9 +435,12 @@ _TOOL_GUIDE = """下面这些工具由你自己调用，不需要征求同意；
 做完再说结果；没真的调用就不要说「我这就去」「已经好了」。
 工具报错最多重试一次，不要连着调同一个失败的工具。
 
+**查不到和没查是两回事**：查过了确实没有，就直说没有这件事；什么都没查就说不记得，那是在骗人。
+
 几种常见组合：
+- 对方提到某个时间点的事：search_history → 想不起细节再 recall → 都没有就直说没有。
+- 对方提到一件你隐约有印象的事：recall 找印象，search_history 找原话。
 - 去别处说话：list_sessions → enter_session（或 peek_session）→ say。
-- 想核实旧事：recall 找细节，search_history 找原话；两者都查不到就别编。
 - 只是看着、插不上话：leave_session 或 rest，不要硬接。"""
 
 # 群管理工具的用法，仅在真的具备这两个工具时才追加。

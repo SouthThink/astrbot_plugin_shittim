@@ -825,19 +825,29 @@ class ShortTermLedger:
         chat_id: str | None,
         keyword: str = "",
         since: float = 0.0,
+        until: float = 0.0,
         limit: int = 20,
     ) -> list[sqlite3.Row]:
-        """按关键词查询历史消息，返回时间正序。
+        """按关键词与时间区间查询历史消息，返回时间正序。
 
         **刻意不使用 `_LIVE_SQL`**：该工具用于历史回查，已清空
         （`archived_at`）与已压入摘要（`condensed_at`）的行正是查询目标。
         唯一排除睡眠期暂存（`staged = 1`），这些消息在起床前不应对模型可见。
 
         关键词同时匹配正文、发言人名称、图片描述与转发内容，使这些内容也可检索。
+
+        `chat_id` 传 None 表示**跨全部会话**查找：「昨天群里说的那件事」可能发生在
+        她当时不在的那个群，只查当前会话会漏掉。
+
+        `until` 是时间区间的右端（不含），0 表示不封顶。它是「昨天」「上周三」
+        这类时间词的落点：时间由插件算成区间，不交给模型自己比对日期。
         """
         limit = max(int(limit), 1)
         clauses = ["staged = 0", "created_at >= ?"]
         params: list = [float(since)]
+        if until and float(until) > 0:
+            clauses.append("created_at < ?")
+            params.append(float(until))
         if chat_id:
             clauses.append("chat_id = ?")
             params.append(chat_id)
@@ -860,6 +870,35 @@ class ShortTermLedger:
             tuple(params),
         )
         return list(reversed(rows))
+
+    def count_history(
+        self,
+        *,
+        chat_id: str | None,
+        since: float = 0.0,
+        until: float = 0.0,
+    ) -> int:
+        """区间内有多少条历史消息（不算关键词）。
+
+        用来让模型知道「查过、确实没有」与「没查」的区别：区间内条数为 0 是
+        真的那段时间没有对话，条数大于 0 但关键词没命中，说明该换个说法再查。
+        """
+        clauses = ["staged = 0", "created_at >= ?"]
+        params: list = [float(since)]
+        if until and float(until) > 0:
+            clauses.append("created_at < ?")
+            params.append(float(until))
+        if chat_id:
+            clauses.append("chat_id = ?")
+            params.append(chat_id)
+        row = self._db.query_one(
+            f"""
+            SELECT COUNT(*) AS n FROM short_term_messages
+             WHERE {' AND '.join(clauses)}
+            """,
+            tuple(params),
+        )
+        return int(row["n"]) if row else 0
 
     def page(
         self, chat_id: str | None, limit: int, offset: int

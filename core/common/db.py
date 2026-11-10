@@ -12,7 +12,9 @@ import sqlite3
 import threading
 from pathlib import Path
 
-SCHEMA_VERSION = 13
+from .timeexpr import day_key
+
+SCHEMA_VERSION = 14
 
 # 增量列迁移：用于给已存在的库补列，避免升级插件时丢数据
 _COLUMN_MIGRATIONS = (
@@ -63,6 +65,15 @@ _COLUMN_MIGRATIONS = (
     # 「她最后一次真正在这个会话里」的时刻，用于算「离开期间攒下的未读」。
     # 与 focused_at 分开：收消息、超时都会刷新焦点，但都不代表她看过那些消息。
     ("session_focus", "last_read_at", "REAL NOT NULL DEFAULT 0"),
+    # 这条记忆所覆盖的**自然日**（本地时区 `YYYY-MM-DD`）。
+    # 按天查记忆不能只靠 promoted_at：它是入榜位置，当天摘要与合并结果用的是
+    # 整理时刻（凌晨 01:30），会落到「昨天」的区间之外。写入时算好这个键，
+    # 「昨天发生了什么」就有确定答案，不必每次靠时间区间猜。
+    ("memories", "covered_date", "TEXT NOT NULL DEFAULT ''"),
+    # 画像里的态度与关系：observations 是「他是什么样的人」，
+    # stance/dimensions 是「我怎么看他」。旧画像两样都没有，先留空。
+    ("user_profiles", "stance", "TEXT NOT NULL DEFAULT ''"),
+    ("user_profiles", "dimensions", "TEXT NOT NULL DEFAULT '{}'"),
 )
 
 # 建在「迁移后才存在的列」上的索引：**必须**在补列之后创建。
@@ -74,6 +85,8 @@ _POST_MIGRATION_INDEXES = (
     "ON short_term_messages (condensed_at, archived_at, id)",
     "CREATE INDEX IF NOT EXISTS idx_mem_promoted "
     "ON memories (tier, promoted_at DESC)",
+    # 「昨天发生了什么事」按自然日取记忆：没有该索引会全表扫
+    "CREATE INDEX IF NOT EXISTS idx_mem_covered ON memories (covered_date)",
     # strength 已退役（权重召回被位置榜取代），旧库上的该索引只会造成误导
     "DROP INDEX IF EXISTS idx_mem_tier",
     # extracted 的「待提炼」通道已并入短期收口（压缩即提炼），该索引只会增加记账开销
@@ -149,11 +162,39 @@ CREATE TABLE IF NOT EXISTS memories (
     forget_requested_at REAL NOT NULL DEFAULT 0,
     worthless        INTEGER NOT NULL DEFAULT 0,
     worthless_at     REAL    NOT NULL DEFAULT 0,
-    worthless_checked_at REAL NOT NULL DEFAULT 0
+    worthless_checked_at REAL NOT NULL DEFAULT 0,
+    covered_date     TEXT    NOT NULL DEFAULT ''
 );
 CREATE INDEX IF NOT EXISTS idx_mem_tier  ON memories (tier, strength);
 CREATE INDEX IF NOT EXISTS idx_mem_user  ON memories (user_id);
 CREATE INDEX IF NOT EXISTS idx_mem_stale ON memories (last_recalled_at);
+-- 注意：covered_date 是迁移列，建在它上面的索引一律放 _POST_MIGRATION_INDEXES。
+-- 老库里 memories 表已经存在，CREATE TABLE IF NOT EXISTS 不会补列，
+-- 在 _DDL 里建索引会在 ALTER TABLE 之前执行，直接报 no such column: covered_date。
+
+-- 态度：她对人、对事的看法与感受。**不放进 memories 表**，两者生命周期不同：
+-- 记忆是「发生了什么」，会随名次下沉被模糊、最终被遗忘；态度是「我怎么想」，
+-- 只会被改写，不会被遗忘——「我觉得他其实挺怕麻烦的」被压成关键词碎片是很怪的。
+-- subject_type 取值：user（按 QQ 号）/ topic（按关键词）/ self（对自身处境）。
+-- 同一个对象可有多个 dimension（view 看法 / relation 关系…），联合唯一。
+CREATE TABLE IF NOT EXISTS stances (
+    id            INTEGER PRIMARY KEY AUTOINCREMENT,
+    subject_type  TEXT    NOT NULL,
+    subject_key   TEXT    NOT NULL,
+    subject_name  TEXT    NOT NULL DEFAULT '',
+    dimension     TEXT    NOT NULL DEFAULT 'view',
+    stance        TEXT    NOT NULL,
+    basis         TEXT    NOT NULL DEFAULT '[]',   -- 依据：记忆 id + 逐字原话
+    intensity     REAL    NOT NULL DEFAULT 0.5,    -- 0~1，态度有多强
+    confidence    REAL    NOT NULL DEFAULT 0.4,    -- 0~1，她有多确信
+    evidence_count INTEGER NOT NULL DEFAULT 1,
+    revision      INTEGER NOT NULL DEFAULT 1,
+    first_at      REAL    NOT NULL,
+    updated_at    REAL    NOT NULL,
+    UNIQUE (subject_type, subject_key, dimension)
+);
+CREATE INDEX IF NOT EXISTS idx_stance_subject ON stances (subject_type, subject_key);
+CREATE INDEX IF NOT EXISTS idx_stance_updated ON stances (updated_at DESC);
 
 -- 短期摘要：把一段较早的对话（或更早的摘要）压成一条，构成短期层的「远期背景」。
 -- 它是分层压缩的产物，也是二次合并的输入——被吸收时同样置 condensed_at。
@@ -199,6 +240,8 @@ CREATE TABLE IF NOT EXISTS user_profiles (
     display_name  TEXT    NOT NULL DEFAULT '',
     summary       TEXT    NOT NULL DEFAULT '',
     keywords      TEXT    NOT NULL DEFAULT '[]',
+    stance        TEXT    NOT NULL DEFAULT '',
+    dimensions    TEXT    NOT NULL DEFAULT '{}',
     message_count INTEGER NOT NULL DEFAULT 0,
     first_seen    REAL    NOT NULL DEFAULT 0,
     last_seen     REAL    NOT NULL DEFAULT 0,
@@ -305,6 +348,7 @@ class MemoryDB:
         for statement in _POST_MIGRATION_INDEXES:
             self._conn.execute(statement)
         self._backfill_promoted_at()
+        self._backfill_covered_date()
         self._conn.execute(
             "UPDATE meta SET value = ? WHERE key = 'schema_version'",
             (str(SCHEMA_VERSION),),
@@ -329,6 +373,38 @@ class MemoryDB:
              WHERE promoted_at = 0
             """
         )
+
+    def _backfill_covered_date(self) -> None:
+        """老库补上「覆盖的自然日」。
+
+        新列默认空串，按天查记忆时这批老数据会被整体漏掉。回填顺序与
+        `promoted_at` 一致（整理时刻 > 召回时刻 > 创建时刻），因为入榜位置
+        本来就取自「这段发言覆盖的末尾时间」。只在空值上动手，幂等。
+        """
+        rows = self._conn.execute(
+            """
+            SELECT id, created_at, last_recalled_at, last_curated_at, promoted_at
+              FROM memories
+             WHERE covered_date = ''
+            """
+        ).fetchall()
+        if not rows:
+            return
+        updates = []
+        for row in rows:
+            moment = (
+                float(row["promoted_at"] or 0)
+                or float(row["last_curated_at"] or 0)
+                or float(row["last_recalled_at"] or 0)
+                or float(row["created_at"] or 0)
+            )
+            key = day_key(moment)
+            if key:
+                updates.append((key, int(row["id"])))
+        if updates:
+            self._conn.executemany(
+                "UPDATE memories SET covered_date = ? WHERE id = ?", updates
+            )
 
     @property
     def lock(self) -> threading.RLock:

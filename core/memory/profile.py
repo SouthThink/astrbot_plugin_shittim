@@ -39,6 +39,25 @@
 覆盖、不再有独立价值的记忆编号。调用方据此**删除**这些条目——画像接住了
 它们的信息，留着只是重复。`manual=1`（明确要求记住的）永不参与删除。
 
+## 观察与态度分开
+
+画像有**两半**，混在一起就会变成「该用户为人友善，我很喜欢他」这种不像人话
+的东西：
+
+- `summary` / `keywords`：观察到的他。第三人称、客观、可核验。
+- `stance` / `dimensions`：她对他的看法。第一人称、主观、允许多次改写。
+
+`dimensions` 只有三个：`familiarity` / `trust` / `closeness`，都是 0~1。
+它们在落库前要过两道处理，缺一不可：
+
+1. **缓慢回归**（`merge_dimensions()`）：新值只占 35%，旧值占 65%。模型看到
+   一段开心的对话就写 trust=0.95，第二天看到一次争吵又写 trust=0.1，不回归的
+   话关系状态会在两天里来回横跳，表现成「她对他忽冷忽热」。回归让长期状态
+   只随持续的证据漂移。
+2. **不注入数值**：注入侧只把数值翻译成「很熟 / 一般 / 刚认识」这类描述，
+   见 `injector.build_profile_block()`。把 0.73 这种数字递给主脑，它会开始
+   表演这个数字——「我今天对你亲近度 73%」不是人说话的方式。
+
 ## 失败处理
 
 模型不可用、调用失败或输出不可解析时**不更新** `profiled_at`，下一轮整理
@@ -64,6 +83,106 @@ _MAX_LINE_CHARS = 200
 # 单次带入的长期 / 永久记忆条数：画像是摘要而不是档案，素材宁精不宁多
 _MAX_PROFILE_MEMORIES = 20
 
+# 关系维度：与 extractor._RELATION_DIMENSIONS 一一对应。
+# 初始值取 0.3 / 0.3 / 0.25：刚认识的人不熟、也谈不上信不信任，
+# 但不能是 0——0 会让「亲近感」永远起步不了（回归是乘法式的）。
+DIMENSIONS = ("familiarity", "trust", "closeness")
+_DIMENSION_SEEDS: dict[str, float] = {
+    "familiarity": 0.3,
+    "trust": 0.3,
+    "closeness": 0.25,
+}
+# 新观测只占这么多，其余来自旧值：关系是慢变量，一次对话推不动它
+_DIMENSION_RATE = 0.35
+# 三个维度都还在种子值这个带宽内，就当作「还没处出关系来」，不写进画像块
+_DIMENSION_SEED_BAND = 0.06
+# 关系描述不用数值，用词。档位与 injector 的渲染一一对应。
+# 最后一档的门槛是 0：任何取值都要能翻成一个词，否则注入侧会出现空行。
+_DIMENSION_WORDS: dict[str, tuple[tuple[float, str], ...]] = {
+    "familiarity": ((0.7, "很熟"), (0.4, "聊过不少"), (0.0, "刚认识")),
+    "trust": ((0.7, "信得过"), (0.4, "还谈不上完全放心"), (0.0, "摸不准")),
+    "closeness": ((0.7, "亲近"), (0.4, "相处还算自然"), (0.0, "还没熟络起来")),
+}
+
+
+def merge_dimensions(
+    old: dict[str, float] | None, new: dict[str, float] | None
+) -> dict[str, float]:
+    """把模型给的新关系值缓慢合进旧值。
+
+    纯函数。缺失的维度沿用旧值（新人也从种子值起步），未知键直接丢弃——
+    存下没人读的东西只会让下次的提示词里多出一行噪音。
+    """
+    merged: dict[str, float] = {}
+    old = old or {}
+    new = new or {}
+    for name in DIMENSIONS:
+        base = old.get(name)
+        if not isinstance(base, (int, float)):
+            base = _DIMENSION_SEEDS[name]
+        candidate = new.get(name)
+        if isinstance(candidate, (int, float)):
+            value = _DIMENSION_RATE * float(candidate) + (1.0 - _DIMENSION_RATE) * float(base)
+        else:
+            value = float(base)
+        merged[name] = max(0.0, min(value, 1.0))
+    return merged
+
+
+def describe_dimension(name: str, value: float) -> str:
+    """把 0~1 的数值翻译成一个词。
+
+    注入侧只给词、不给数：把 0.73 递给模型，它会照着这个数字表演。
+    """
+    for threshold, word in _DIMENSION_WORDS.get(name, ()):
+        if value >= threshold:
+            return word
+    return ""
+
+
+def describe_relation(dimensions: dict[str, float] | None) -> str:
+    """把三个关系维度拼成一句话，交给画像块。
+
+    拼法是「你跟他很熟，信得过，也亲近」这类**第一人称的关系描述**，不是
+    「familiarity=0.7」。原因同 `describe_dimension`：数值会被表演，词不会。
+
+    三个维度都还在种子值附近时返回空串：那是「还没处出关系来」，
+    此时说一句「你跟他：刚认识，摸不准，还没熟络起来」只是噪音——
+    刚认识的人本来就是这样，不需要专门告诉她一遍。
+    """
+    dimensions = dimensions or {}
+    if not dimensions:
+        return ""
+    near_seed = all(
+        abs(float(dimensions.get(name, _DIMENSION_SEEDS[name])) - _DIMENSION_SEEDS[name])
+        <= _DIMENSION_SEED_BAND
+        for name in DIMENSIONS
+        if isinstance(dimensions.get(name), (int, float))
+    )
+    if near_seed:
+        return ""
+    words: list[str] = []
+    for name in DIMENSIONS:
+        value = dimensions.get(name)
+        if not isinstance(value, (int, float)):
+            continue
+        word = describe_dimension(name, float(value))
+        if word:
+            words.append(word)
+    if not words:
+        return ""
+    return "你跟他：" + "，".join(words) + "。"
+
+
+def _json_obj(raw) -> dict:
+    if not raw:
+        return {}
+    try:
+        value = json.loads(str(raw))
+    except (TypeError, ValueError):
+        return {}
+    return value if isinstance(value, dict) else {}
+
 
 def _json_list(raw) -> list:
     if not raw:
@@ -84,6 +203,9 @@ class UserProfile:
     display_name: str = ""
     summary: str = ""
     keywords: list[str] = field(default_factory=list)
+    # 她对他的看法（第一人称）与关系状态（0~1）。见模块开头的「观察与态度分开」。
+    stance: str = ""
+    dimensions: dict[str, float] = field(default_factory=dict)
     aliases: list[str] = field(default_factory=list)
     message_count: int = 0
     first_seen: float = 0.0
@@ -97,9 +219,10 @@ class UserProfile:
         """是否有值得注入 / 展示的「印象」。
 
         只有名字、没有描述与关键词时不算画像——名字本身已经随消息出现，
-        单独注入只是重复。
+        单独注入只是重复。态度也算内容：有些人她答不上来「他是谁」，
+        但已经能说出「我不太喜欢跟他说话」。
         """
-        return bool(self.summary or self.keywords)
+        return bool(self.summary or self.keywords or self.stance)
 
     def label(self) -> str:
         """页面与日志用的可读名字。"""
@@ -117,6 +240,12 @@ def _profile_from_row(row: sqlite3.Row, aliases: list[str]) -> UserProfile:
         display_name=display_name,
         summary=str(row["summary"] or ""),
         keywords=[str(k) for k in _json_list(row["keywords"]) if str(k).strip()],
+        stance=str(row["stance"] or ""),
+        dimensions={
+            str(k): float(v)
+            for k, v in _json_obj(row["dimensions"]).items()
+            if isinstance(v, (int, float))
+        },
         aliases=aliases,
         message_count=int(row["message_count"] or 0),
         first_seen=float(row["first_seen"] or 0.0),
@@ -309,19 +438,40 @@ class ProfileStore:
         *,
         summary: str,
         keywords: list[str],
+        stance: str | None = None,
+        dimensions: dict[str, float] | None = None,
     ) -> bool:
         """用模型产出的完整结果替换描述与关键词。
 
         刻意做**整体替换**而非合并：删除关键词只能靠「新列表里没有它」来表达。
+
+        `stance` 传 None 表示「模型这次没给」→ 保留旧值；传空串表示「明确
+        清空」（例如刚认识、还没形成看法）。两者不能混用：`_update_one()` 只在
+        模型确实给了非空态度时才传值，其余情况传 None。
+
+        `dimensions` 走 `merge_dimensions()` 的缓慢回归，不整体替换——
+        关系是累积出来的，不是每轮重算的。
         """
         if not user_id:
             return False
         now = time.time()
+        current = self.get(user_id)
+        merged_dims = merge_dimensions(
+            current.dimensions if current else None, dimensions
+        )
+        if stance is None:
+            stance_sql = "stance = stance"
+            stance_params: tuple = ()
+        else:
+            stance_sql = "stance = ?"
+            stance_params = (stance.strip(),)
         cursor = self._db.execute(
-            """
+            f"""
             UPDATE user_profiles
                SET summary = ?,
                    keywords = ?,
+                   {stance_sql},
+                   dimensions = ?,
                    profiled_at = ?,
                    updated_at = ?
              WHERE user_id = ?
@@ -331,6 +481,8 @@ class ProfileStore:
                 json.dumps(
                     [k for k in keywords if str(k).strip()], ensure_ascii=False
                 ),
+                *stance_params,
+                json.dumps(merged_dims, ensure_ascii=False),
                 now,
                 now,
                 user_id,
@@ -338,8 +490,15 @@ class ProfileStore:
         )
         return bool(getattr(cursor, "rowcount", 0))
 
-    def edit(self, user_id: str, *, summary: str, keywords: list[str]) -> bool:
-        """页面手工改写印象（描述与关键词）。
+    def edit(
+        self,
+        user_id: str,
+        *,
+        summary: str,
+        keywords: list[str],
+        stance: str | None = None,
+    ) -> bool:
+        """页面手工改写印象（描述与关键词，可选态度）。
 
         与 `update()` 的唯一区别是**不推进 `profiled_at`**：那是「素材读到哪」
         的水位线，由整理流程维护。手工改动若把它抬到当下，此后到今天为止他
@@ -347,11 +506,18 @@ class ProfileStore:
         """
         if not user_id:
             return False
+        if stance is None:
+            stance_sql = "stance = stance"
+            stance_params: tuple = ()
+        else:
+            stance_sql = "stance = ?"
+            stance_params = (stance.strip(),)
         cursor = self._db.execute(
-            """
+            f"""
             UPDATE user_profiles
                SET summary = ?,
                    keywords = ?,
+                   {stance_sql},
                    updated_at = ?
              WHERE user_id = ?
             """,
@@ -361,6 +527,7 @@ class ProfileStore:
                     [str(k).strip() for k in keywords if str(k).strip()],
                     ensure_ascii=False,
                 ),
+                *stance_params,
                 time.time(),
                 user_id,
             ),
@@ -536,26 +703,34 @@ class ProfileMaintainer:
             keywords=profile.keywords,
             records=records,
             memories=self._render_memories(memories),
+            stance=profile.stance,
+            dimensions=profile.dimensions,
         )
         if result is None:
             return False
-        summary, keywords, absorbed = result
-        if not self._store.update(
+        # build_profile 返回 ProfileDraft；态度为空串时传 None 以保留旧值
+        updated = self._store.update(
             profile.user_id,
-            summary=summary,
-            keywords=keywords,
-        ):
+            summary=result.summary,
+            keywords=result.keywords,
+            stance=result.stance or None,
+            dimensions=result.dimensions,
+        )
+        if not updated:
             return False
-        removed = self._absorb(memories, absorbed)
+        removed = self._absorb(memories, result.absorbed)
         logger.info(
             "[什亭之枢] 用户画像已更新 | %s（%s）| 发言%d条 + 记忆%d条 → "
-            "描述%d字 / 关键词%d个 / 吸收删除%d条",
+            "描述%d字 / 关键词%d个 / 态度%d字 / 关系%s / 吸收删除%d条",
             profile.label(),
             profile.user_id,
             len(rows),
             len(memories),
-            len(summary),
-            len(keywords),
+            len(result.summary),
+            len(result.keywords),
+            len(result.stance or ""),
+            " ".join(f"{k}={v:.2f}" for k, v in (result.dimensions or {}).items())
+            or "未更新",
             removed,
         )
         return True

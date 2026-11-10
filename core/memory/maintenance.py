@@ -57,14 +57,21 @@ def _jaccard(left: set[str], right: set[str]) -> float:
 class MemoryMaintainer:
     """记忆的衰减、遗忘、晋升与合并。"""
 
-    def __init__(self, store: MemoryStore, extractor, config, short_term=None):
+    def __init__(
+        self, store: MemoryStore, extractor, config, short_term=None, stances=None
+    ):
         self._store = store
         self._extractor = extractor
         self._config = config
         self._short_term = short_term
+        # 态度库：压缩时顺带产出的 stances 写到这里。可以不给（老调用方、
+        # 单测），给了才写。
+        self._stances = stances
 
     def update_config(self, config) -> None:
         self._config = config
+        if self._stances is not None:
+            self._stances.update_config(config)
 
     async def run(self, *, curate_budget: int = 20) -> dict:
         """执行一次完整维护，返回统计信息（供日志与排障使用）。
@@ -213,11 +220,13 @@ class MemoryMaintainer:
             return stats
         if await self._condense_batch(picked, stats):
             logger.info(
-                "[什亭之枢] 短期压缩完成 条目%d→%d 折叠%d条 新增记忆%d条",
+                "[什亭之枢] 短期压缩完成 条目%d→%d 折叠%d条 新增记忆%d条 态度%d新%d改",
                 stats["entries"],
                 stats["entries"] - stats["folded"] + 1,
                 stats["folded"],
                 stats["memories_created"],
+                stats.get("stances_created", 0),
+                stats.get("stances_updated", 0),
             )
         else:
             stats["failed"] = True
@@ -287,7 +296,14 @@ class MemoryMaintainer:
             return False
         # 不传 created_at：promoted_at 取当下，当天摘要于是**确定性地**排在榜首
         # （同刻写入的靠 id 兜底，它的 id 最大）。这是「排最前＝最详细」的落点。
-        self._store.add(content=content, tags=["当天摘要"], tier=TIER_LONG)
+        # `covered_at` 仍要传：当天摘要记的是那一天的事，「昨天聊了什么」这类
+        # 时间联想必须能查到它，所以它落在被覆盖的那一天而不是写入的当下。
+        self._store.add(
+            content=content,
+            tags=["当天摘要"],
+            tier=TIER_LONG,
+            covered_at=float(row["covered_at"] or 0.0) or None,
+        )
         self._short_term.retire_summary(int(row["id"]))
         logger.info("[什亭之枢] 当天摘要已写入长期记忆：%s", content[:40])
         return True
@@ -307,13 +323,24 @@ class MemoryMaintainer:
         )
         if result is None:
             return False
-        summary, memories = result
         context = self._short_term.condense_context(entries)
-        created, reinforced = self._write_condensed_memories(memories, context)
+        created, reinforced = self._write_condensed_memories(result.memories, context)
         stats["memories_created"] += created
         stats["memories_reinforced"] += reinforced
+        # 态度单独落库：它不属于位置榜，不进 summary，也不是「值得记住的事」。
+        # 一批对话同时产出「发生了什么」和「你怎么看」，两者分开存。
+        if result.stances and self._stances is not None:
+            applied = self._stances.apply(
+                result.stances, name_to_id=context.get("name_to_id")
+            )
+            stats["stances_created"] = stats.get("stances_created", 0) + applied[
+                "created"
+            ]
+            stats["stances_updated"] = stats.get("stances_updated", 0) + applied[
+                "updated"
+            ]
         if not self._short_term.apply_condensation(
-            summary=summary, entries=entries, covered_count=len(entries)
+            summary=result.summary, entries=entries, covered_count=len(entries)
         ):
             return False
         stats["folded"] += len(entries)
@@ -330,6 +357,8 @@ class MemoryMaintainer:
             "summaries": 0,
             "memories_created": 0,
             "memories_reinforced": 0,
+            "stances_created": 0,
+            "stances_updated": 0,
             "day_summary": False,
             "failed": False,
         }
@@ -363,6 +392,7 @@ class MemoryMaintainer:
                 user_id=context["name_to_id"].get(name),
                 user_name=name or None,
                 promoted_at=context.get("covered_at") or None,
+                covered_at=context.get("covered_at") or None,
             )
             if is_new:
                 created += 1

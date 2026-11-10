@@ -190,6 +190,41 @@
         "type": "int",
         "default": 400
       },
+      "auto_recall_cooldown_seconds": {
+        "description": "同一段联想在同一会话内不重复注入的间隔（秒）；0 表示每轮都重新联想",
+        "type": "int",
+        "default": 1800
+      },
+      "time_recall_top_k": {
+        "description": "联想时按时间区间（如「昨天」「上周三」）取回的记忆条数上限；0 表示关闭时间路联想",
+        "type": "int",
+        "default": 4
+      },
+      "stance_enabled": {
+        "description": "态度提炼开关；开启后压缩时另出一份她对某人某事的看法，关闭后只提炼事实，已有的态度保留但不再更新",
+        "type": "bool",
+        "default": true
+      },
+      "stance_inject": {
+        "description": "是否把她自己的态度注入主脑上下文；只注入第一人称的看法，不注入强度数值",
+        "type": "bool",
+        "default": true
+      },
+      "stance_token_budget": {
+        "description": "态度块的 token 预算（token）；与画像、记忆块各自独立",
+        "type": "int",
+        "default": 300
+      },
+      "stance_top": {
+        "description": "态度块最多显示几条（按态度强度取）；数值越大越容易被想起",
+        "type": "int",
+        "default": 6
+      },
+      "relation_inject": {
+        "description": "是否把关系强度（熟悉 / 信任 / 亲近）翻译成词注入画像块；关闭后画像只留文字描述",
+        "type": "bool",
+        "default": true
+      },
       "maintenance_enabled": {
         "description": "记忆维护（降级 / 遗忘 / 晋升 / 合并）开关；不影响短期压缩与深睡收口",
         "type": "bool",
