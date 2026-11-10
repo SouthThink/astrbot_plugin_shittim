@@ -75,6 +75,7 @@ from .core.common.event_utils import (
     platform_of,
     set_extra,
 )
+from .core.common.model_json import parse_model_json
 from .core.common.time_utils import format_age, format_clock
 from .core.common.timeexpr import best_time_hint, strip_time_phrases
 from .core.focus.manager import FocusManager
@@ -121,16 +122,19 @@ from .core.memory.stance import StanceStore
 from .core.memory.store import MemoryStore
 from .core.memory.timeline import build_timeline, build_timeline_block
 from .core.memory.vision import ImageCaptioner
+from .core.schedule.prompts import build_farewell_prompt, build_greeting_prompt
 from .core.schedule.state import (
     AWAKE,
     DEEP,
     LIGHT as SLEEP_LIGHT,
+    SETTLE as SLEEP_SETTLE,
     SLEEP_PHASES,
     SleepStateStore,
     WakeSignalCounter,
     last_sleep_start,
     phase_at,
     plan_window,
+    settle_deadline,
 )
 from .web_api import register_all_routes
 
@@ -184,12 +188,19 @@ _CONDENSE_CHECK_SECONDS = 30.0
 _SLEEP_TICK_SECONDS = 60.0
 
 # 阶段的中文说法：日志、工具返回、记忆页面共用同一套，避免三处各写一份
-_PHASE_LABELS = {AWAKE: "清醒", SLEEP_LIGHT: "浅睡", DEEP: "深睡"}
+_PHASE_LABELS = {AWAKE: "清醒", SLEEP_SETTLE: "入睡中", SLEEP_LIGHT: "浅睡", DEEP: "深睡"}
 
 # 进入会话时带回的未读：条数与字数双上限。未读只是「补全她不在时发生的事」，
 # 不是本轮要回应的内容，给太多反而会把眼前的目的挤掉。
 _UNREAD_LIMIT = 20
 _UNREAD_CHARS = 1200
+
+# 睡前道别 / 起床问候的单轮模型调用上限（秒）。给的是一次决定的时间，
+# 不是一轮对话的时间：超时就当作「今天不想说话」，不重试。
+_GOODNIGHT_TIMEOUT_SECONDS = 40.0
+# 送给模型的会话片段：最多几个会话、每个会话几行。挑多了等于让她读一整晚的群聊。
+_GOODNIGHT_SESSIONS = 5
+_GOODNIGHT_LINES = 6
 
 # 主脑上下文快照：仅供页面查看，保留最近若干个会话的最后一次请求。
 # 每个会话只留一份，避免热路径无限累积；单段文本做截断，防止内存占用失控。
@@ -411,9 +422,16 @@ class ShittimPlugin(Star):
         # 由 tick / 配置保存 / 叫醒时刷新。
         self._sleep_window = None
         self._grace_until = 0.0
+        # 入睡静默期：`_sleep_from` 是实际入睡时刻（0 = 仍在入睡中），
+        # `_settle_deadline` 是「安静到这一刻就睡着」。
+        self._sleep_from = 0.0
+        self._settle_deadline = 0.0
+        self._sleep_activity_at = 0.0
         self._sleep_tick_started = False
         # 整理是重活（多次模型调用 + 重写历史），同一时刻只允许一次
         self._curating = False
+        # 正在整理的作息轮次（`plan_date`），整理成功后写回 `curated_round`
+        self._curating_round = ""
         # 短期压缩也要调模型，同样防重入；与 _curating 互斥，避免两边同时动账本
         self._condensing = False
         self._last_condense_check = 0.0
@@ -451,18 +469,62 @@ class ShittimPlugin(Star):
         return self.schedule_config.enabled and not self._is_terminating
 
     def _sleep_phase(self, now: float | None = None) -> str:
-        """当前作息阶段。仅读取内存快照，不执行 IO。"""
+        """当前作息阶段。仅读取内存快照，不执行 IO。
+
+        实际入睡时刻 `_sleep_from` 与静默期终点 `_settle_deadline` 都由 tick 维护，
+        这里只做比较——睡眠门与记账都是热路径，不能为了算一个阶段去读库。
+        """
         if not self._schedule_active():
             return AWAKE
         window = self._sleep_window
         if window is None:
+            # 首次消息可能早于 tick 启动：窗口是纯算术，当场算一份即可（不做 IO）
             window = plan_window(time.time(), self.schedule_config)
-        return phase_at(
-            time.time() if now is None else now, window, self.schedule_config
-        )
+        current = time.time() if now is None else now
+        sleep_from = self._sleep_from
+        if (
+            not sleep_from
+            and self._settle_deadline
+            and current >= self._settle_deadline
+            and window.sleep_at <= current < window.wake_at
+        ):
+            # tick 还没跑到，但静默期已经过了：先在内存里推进，避免 60 秒空窗
+            sleep_from = self._settle_deadline
+        return phase_at(current, window, self.schedule_config, sleep_from=sleep_from)
 
     def _in_grace(self, now: float) -> bool:
         return self._grace_until > now
+
+    def _note_settle_activity(self, now: float, event=None) -> None:
+        """入睡中的静默期重新起算。非入睡中阶段直接返回。
+
+        只认「对方真在跟她说话」的消息（私聊、或群里 @ / 点名她）。群里
+        三五个人的日常闲聊不算：那件事跟她没关系，凭什么让她推迟入睡。
+        她自己的消息更不算——走的是 `after_message_sent`，不经过这里。
+
+        只更新内存并异步落库：这是每条消息都会走的路径，不能在这里做同步写。
+        静默期终点由 `settle_deadline()` 计算，上限保护在那边。
+        """
+        if not self._schedule_active() or self._sleep_from:
+            return
+        if event is not None and not self._is_settle_signal(event):
+            return
+        window = self._sleep_window
+        if window is None or not (window.sleep_at <= now < window.wake_at):
+            return
+        self._sleep_activity_at = now
+        self._settle_deadline = settle_deadline(window, self.schedule_config, now)
+        try:
+            self.sleep_state.save(sleep_activity_at=now)
+        except Exception as error:
+            logger.error("[什亭之枢] 记录入睡静默期失败: %s", error)
+
+    def _is_settle_signal(self, event) -> bool:
+        """私聊与群内 @ / 点名算「对方还在跟她说话」；群里普通消息不算。"""
+        chat_id = event.unified_msg_origin or ""
+        if is_private_chat(chat_id):
+            return True
+        return bool(getattr(event, "is_at_or_wake_command", False))
 
     def _refresh_sleep_window(self) -> None:
         """重算内存中的作息窗口快照（tick / 配置保存时调用）。"""
@@ -471,19 +533,28 @@ class ShittimPlugin(Star):
             return
         postponed = 0.0
         try:
-            posted = self.sleep_state.load().get("postponed_hours")
-            postponed = float(posted or 0.0)
+            state = self.sleep_state.load()
+            postponed = float(state.get("postponed_hours") or 0.0)
+            self._sleep_from = float(state.get("sleep_from") or 0.0)
+            self._sleep_activity_at = float(state.get("sleep_activity_at") or 0.0)
         except Exception as error:
             logger.error("[什亭之枢] 读取作息状态失败: %s", error)
         self._sleep_window = plan_window(
             time.time(), self.schedule_config, postponed
         )
+        self._settle_deadline = (
+            settle_deadline(
+                self._sleep_window, self.schedule_config, self._sleep_activity_at
+            )
+            if self._sleep_window is not None
+            else 0.0
+        )
 
     def sleep_snapshot(self) -> dict | None:
         """当前作息快照（供记忆页面展示）。作息关闭时返回 None。
 
-        现算而不存中间态：阶段是 `phase_at()` 的纯函数结果，落库只会多一份
-        可能过期的真值。公开（无下划线）是因为 `web_api` 只读接口要调它。
+        阶段与入睡时刻都从持久化的事实现算，不存中间态——落库只会多一份可能
+        过期的真值。公开（无下划线）是因为 `web_api` 只读接口要调它。
         """
         if not self.schedule_config.enabled or self._is_terminating:
             return None
@@ -492,7 +563,10 @@ class ShittimPlugin(Star):
             state = self.sleep_state.load()
             postponed = float(state.get("postponed_hours") or 0.0)
             window = plan_window(now, self.schedule_config, postponed)
-            phase = phase_at(now, window, self.schedule_config)
+            sleep_from = float(state.get("sleep_from") or 0.0)
+            activity = float(state.get("sleep_activity_at") or 0.0)
+            deadline = settle_deadline(window, self.schedule_config, activity)
+            phase = phase_at(now, window, self.schedule_config, sleep_from=sleep_from)
             last = float(state.get("last_curation_at") or 0.0)
         except Exception as error:
             logger.error("[什亭之枢] 读取作息快照失败: %s", error)
@@ -501,6 +575,8 @@ class ShittimPlugin(Star):
             "phase": phase,
             "phase_label": _PHASE_LABELS.get(phase, phase),
             "sleep_at": window.sleep_at,
+            "settle_until": deadline,
+            "sleep_from": sleep_from,
             "wake_at": window.wake_at,
             "postponed_hours": postponed,
             "last_curation_at": last,
@@ -570,6 +646,8 @@ class ShittimPlugin(Star):
             if not sleeping:
                 # 有消息的会话获得焦点。焦点仅约束主动发言，不影响是否接话。
                 self.focus.touch(chat_id, chat_label)
+                # 入睡中的静默期：对方一开口就重新起算（只认私聊与 @ / 点名）。
+                self._note_settle_activity(now, event)
 
             if not self._memory_active():
                 return
@@ -632,9 +710,12 @@ class ShittimPlugin(Star):
         1. 上游指令 —— 放行。需求是「忽略所有**非命令**消息」，命令必须穿透，
            否则睡眠期间无法执行 `/` 指令。放行不代表解除睡眠，也不开启宽限。
         2. 清醒 —— 交回原有链路。
-        3. 宽限期内（刚被叫醒）—— 放行。
-        4. 浅睡 —— 累计 @/私聊信号，达到阈值即叫醒，并放行触发叫醒的消息。
-        5. 深睡 —— 一律拦下，不计数、不响应。
+        3. 入睡中（`SETTLE`）—— 放行。她还没睡着，只是到了该睡的点，仍在等
+           对方安静下来。这段时间她照常能说话，而每收到一句对方的话都会把
+           入睡时间往后推（见 `record_incoming_message`）。
+        4. 宽限期内（刚被叫醒）—— 放行。
+        5. 浅睡 —— 累计 @/私聊信号，达到阈值即叫醒，并放行触发叫醒的消息。
+        6. 深睡 —— 一律拦下，不计数、不响应。
 
         整条链路零 token：仅读取时间轴与计数，不调用任何模型。
         """
@@ -646,7 +727,7 @@ class ShittimPlugin(Star):
                 return
             now = time.time()
             phase = self._sleep_phase(now)
-            if phase == AWAKE or self._in_grace(now):
+            if phase in (AWAKE, SLEEP_SETTLE) or self._in_grace(now):
                 return
             chat_id = event.unified_msg_origin or ""
             if (
@@ -669,22 +750,44 @@ class ShittimPlugin(Star):
 
     # ── 作息收口 ──────────────────────────────────────────
 
-    def _on_fall_asleep(self) -> None:
-        """入睡收口：收回全部焦点、清零唤醒信号。
+    def _on_fall_asleep(self, now: float) -> None:
+        """入睡收口：落定实际入睡时刻、收回焦点、清零唤醒信号。
 
-        静默执行，不做睡前告别——主动广播「我睡了」会使该状态成为公开信息，
-        正确表现应为「没有回应」。
+        然后唤起一轮主脑做**睡前道别**：这是她今天最后一次开口的机会，
+        可以不说话，也可以找最后跟她说话的那个私聊说声晚安。
+
+        「最后一次开口」不是公开信息：告别的对象只有她主动选中的那一个会话，
+        不会在群里广播「我睡了」。
         """
         try:
             count = self.focus.rest()
             self._wake_signals.clear()
+            self.sleep_state.save(sleep_from=now)
+            self._sleep_from = now
         except Exception as error:
             logger.error("[什亭之枢] 入睡收口失败: %s", error)
             return
-        logger.info("[什亭之枢] 入睡收口 | 收回 %d 个会话的焦点", count)
+        logger.info(
+            "[什亭之枢] 入睡 | %s | 收回 %d 个会话的焦点",
+            format_clock(now),
+            count,
+        )
+        if self.schedule_config.farewell_enabled:
+            self._spawn(self._farewell(now))
 
-    def _on_wake_up(self) -> None:
-        """起床收口：放行睡眠期消息、恢复那些会话的焦点、置起床提示。"""
+    def _on_wake_up(self, now: float = 0.0, *, sleep_from: float = 0.0) -> None:
+        """起床收口：放行睡眠期消息、恢复那些会话的焦点、置起床提示。
+
+        这里的日志是**她醒来**的唯一权威记录：`phase` 变化、跨天结算、
+        窄门检查都收敛到这里。
+
+        `sleep_from` 给调用方一个补救口：跨天分支会先把本轮 `sleep_from`
+        归零再结算上一轮，不显式传进来，起床问候就算不出「睡时收到了什么」。
+        """
+        at = now or time.time()
+        # 入睡时刻必须在清零之前取出：起床问候要用它算「睡时收到了哪些消息」，
+        # 而下面几行会把 sleep_from 归零（下一轮入睡中）。
+        sleep_from = float(sleep_from or 0.0) or self._sleep_from
         try:
             chat_ids = self.short_term.staged_chat_ids()
             labels = [
@@ -696,16 +799,34 @@ class ShittimPlugin(Star):
                 self.focus.touch(chat_id, label)
             self._wake_signals.clear()
             self._grace_until = 0.0
+            self._sleep_from = 0.0
+            self._settle_deadline = 0.0
+            self._sleep_activity_at = 0.0
             # 起床提示待注入：由作息事件注入通道消费，注入后清除标记。
-            self.sleep_state.save(wake_notice_pending=1, grace_until=0.0)
+            self.sleep_state.save(
+                wake_notice_pending=1,
+                grace_until=0.0,
+                sleep_from=0.0,
+                sleep_activity_at=0.0,
+            )
         except Exception as error:
             logger.error("[什亭之枢] 起床收口失败: %s", error)
             return
         logger.info(
-            "[什亭之枢] 起床收口 | 放行睡眠期消息 %d 条，涉及 %d 个会话",
+            "[什亭之枢] 起床 | %s | 放行睡眠期消息 %d 条，涉及 %d 个会话",
+            format_clock(at),
             released,
             len(labels),
         )
+        if self.schedule_config.wake_greeting_enabled:
+            self._spawn(
+                self._wake_greeting(
+                    at,
+                    [label for _chat_id, label in labels],
+                    chat_ids=[chat_id for chat_id, _label in labels],
+                    sleep_from=sleep_from,
+                )
+            )
 
     def _on_awakened(self, chat_id: str, now: float) -> None:
         """被叫醒：开启清醒宽限，并使该会话恢复主动发言资格。"""
@@ -723,6 +844,280 @@ class ShittimPlugin(Star):
             grace_seconds // 60,
         )
 
+    # ── 睡前道别 / 起床问候 ──────────────────────────────────
+    #
+    # 这两次唤醒不是消息事件：没有用户消息、没有工具、也不进 AstrBot 的历史。
+    # 它们只做一件事——问主脑「现在想不想说话、对谁说、说什么」，拿到答案就
+    # 直接发出去。因此这里不走 `gate_official_llm`，也不用伪造事件：伪造
+    # `AstrMessageEvent` 能复用整条注入链，但依赖适配器的 meta 细节，换平台就碎。
+
+    async def _pick_provider(self):
+        """取本轮要用的模型：优先她平时用的那个，取不到再退到压缩模型。"""
+        provider = None
+        try:
+            provider = await self.context.get_using_provider_async()
+        except Exception as error:
+            logger.debug("[什亭之枢] 取当前对话模型失败: %s", error)
+        if provider is not None:
+            return provider
+        provider_id = self.memory_config.extract_provider_id
+        if provider_id:
+            try:
+                return self.context.get_provider_by_id(provider_id)
+            except Exception as error:
+                logger.debug("[什亭之枢] 取压缩模型失败: %s", error)
+        return None
+
+    async def _persona_text(self, chat_id: str = "") -> str:
+        """读当前生效的人格提示词。取不到返回空串，唤醒照常进行。"""
+        manager = getattr(self.context, "persona_manager", None)
+        if manager is None:
+            return ""
+        try:
+            persona = await manager.get_default_persona_v3(chat_id)
+        except Exception as error:
+            logger.debug("[什亭之枢] 读取人格失败: %s", error)
+            return ""
+        if isinstance(persona, dict):
+            prompt = persona.get("prompt") or ""
+        else:
+            prompt = getattr(persona, "prompt", "") or ""
+        return str(prompt).strip()[:1200]
+
+    def _transcripts(
+        self, chat_ids: Sequence[str], *, since: float = 0.0
+    ) -> list[tuple[str, str, str]]:
+        """给模型看的会话片段：每个会话最后几行，剔掉纯占位与空行。"""
+        chunks: list[tuple[str, str, str]] = []
+        for chat_id in chat_ids:
+            try:
+                rows = self.short_term.recent_of_chat(chat_id, _GOODNIGHT_LINES)
+            except Exception as error:
+                logger.debug("[什亭之枢] 取会话片段失败 | %s | %s", chat_id, error)
+                continue
+            lines: list[str] = []
+            for row in rows:
+                created_at = float(row["created_at"] or 0.0)
+                if since and created_at < since:
+                    continue
+                line = format_message_line(row).strip()
+                if line:
+                    lines.append(line)
+            if not lines:
+                continue
+            label = self.short_term.label_for_chat(chat_id) or chat_id
+            chunks.append((label, chat_id, "\n".join(lines)))
+        return chunks
+
+    def _recent_chat_ids(self, limit: int = _GOODNIGHT_SESSIONS) -> list[str]:
+        """最近有动静的会话，按最后一条消息的时间倒序。"""
+        try:
+            rows = self.short_term.list_known_chats(limit=limit)
+        except Exception as error:
+            logger.debug("[什亭之枢] 列出会话失败: %s", error)
+            return []
+        return [str(row["chat_id"]) for row in rows if str(row["chat_id"] or "")]
+
+    async def _ask_model(self, prompt: str) -> dict | None:
+        """单轮调用，返回解析后的 dict；任何异常都返回 None（当作不说话）。"""
+        provider = await self._pick_provider()
+        if provider is None:
+            logger.warning("[什亭之枢] 没有可用的对话模型，本次不发言")
+            return None
+        try:
+            token = await asyncio.wait_for(
+                provider.text_chat(prompt=prompt),
+                timeout=_GOODNIGHT_TIMEOUT_SECONDS,
+            )
+            raw = (getattr(token, "completion_text", "") or "").strip()
+        except asyncio.TimeoutError:
+            logger.warning(
+                "[什亭之枢] 唤醒模型超时（%.0fs），本次不发言",
+                _GOODNIGHT_TIMEOUT_SECONDS,
+            )
+            return None
+        except Exception as error:
+            logger.error("[什亭之枢] 唤醒模型调用失败: %s", error)
+            return None
+        payload = parse_model_json(raw)
+        if not isinstance(payload, dict):
+            logger.warning("[什亭之枢] 唤醒模型输出无法解析: %s", raw[:120])
+            return None
+        return payload
+
+    def _coerce_speak(self, payload: dict) -> bool:
+        value = payload.get("speak")
+        if isinstance(value, bool):
+            return value
+        if isinstance(value, (int, float)):
+            return value != 0
+        if isinstance(value, str):
+            return value.strip().lower() in ("true", "1", "yes", "是", "说")
+        return False
+
+    async def _deliver(
+        self, session: str, text: str, *, reason: str
+    ) -> bool:
+        """把一句话发到指定会话。返回是否真的发出去了。
+
+        `reason` 只用于日志（「睡前道别」/「起床问候」），便于事后区分
+        这两条不来自用户消息的发送路径。
+        """
+        message = (text or "").strip()
+        if not message:
+            return False
+        chat_id = self.short_term.resolve_chat(session)
+        if not chat_id:
+            logger.warning("[什亭之枢] %s 目标解析失败 | %s", reason, session)
+            return False
+
+        chat_kind = "private" if is_private_chat(chat_id) else "group"
+        target_key = f"{chat_kind}:{chat_id.rsplit(':', 1)[-1]}"
+        if self._allowed_targets and target_key not in self._allowed_targets:
+            logger.warning(
+                "[什亭之枢] %s 目标不在白名单 | %s", reason, target_key
+            )
+            return False
+        if not self._check_rate_limit(self._proactive_config()):
+            logger.warning("[什亭之枢] %s 被限流拦下", reason)
+            return False
+        # 白名单里的开关关闭时不主动发送，但仍允许她「不想说」——这里只挡发送
+        if not self._proactive_config().get("enabled", True):
+            logger.debug("[什亭之枢] 主动发言已关闭，%s 不发送", reason)
+            return False
+
+        try:
+            sent = await self.context.send_message(chat_id, _build_plain_chain(message))
+        except Exception as error:
+            logger.error("[什亭之枢] %s 发送失败 | %s | %s", reason, chat_id, error)
+            return False
+        if sent is False:
+            logger.warning("[什亭之枢] %s 未被平台接受 | %s", reason, chat_id)
+            return False
+
+        self._send_timestamps.append(time.time())
+        label = self.short_term.label_for_chat(chat_id)
+        self.focus.touch(chat_id, label)
+        self.focus.mark_read(chat_id)
+        try:
+            await self.patrol.note_spoke(chat_id)
+        except Exception as error:
+            logger.debug("[什亭之枢] %s 刷新巡检窗口失败: %s", reason, error)
+        if self._memory_active():
+            self.short_term.add(
+                chat_id=chat_id,
+                chat_label=label,
+                chat_kind=chat_kind,
+                sender_id="",
+                sender_name="",
+                role="assistant",
+                content=message,
+                gated=True,
+            )
+        logger.info(
+            "[什亭之枢] %s | %s | %s", reason, target_key, message[:50]
+        )
+        return True
+
+    async def _farewell(self, now: float) -> None:
+        """入睡时刻的一次唤醒：今天最后一次开口的机会。
+
+        她可以不说。说不说、对谁说都由模型决定——写成「请说一句晚安」，
+        发出去的就会是一句她自己也不信的仪式。
+        """
+        try:
+            if self._is_terminating:
+                return
+            chat_ids = self._recent_chat_ids()
+            if not chat_ids:
+                logger.info("[什亭之枢] 睡前道别：今天没有任何会话，跳过")
+                return
+            prompt = build_farewell_prompt(
+                now=now,
+                persona=await self._persona_text(chat_ids[0]),
+                transcripts=self._transcripts(chat_ids),
+            )
+            payload = await self._ask_model(prompt)
+            if payload is None or not self._coerce_speak(payload):
+                logger.info("[什亭之枢] 睡前道别：她选择不说话")
+                return
+            session = str(payload.get("session") or "").strip()
+            text = str(payload.get("text") or "").strip()
+            if not session or not text:
+                logger.info("[什亭之枢] 睡前道别：输出缺少 session 或 text，跳过")
+                return
+            await self._deliver(session, text, reason="睡前道别")
+        except asyncio.CancelledError:
+            raise
+        except Exception as error:
+            logger.error("[什亭之枢] 睡前道别失败: %s", error)
+
+    async def _wake_greeting(
+        self,
+        at: float,
+        labels: Sequence[str] = (),
+        *,
+        chat_ids: Sequence[str] = (),
+        sleep_from: float = 0.0,
+    ) -> None:
+        """起床时刻的一次唤醒：昨晚那些消息要不要回。
+
+        无论睡眠期有没有消息都叫一次：没有消息时她也可能想说一句「早」，
+        而「要不要说」本来就该由她自己判断，不是由有没有人找她决定。
+
+        `sleep_from` 必须由调用方传入：起床收口会把库里的 `sleep_from` 清零，
+        这里再读就只能读到 0，睡眠期消息的统计会全部落空。
+
+        `chat_ids` 是睡眠期真的有人说话的会话（`labels` 是它们的名字）。
+        没有它时退到「最近有动静的会话」，但那会把白天的会话也拉进来。
+        """
+        try:
+            if self._is_terminating:
+                return
+            candidates = [str(cid) for cid in chat_ids if str(cid or "")]
+            if not candidates:
+                candidates = self._recent_chat_ids()
+            else:
+                candidates = candidates[:_GOODNIGHT_SESSIONS]
+            if not candidates:
+                logger.info("[什亭之枢] 起床问候：没有任何已知会话，跳过")
+                return
+            sleep_at = max(float(sleep_from or 0.0), 0.0)
+            total = 0
+            unseen: list[tuple[str, str]] = []
+            if sleep_at:
+                try:
+                    total, digest = self.short_term.sleep_digest(sleep_at)
+                    unseen = [(label, "") for label, _count, _line in digest]
+                except Exception as error:
+                    logger.debug("[什亭之枢] 取睡眠期消息失败: %s", error)
+            if not unseen and labels:
+                unseen = [(label, "") for label in labels]
+
+            prompt = build_greeting_prompt(
+                now=at,
+                sleep_at=sleep_at,
+                persona=await self._persona_text(candidates[0]),
+                total=total,
+                unseen=unseen,
+                transcripts=self._transcripts(candidates, since=sleep_at),
+            )
+            payload = await self._ask_model(prompt)
+            if payload is None or not self._coerce_speak(payload):
+                logger.info("[什亭之枢] 起床问候：她选择不说话")
+                return
+            session = str(payload.get("session") or "").strip()
+            text = str(payload.get("text") or "").strip()
+            if not session or not text:
+                logger.info("[什亭之枢] 起床问候：输出缺少 session 或 text，跳过")
+                return
+            await self._deliver(session, text, reason="起床问候")
+        except asyncio.CancelledError:
+            raise
+        except Exception as error:
+            logger.error("[什亭之枢] 起床问候失败: %s", error)
+
+
     # ── 周期检查 ──────────────────────────────────────────
 
     async def _sleep_tick_loop(self) -> None:
@@ -735,7 +1130,12 @@ class ShittimPlugin(Star):
             await asyncio.sleep(_SLEEP_TICK_SECONDS)
 
     def _sleep_tick(self) -> None:
-        """把持久化的阶段与时间轴推导出的阶段对齐，并执行转换收口。"""
+        """把持久化的阶段与时间轴推导出的阶段对齐，并执行转换收口。
+
+        这里同时负责**入睡静默期**的推进：计划入睡时刻到了之后，先进入
+        `SETTLE`；等对方安静满 `settle_minutes`（或到达 `settle_max_minutes`
+        上限）才落定 `sleep_from`，真正入睡。
+        """
         if not self._schedule_active():
             return
         now = time.time()
@@ -744,11 +1144,16 @@ class ShittimPlugin(Star):
         window = plan_window(now, self.schedule_config, postponed)
         self._sleep_window = window
         self._grace_until = float(state.get("grace_until") or 0.0)
+        self._sleep_from = float(state.get("sleep_from") or 0.0)
+        self._sleep_activity_at = float(state.get("sleep_activity_at") or 0.0)
 
         if str(state.get("plan_date") or "") != window.plan_date:
             # 跨入新一轮作息：先结算上一轮（若已过起床时间），再开启本轮。
             # 结算必须在 reset 之后执行，否则 wake_notice_pending 会被重置。
             previous_wake = float(state.get("wake_at") or 0.0)
+            # 上一轮的实际入睡时刻：reset_round 与下面两行归零之后就拿不到了，
+            # 而起床问候要用它统计睡眠期消息。
+            previous_sleep_from = float(state.get("sleep_from") or 0.0)
             # 新一轮恢复基础时间表：推迟仅对当次作息生效。必须使用归零后的
             # 推迟量重新计算窗口；若直接写回已计算的 window，会将本次顺延
             # 带入次日，导致推迟量逐日累积。
@@ -756,19 +1161,39 @@ class ShittimPlugin(Star):
             self._sleep_window = window
             self.sleep_state.reset_round(window, 0.0)
             state = self.sleep_state.load()
+            self._sleep_from = 0.0
+            self._sleep_activity_at = 0.0
             if previous_wake and now >= previous_wake:
-                self._on_wake_up()
+                self._on_wake_up(previous_wake, sleep_from=previous_sleep_from)
 
-        phase = phase_at(now, window, self.schedule_config)
+        # 入睡静默期：计划入睡时刻已到、但还没真正睡着时，结束时刻随
+        # 最后一次「对方说话」滑动。tick 只负责在它过期时落定入睡。
+        self._settle_deadline = settle_deadline(
+            window, self.schedule_config, self._sleep_activity_at
+        )
+        if (
+            not self._sleep_from
+            and window.sleep_at <= now < window.wake_at
+            and now >= self._settle_deadline
+        ):
+            self._on_fall_asleep(now)
+            self._sleep_from = now
+            state = self.sleep_state.load()
+
+        phase = phase_at(now, window, self.schedule_config, sleep_from=self._sleep_from)
         previous_phase = str(state.get("phase") or "")
         if phase != previous_phase:
             logger.info(
                 "[什亭之枢] 作息转换 | %s → %s", previous_phase or "未知", phase
             )
-            if phase in SLEEP_PHASES and previous_phase in ("", AWAKE):
-                self._on_fall_asleep()
+            # SETTLE → LIGHT 不算「睡着」：真正的入睡收口已经在上面落定过，
+            # 这里只补齐旧数据（例如重启时 sleep_from 恰好丢失）的边界。
+            if phase in SLEEP_PHASES and previous_phase in ("", AWAKE, SLEEP_SETTLE):
+                if not self._sleep_from:
+                    self._on_fall_asleep(now)
+                    self._sleep_from = now
             elif phase == AWAKE and previous_phase in SLEEP_PHASES:
-                self._on_wake_up()
+                self._on_wake_up(now)
             self.sleep_state.save(phase=phase)
 
         # 整理节拍与阶段转换无关：即使本次 tick 未发生阶段变化，也需检查是否满足整理条件。
@@ -777,13 +1202,11 @@ class ShittimPlugin(Star):
     def _maybe_curate(self, phase: str, window, now: float) -> None:
         """按节拍触发记忆整理（§9.1）。仅由 tick 调用。
 
-        **主触发：本轮深睡窗口内尚未整理**（`last_curation_at < window.sleep_at`）。
-        该判据直接对应当前睡眠轮次，不依赖「距上次满 24 小时」的绝对时间间隔。
-
-        不使用 24 小时间隔的原因：该间隔以上次整理**完成**时刻为锚点。
-        若插件在启动当晚 22:56 加载、01:30 进入深睡，间隔仅 2.5 小时，
-        整夜都会被判据阻止；此外每次整理耗时还会使锚点逐日偏移。
-        按「本轮窗口」判断只需确认本轮是否已整理，不会产生累积偏差。
+        **主触发：本轮深睡里还没整理过**。判据是 `curated_round`（记的是
+        最近一次整理的 `plan_date`），不是「上次整理时间戳早于计划入睡时刻」：
+        晚睡时后一个判据会把上一轮的整理当成「本轮已整理」，整夜都不再整理。
+        每小时检查一次，由 tick 的 60 秒节拍保证——`DEEP` 里每 tick 都会重新问
+        一次「这一轮整理过没有」。
 
         兜底触发：不在深睡且距上次整理超过 `curation_force_after_hours`。
         睡眠时长过短时深睡窗口可能不出现，缺少兜底将导致永不整理。
@@ -804,15 +1227,18 @@ class ShittimPlugin(Star):
         if self._in_grace(now):
             return
         try:
-            last = float(self.sleep_state.load().get("last_curation_at") or 0.0)
+            state = self.sleep_state.load()
+            last = float(state.get("last_curation_at") or 0.0)
+            curated_round = str(state.get("curated_round") or "")
         except Exception as error:
             logger.error("[什亭之枢] 读取整理节拍失败: %s", error)
             return
-        if phase == DEEP and last < float(window.sleep_at):
+        if phase == DEEP and curated_round != window.plan_date:
             logger.info(
-                "[什亭之枢] 本轮深睡窗口尚未整理，开始整理（上次 %s）",
+                "[什亭之枢] 本轮深睡尚未整理，开始整理（上次 %s）",
                 time.strftime("%m-%d %H:%M", time.localtime(last)) if last else "从未",
             )
+            self._curating_round = window.plan_date
             self._spawn(self._run_curation(full_reset=True))
             return
         force_seconds = max(int(cfg.curation_force_after_hours), 0) * 3600
@@ -2901,7 +3327,13 @@ class ShittimPlugin(Star):
                     cfg.archive_retention_days
                 )
 
-            self.sleep_state.save(last_curation_at=time.time())
+            round_key = self._curating_round
+            self._curating_round = ""
+            # 记下「这一轮整理过了」：主判据是轮次而不是时间戳，晚睡时
+            # 才不会被上一轮的整理时刻误判成本轮已整理。
+            self.sleep_state.save(
+                last_curation_at=time.time(), curated_round=round_key or ""
+            )
             logger.info(
                 "[什亭之枢] 记忆整理完成 用时%.0fms | 收口%d条→%d轮 当天摘要%d "
                 "降级%d(重写%d) 遗忘%d 晋升%d 合并%d簇 画像%d 态度%d条%s",
@@ -2926,6 +3358,8 @@ class ShittimPlugin(Star):
             return {}
         finally:
             self._curating = False
+            # 失败时也清掉轮次标记：不推进 `curated_round`，下一 tick 会重试。
+            self._curating_round = ""
 
     def _schedule_maintenance_if_due(self) -> None:
         if not self.memory_config.maintenance_enabled:

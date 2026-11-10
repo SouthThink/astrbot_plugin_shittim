@@ -71,10 +71,14 @@ pages/memory/   记忆页面
 
 ### 3.3 作息链路（她醒着吗）
 
-`schedule/state.py`（纯函数 `plan_window` / `phase_at`）+ `sleep_state` 单行表 + `main.sleep_gate()`。
+`schedule/state.py`（纯函数 `plan_window` / `phase_at` / `settle_deadline` / `light_seconds`）+ `sleep_state` 单行表 + `main.sleep_gate()`。
 
-- 只有 `awake` / `light` / `deep` 三态，**由时间与配置现算**，不存中间态，重启即恢复。
-- `deep` 拦下一切（含私聊）；`light` 需累积到 `wake_signal_threshold` 次唤醒信号（私聊或 @）才叫醒；命令消息永远放行。
+- 有 `awake` / `settle` / `light` / `deep` 四态，**由时间与配置现算**，不存中间态，重启即恢复。`settle`（入睡中）**不属于 `SLEEP_PHASES`**：它不拦消息、不进睡眠期记账、不刷 `source='sleep'`。
+- `deep` 拦下一切（含私聊）；`light` 需累积到 `wake_signal_threshold` 次唤醒信号（私聊或 @）才叫醒；`settle` 与 `awake` 一样放行；命令消息永远放行。
+- **入睡静默期**：计划入睡时刻到点后进入 `settle`，每收到一条「对方在跟她说话」的消息（私聊 / 群内 @ 或点名）就把入睡推后 `settle_minutes`；上限是 `window.sleep_at + settle_max_minutes`，到点强制入睡（`settle_deadline()`）。**上限必须有**：没有它，有人每隔半小时发一句就能把她拖到天亮。
+- **重置只认对方的消息**：她自己的话走 `after_message_sent`，不经过 `_note_settle_activity()`；群里三五人的日常闲聊也不算（`_is_settle_signal()`）。否则她道别一句就把入睡推后一整个静默期，永远睡不着。
+- **实际入睡时刻是 `sleep_from`**，不是 `window.sleep_at`。`phase_at(..., sleep_from=0)` 一律返回 `SETTLE`——「还没睡着」这件事本身就是这个参数表达的。
+- **浅睡时长随延误收缩**：`light_seconds(config, delay)` = `max(20 分钟, light_until_deep_minutes − 0.5 × 延误)`。睡得越晚剩下的夜越短；下限 20 分钟是因为再短就攒不够叫醒信号，等于一闭眼就叫不醒。
 - 睡眠期记账用 `source='sleep'` + `staged=1`（暂存区）；叫醒/起床时 `release_staged()` 只翻 `staged`，**不动 `source`**。
 - 睡眠期收消息**不刷新焦点**；焦点只在叫醒/起床时给叫醒她的那个会话。
 - 作息事件提示共用一条通道：`wake_notice_pending=1` 或 `awakened_at > wake_notice_fired_at` 才算待注入，注入后把 `wake_notice_fired_at` 抬到当下完成去重。**起床优先于叫醒**；`wake_notice_fired_at` 是唯一水位线，别再引入第二个「已注入」标记。
@@ -82,6 +86,14 @@ pages/memory/   记忆页面
 - 暂存消息（`staged=1`）**不算短期记忆**：`live_entries()` / `live_entry_count()` / 时间线条目查询一律只取 `staged=0`。判断「现在是不是睡眠期」要排除清醒宽限（刚被叫醒的 10 分钟她是醒着的）。
 - `format_message_line()` 给 `source='sleep'` 补「（睡觉时收到）」。这是**行格式**，绝不能写进 `content`（时间线剔除当前消息靠 content 精确匹配）。
 - 周期 tick 负责跨天重置与阶段转换收口；不要在事件处理器里做重活。
+
+**入睡与起床各有一次主脑唤醒**（`main._farewell()` / `main._wake_greeting()`，提示词在 `core/schedule/prompts.py`）。它们不是消息事件，也不占主脑闸门：单轮 `text_chat()` 拿一个决定，再由 `_deliver()` 直接发送。
+
+- **「可以不说话」写在提示词最前面**。写成「请说一句晚安」，发出去的就是一句她自己也不信的仪式；写成「今天还有没有话要说」，答案才可能是「没有」。
+- **输出是 `{"speak": false}` 或 `{"speak": true, "session": ..., "text": ...}`**：说 / 不说 / 对谁说 / 说什么全由模型定。`session` 用 `resolve_chat()` 解析，落不到就放弃。
+- **`sleep_from` 必须在清零之前取出并显式传入 `_wake_greeting()`**：起床收口会把库里的 `sleep_from` 归零，之后再读只能读到 0，睡眠期消息统计会全部落空。跨天分支同理（`previous_sleep_from`）。
+- **入睡越晚整理越晚，判据是轮次不是时间戳**：`_maybe_curate()` 用 `curated_round != window.plan_date`。**不要改回 `last_curation_at < window.sleep_at`**——晚睡时那个判据会把上一轮的整理当成本轮已整理，整夜都不再整理。深睡里每 tick 都会重新问一次，等效于「每小时检查一次」。
+- 整理失败**不推进 `curated_round`**（`_run_curation` 的 `finally` 会清掉 `_curating_round`），下一 tick 重试。
 
 ### 3.4 记忆链路
 
@@ -326,6 +338,13 @@ docker exec astrbot sh -lc 'cd /AstrBot && PYTHONPATH=/tmp:/AstrBot python /tmp/
 - 仓库里的 `build/` 不进版本库（已 gitignore）。
 
 **提交信息**：`type(scope): 中文摘要`，常用 `feat` / `fix` / `refactor` / `perf` / `docs` / `chore`。
+
+**打包（`build.ps1`）**
+
+- 输出 `build/astrbot_plugin_shittim-<version>.zip`，版本读自 `metadata.yaml`。
+- **zip 条目名必须用 `/`**。不要改回 `[System.IO.Compression.ZipFile]::CreateFromDirectory`：Windows PowerShell 5.1 下它写出的条目名是 `dir\file`，而 ZIP 规范与 Linux 的 `zipfile` 只认 `/`，`\` 会被当成文件名字符。解压结果是 38 个名字里带反斜杠的扁平文件，AstrBot 安装器随后找不到 `plugin/<插件名>/`，报
+  `FileNotFoundError: .../plugin/astrbot_plugin_shittim`。现在用的是逐条 `CreateEntry` + `-replace '\\','/'`。
+- 验证方法（不要靠肉眼）：容器内用 AstrBot 自己的 `_PluginUpdater._extract_plugin_archive(zip, target)` 跑一遍，确认 `target/` 下直接是 `main.py` / `metadata.yaml` / `core/`，**没有**多包一层插件名目录。
 
 ## 9. 文档职责
 

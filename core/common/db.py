@@ -14,7 +14,7 @@ from pathlib import Path
 
 from .timeexpr import day_key
 
-SCHEMA_VERSION = 14
+SCHEMA_VERSION = 15
 
 # 增量列迁移：用于给已存在的库补列，避免升级插件时丢数据
 _COLUMN_MIGRATIONS = (
@@ -74,6 +74,15 @@ _COLUMN_MIGRATIONS = (
     # stance/dimensions 是「我怎么看他」。旧画像两样都没有，先留空。
     ("user_profiles", "stance", "TEXT NOT NULL DEFAULT ''"),
     ("user_profiles", "dimensions", "TEXT NOT NULL DEFAULT '{}'"),
+    # 入睡静默期。`sleep_from` 是**实际**入睡时刻：计划 23:30 睡，但对方 23:40
+    # 还在说话，真正睡着就是 23:51（最后一次发言 + 静默期）。它不能由作息时间
+    # 推导，只能记下来；0 表示还在入睡中。`sleep_activity_at` 是最后一次「对方
+    # 说话」的时刻，静默期从它起算。`curated_round` 存已经整理过的 plan_date，
+    # 深睡里每小时检查一次时用它判重——只看 last_curation_at 会在晚睡时误判成
+    # 「本轮已整理」（那个时间戳属于上一轮）。
+    ("sleep_state", "sleep_from", "REAL NOT NULL DEFAULT 0"),
+    ("sleep_state", "sleep_activity_at", "REAL NOT NULL DEFAULT 0"),
+    ("sleep_state", "curated_round", "TEXT NOT NULL DEFAULT ''"),
 )
 
 # 建在「迁移后才存在的列」上的索引：**必须**在补列之后创建。
@@ -284,6 +293,9 @@ CREATE TABLE IF NOT EXISTS sleep_state (
     wake_notice_fired_at REAL    NOT NULL DEFAULT 0,    -- 起床提示已注入时刻
     last_curation_at     REAL    NOT NULL DEFAULT 0,    -- 上次深睡整理时刻
     last_cleared_at      REAL    NOT NULL DEFAULT 0,    -- 上次归档时刻
+    sleep_from           REAL    NOT NULL DEFAULT 0,    -- 实际入睡时刻（0 = 尚未入睡，处于入睡中）
+    sleep_activity_at    REAL    NOT NULL DEFAULT 0,    -- 入睡前最后一次「对方说话」时刻
+    curated_round        TEXT    NOT NULL DEFAULT '',   -- 已经整理过的轮次（plan_date），防重复整理
     updated_at           REAL    NOT NULL DEFAULT 0
 );
 """

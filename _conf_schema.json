@@ -396,9 +396,29 @@
         "default": 120
       },
       "light_until_deep_minutes": {
-        "description": "浅睡满多久转入深睡（分钟）",
+        "description": "浅睡满多久转入深睡（分钟）；入睡越晚该时长越短，最短 20 分钟",
         "type": "int",
         "default": 120
+      },
+      "settle_minutes": {
+        "description": "到达入睡时刻后的静默期：对方安静这么久她才真正睡着，期间每收到对方一句话就重新计时（分钟，0 = 到点即睡）",
+        "type": "int",
+        "default": 30
+      },
+      "settle_max_minutes": {
+        "description": "静默期最多把入睡推迟多久，到点强制入睡，防止有人每隔一会儿说一句就把她拖到天亮（分钟，0 = 不封顶）",
+        "type": "int",
+        "default": 120
+      },
+      "farewell_enabled": {
+        "description": "睡前道别：入睡那一刻唤起一轮，让她自己决定要不要找人说声晚安；关闭后入睡不唤醒主脑",
+        "type": "bool",
+        "default": true
+      },
+      "wake_greeting_enabled": {
+        "description": "起床唤醒：醒来时唤起一轮，让她自己判断睡眠期收到的消息要不要回应；关闭后只记录起床提示，不主动唤起",
+        "type": "bool",
+        "default": true
       },
       "wake_signal_window_minutes": {
         "description": "同一会话的 @ / 私聊信号在该时间窗口内累计（分钟）",

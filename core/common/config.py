@@ -360,6 +360,15 @@ class ScheduleConfig:
     wake_notice_lead_minutes: int = 120
     # 浅睡持续多久后转入深睡
     light_until_deep_minutes: int = 120
+    # 到达入睡时刻后的静默期：对方安静这么久，她才真正睡着。
+    # 期间每收到一句「对方」的话就重新起算（她自己的发言不算）。
+    settle_minutes: int = 30
+    # 静默期最多推迟多久，到点强制入睡（0 = 不封顶）
+    settle_max_minutes: int = 120
+    # 睡前道别：入睡那一刻唤起一轮，给她最后一次开口的机会
+    farewell_enabled: bool = True
+    # 起床唤醒：醒来时唤起一轮，让她自己决定要不要回应睡眠期消息
+    wake_greeting_enabled: bool = True
     # 叫醒信号：同一会话在时间窗口内累计的 @/私聊次数达到阈值即叫醒
     wake_signal_window_minutes: int = 5
     wake_signal_threshold: int = 3
@@ -401,6 +410,12 @@ class ScheduleConfig:
             ),
             light_until_deep_minutes=_get_int(
                 cfg, "schedule.light_until_deep_minutes", 120
+            ),
+            settle_minutes=_get_int(cfg, "schedule.settle_minutes", 30),
+            settle_max_minutes=_get_int(cfg, "schedule.settle_max_minutes", 120),
+            farewell_enabled=bool(_get(cfg, "schedule.farewell_enabled", True)),
+            wake_greeting_enabled=bool(
+                _get(cfg, "schedule.wake_greeting_enabled", True)
             ),
             wake_signal_window_minutes=_get_int(
                 cfg, "schedule.wake_signal_window_minutes", 5
