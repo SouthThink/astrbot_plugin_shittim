@@ -852,7 +852,12 @@ class ShittimPlugin(Star):
     # `AstrMessageEvent` 能复用整条注入链，但依赖适配器的 meta 细节，换平台就碎。
 
     async def _pick_provider(self):
-        """取本轮要用的模型：优先她平时用的那个，取不到再退到压缩模型。"""
+        """取本轮要用的模型：优先她平时用的那个，取不到再退到压缩模型。
+
+        插件比 AstrBot 的提供商初始化得早，刚启动那几秒 `get_using_provider_async()`
+        可能还是 None。这里再退一层到 `provider_insts[0]`，否则在启动瞬间触发的
+        睡前道别会直接判成「没有可用的对话模型」——看起来像配置错了，其实是时序。
+        """
         provider = None
         try:
             provider = await self.context.get_using_provider_async()
@@ -863,10 +868,25 @@ class ShittimPlugin(Star):
         provider_id = self.memory_config.extract_provider_id
         if provider_id:
             try:
-                return self.context.get_provider_by_id(provider_id)
+                provider = self.context.get_provider_by_id(provider_id)
             except Exception as error:
                 logger.debug("[什亭之枢] 取压缩模型失败: %s", error)
-        return None
+            if provider is not None:
+                return provider
+        # 兜底：提供商还没就绪时直接拿第一个可用的对话模型。
+        manager = getattr(self.context, "provider_manager", None)
+        for attr in ("provider_insts", "insts"):
+            insts = getattr(manager, attr, None)
+            if insts:
+                try:
+                    return insts[0]
+                except Exception:
+                    pass
+        try:
+            provider = self.context.get_provider_by_id(self.memory_config.extract_provider_id)
+        except Exception:
+            provider = None
+        return provider
 
     async def _persona_text(self, chat_id: str = "") -> str:
         """读当前生效的人格提示词。取不到返回空串，唤醒照常进行。"""
@@ -1171,6 +1191,27 @@ class ShittimPlugin(Star):
         self._settle_deadline = settle_deadline(
             window, self.schedule_config, self._sleep_activity_at
         )
+        # 老库 / 刚升级：阶段已经是睡眠期，但 `sleep_from` 还没写过（迁移前的
+        # 数据里没有这一列）。这时她是**早就睡着了**，不是刚刚才睡着——必须
+        # 按计划入睡时刻补齐，否则下面会走成一次假的「入睡」，凌晨重启时突然
+        # 冒出一句道别。
+        previous_phase = str(state.get("phase") or "")
+        if (
+            not self._sleep_from
+            and previous_phase in SLEEP_PHASES
+            and now < window.wake_at
+        ):
+            self._sleep_from = float(window.sleep_at)
+            self._settle_deadline = 0.0
+            try:
+                self.sleep_state.save(sleep_from=self._sleep_from)
+            except Exception as error:
+                logger.debug("[什亭之枢] 补齐入睡时刻失败: %s", error)
+            logger.info(
+                "[什亭之枢] 恢复作息状态 | 已处于%s，按计划计入入睡时刻 %s",
+                _PHASE_LABELS.get(previous_phase, previous_phase),
+                format_clock(self._sleep_from),
+            )
         if (
             not self._sleep_from
             and window.sleep_at <= now < window.wake_at
